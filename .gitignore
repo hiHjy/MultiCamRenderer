@@ -1,0 +1,4 @@
+.clangd
+.vscode
+build*
+*json
