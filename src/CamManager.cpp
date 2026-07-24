@@ -31,23 +31,35 @@ bool CamManager::addCamera(const CameraConfig& config)
         return false;
     }
 
-    auto camera = std::make_unique<V4L2CameraSource>(config.cameraId);
-    if (!camera->openDevice(config.devicePath)) {
-        setError("打开摄像头失败: " + camera->lastError());
+    CameraSlot slot {};
+    slot.config = config;
+    slot.source = std::make_unique<V4L2CameraSource>(config.cameraId);
+    slot.state = CameraState::Created;
+
+    V4L2CameraSource& camera = *slot.source;
+    if (!camera.openDevice(config.devicePath)) {
+        slot.state = CameraState::Error;
+        slot.lastError = "打开摄像头失败: " + camera.lastError();
+        setError(slot.lastError);
         return false;
     }
 
-    if (!camera->configure(config.videoConfig)) {
-        setError("配置摄像头失败: " + camera->lastError());
+    if (!camera.configure(config.videoConfig)) {
+        slot.state = CameraState::Error;
+        slot.lastError = "配置摄像头失败: " + camera.lastError();
+        setError(slot.lastError);
         return false;
     }
 
-    if (!camera->setupDmaImportBuffers(config.bufferCount, config.dmaHeapPath)) {
-        setError("准备摄像头 DMA buffer 失败: " + camera->lastError());
+    if (!camera.setupDmaImportBuffers(config.bufferCount, config.dmaHeapPath)) {
+        slot.state = CameraState::Error;
+        slot.lastError = "准备摄像头 DMA buffer 失败: " + camera.lastError();
+        setError(slot.lastError);
         return false;
     }
 
-    m_cameraMap.emplace(config.cameraId, std::move(camera));
+    slot.state = CameraState::Ready;
+    m_cameraMap.emplace(config.cameraId, std::move(slot));
     m_lastError.clear();
     return true;
 }
@@ -61,7 +73,10 @@ bool CamManager::delCamera(int cameraId)
         return false;
     }
 
-    it->second->stop();
+    if (it->second.source) {
+        it->second.source->stop();
+        it->second.state = CameraState::Stopped;
+    }
     m_cameraMap.erase(it);
     m_lastError.clear();
     return true;
@@ -71,14 +86,29 @@ bool CamManager::startAll()
 {
     std::lock_guard<std::mutex> lock(m_camChangeMutex);
     for (auto& item : m_cameraMap) {
-        V4L2CameraSource& camera = *item.second;
-        if (camera.isStreaming()) {
-            continue;
-        }
-        if (!camera.start()) {
-            setError("启动摄像头失败: " + camera.lastError());
+        CameraSlot& slot = item.second;
+        if (!slot.source) {
+            slot.state = CameraState::Error;
+            slot.lastError = "摄像头对象为空";
+            setError(slot.lastError);
             return false;
         }
+
+        V4L2CameraSource& camera = *slot.source;
+        if (slot.state == CameraState::Streaming || camera.isStreaming()) {
+            slot.state = CameraState::Streaming;
+            continue;
+        }
+
+        if (!camera.start()) {
+            slot.state = CameraState::Error;
+            slot.lastError = "启动摄像头失败: " + camera.lastError();
+            setError(slot.lastError);
+            return false;
+        }
+
+        slot.state = CameraState::Streaming;
+        slot.lastError.clear();
     }
 
     m_stopRequested = false;
@@ -90,7 +120,11 @@ void CamManager::stopAll()
 {
     std::lock_guard<std::mutex> lock(m_camChangeMutex);
     for (auto& item : m_cameraMap) {
-        item.second->stop();
+        CameraSlot& slot = item.second;
+        if (slot.source) {
+            slot.source->stop();
+            slot.state = CameraState::Stopped;
+        }
     }
     m_stopRequested = true;
 }
@@ -112,8 +146,10 @@ bool CamManager::pollOnce(int timeoutMs)
         // 当前第一版约定 pollOnce/run 期间不并发 delCamera。
         // 如果后续要支持运行中删除摄像头，需要改成事件队列，或在快照里持有 shared_ptr。
         for (auto& item : m_cameraMap) {
-            V4L2CameraSource* camera = item.second.get();
-            if (!camera->isStreaming() || camera->fd() < 0) {
+            CameraSlot& slot = item.second;
+            V4L2CameraSource* camera = slot.source.get();
+            if (!camera || slot.state != CameraState::Streaming ||
+                !camera->isStreaming() || camera->fd() < 0) {
                 continue;
             }
 

@@ -9,12 +9,27 @@
 
 class CamManager {
 public:
+    enum class CameraState {
+        Created,
+        Ready,
+        Streaming,
+        Stopped,
+        Error
+    };
+
     struct CameraConfig {
         int cameraId = -1;
         std::string devicePath;
         V4L2CameraSource::CamConfig videoConfig;
         int bufferCount = 4;
         std::string dmaHeapPath = "/dev/dma_heap/system";
+    };
+
+    struct CameraSlot {
+        CameraConfig config;
+        std::unique_ptr<V4L2CameraSource> source;
+        CameraState state = CameraState::Created;
+        std::string lastError;
     };
 
     // 第一版并发约束：
@@ -41,7 +56,7 @@ private:
 
 private:
     std::mutex m_camChangeMutex;
-    std::unordered_map<int, std::unique_ptr<V4L2CameraSource>> m_cameraMap;
+    std::unordered_map<int, CameraSlot> m_cameraMap;
     std::string m_lastError;
     bool m_stopRequested = false;
 };
