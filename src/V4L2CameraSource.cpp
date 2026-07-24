@@ -1,36 +1,19 @@
 #include "V4L2CameraSource.hpp"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <dirent.h>
 #include <fcntl.h>
-#include <linux/ioctl.h>
-#include <linux/types.h>
 #include <linux/videodev2.h>
 #include <sstream>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#include <utility>
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
 
 namespace {
-
-constexpr const char* kDmaHeapDir = "/dev/dma_heap";
-
-struct DmaHeapAllocationData {
-    __u64 len;
-    __u32 fd;
-    __u32 fd_flags;
-    __u64 heap_flags;
-};
-
-#define DMA_HEAP_IOC_MAGIC 'H'
-#define DMA_HEAP_IOCTL_ALLOC \
-    _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, DmaHeapAllocationData)
 
 int ioctlRetry(int fd, unsigned long request, void* arg)
 {
@@ -89,58 +72,6 @@ std::vector<V4L2CameraSource::PixelFormat> formatCandidates(
         V4L2CameraSource::PixelFormat::YUYV,
         V4L2CameraSource::PixelFormat::YUV420P,
     };
-}
-
-std::vector<std::string> dmaHeapCandidates(const std::string& firstHeapPath)
-{
-    std::vector<std::string> paths;
-    if (!firstHeapPath.empty()) {
-        paths.push_back(firstHeapPath);
-    }
-
-    DIR* dir = opendir(kDmaHeapDir);
-    if (dir == nullptr) {
-        return paths;
-    }
-
-    while (dirent* entry = readdir(dir)) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        std::string path = std::string(kDmaHeapDir) + "/" + entry->d_name;
-        if (std::find(paths.begin(), paths.end(), path) == paths.end()) {
-            paths.push_back(path);
-        }
-    }
-    closedir(dir);
-
-    if (paths.size() > 1) {
-        std::sort(paths.begin() + (firstHeapPath.empty() ? 0 : 1), paths.end());
-    }
-    return paths;
-}
-
-int allocateFromDmaHeap(const std::string& heapPath, size_t bytes)
-{
-    int heapFd = open(heapPath.c_str(), O_RDWR | O_CLOEXEC);
-    if (heapFd < 0) {
-        return -1;
-    }
-
-    DmaHeapAllocationData alloc {};
-    alloc.len = bytes;
-    alloc.fd = 0;
-    alloc.fd_flags = O_RDWR | O_CLOEXEC;
-    alloc.heap_flags = 0;
-
-    if (ioctlRetry(heapFd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
-        close(heapFd);
-        return -1;
-    }
-
-    close(heapFd);
-    return static_cast<int>(alloc.fd);
 }
 
 } // namespace
@@ -364,52 +295,24 @@ bool V4L2CameraSource::setupDmaImportBuffers(
         return false;
     }
 
-    m_buffers.clear();
+    releaseBuffers();
     m_buffers.reserve(req.count);
 
-    const std::vector<std::string> heaps = dmaHeapCandidates(heapPath);
-    if (heaps.empty()) {
-        setError("未找到 /dev/dma_heap，暂不使用 DRM buffer fallback");
-        return false;
-    }
+    DmaAllocator allocator(heapPath);
 
     for (uint32_t i = 0; i < req.count; ++i) {
-        int dmaFd = -1;
-        std::string allocError;
-        for (const std::string& heap : heaps) {
-            dmaFd = allocateFromDmaHeap(heap, static_cast<size_t>(m_currentMode.sizeimg));
-            if (dmaFd >= 0) {
-                break;
-            }
-            allocError = errnoText("DMA heap 分配失败 " + heap);
-        }
-
-        if (dmaFd < 0) {
-            setError(allocError.empty() ? "DMA heap 分配失败" : allocError);
-            releaseBuffers();
-            return false;
-        }
-
-        void* va = mmap(nullptr,
-                        static_cast<size_t>(m_currentMode.sizeimg),
-                        PROT_READ | PROT_WRITE,
-                        MAP_SHARED,
-                        dmaFd,
-                        0);
-        if (va == MAP_FAILED) {
-            setError(errnoText("mmap DMA buffer 失败"));
-            close(dmaFd);
+        DmaMemory memory;
+        if (!allocator.allocate(static_cast<size_t>(m_currentMode.sizeimg), memory)) {
+            setError("DMA buffer 分配失败: " + allocator.lastError());
             releaseBuffers();
             return false;
         }
 
         DmaBuffer buffer {};
         buffer.index = static_cast<int>(i);
-        buffer.fd = dmaFd;
-        buffer.va = va;
-        buffer.capacity = static_cast<size_t>(m_currentMode.sizeimg);
+        buffer.memory = std::move(memory);
         buffer.queued = false;
-        m_buffers.push_back(buffer);
+        m_buffers.push_back(std::move(buffer));
     }
 
     for (DmaBuffer& buffer : m_buffers) {
@@ -516,9 +419,9 @@ bool V4L2CameraSource::dequeueFrame(Frame& frame)
     frame.v4l2Format = m_currentMode.v4l2Format;
     frame.bytesUsed = m_multiPlanar ? planes[0].bytesused : buf.bytesused;
     frame.index = static_cast<int>(buf.index);
-    frame.dmaFd = buffer.fd;
-    frame.va = buffer.va;
-    frame.capacity = buffer.capacity;
+    frame.dmaFd = buffer.memory.fd();
+    frame.va = buffer.memory.va();
+    frame.capacity = buffer.memory.size();
     frame.timestampUs =
         static_cast<uint64_t>(buf.timestamp.tv_sec) * 1000000ULL +
         static_cast<uint64_t>(buf.timestamp.tv_usec);
@@ -572,11 +475,11 @@ bool V4L2CameraSource::queueBuffer(int index)
     if (m_multiPlanar) {
         buf.length = 1;
         buf.m.planes = planes;
-        planes[0].length = static_cast<uint32_t>(buffer.capacity);
-        planes[0].m.fd = buffer.fd;
+        planes[0].length = static_cast<uint32_t>(buffer.memory.size());
+        planes[0].m.fd = buffer.memory.fd();
     } else {
-        buf.length = static_cast<uint32_t>(buffer.capacity);
-        buf.m.fd = buffer.fd;
+        buf.length = static_cast<uint32_t>(buffer.memory.size());
+        buf.m.fd = buffer.memory.fd();
     }
 
     if (ioctlRetry(m_v4l2Fd, VIDIOC_QBUF, &buf) < 0) {
@@ -598,14 +501,6 @@ bool V4L2CameraSource::validateBufferIndex(int index) const
 
 void V4L2CameraSource::releaseBuffers()
 {
-    for (DmaBuffer& buffer : m_buffers) {
-        if (buffer.va != nullptr && buffer.va != MAP_FAILED) {
-            munmap(buffer.va, buffer.capacity);
-        }
-        if (buffer.fd >= 0) {
-            close(buffer.fd);
-        }
-    }
     m_buffers.clear();
 }
 

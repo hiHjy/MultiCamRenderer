@@ -1,5 +1,7 @@
 #pragma once
 
+#include "DmaAllocator.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,9 +29,7 @@ public:
 
     struct DmaBuffer {
         int index = -1;
-        int fd = -1;
-        void* va = nullptr;
-        size_t capacity = 0;
+        DmaMemory memory;
         bool queued = false;
     };
 
