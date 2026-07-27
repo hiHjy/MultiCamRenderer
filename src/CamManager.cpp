@@ -8,6 +8,35 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+V4L2CameraSource::PixelFormat toV4L2PixelFormat(CamManager::PixelFormat format)
+{
+    switch (format) {
+    case CamManager::PixelFormat::Auto:
+        return V4L2CameraSource::PixelFormat::Auto;
+    case CamManager::PixelFormat::NV12:
+        return V4L2CameraSource::PixelFormat::NV12;
+    case CamManager::PixelFormat::YUYV:
+        return V4L2CameraSource::PixelFormat::YUYV;
+    case CamManager::PixelFormat::YUV420P:
+        return V4L2CameraSource::PixelFormat::YUV420P;
+    }
+    return V4L2CameraSource::PixelFormat::Auto;
+}
+
+V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig& config)
+{
+    V4L2CameraSource::CamConfig v4l2Config {};
+    v4l2Config.width = config.width;
+    v4l2Config.height = config.height;
+    v4l2Config.fps = config.fps;
+    v4l2Config.format = toV4L2PixelFormat(config.format);
+    return v4l2Config;
+}
+
+} // namespace
+
 bool CamManager::addCamera(const CameraConfig& config)
 {
     if (config.cameraId < 0) {
@@ -17,6 +46,11 @@ bool CamManager::addCamera(const CameraConfig& config)
 
     if (config.devicePath.empty()) {
         setError("devicePath 不能为空");
+        return false;
+    }
+
+    if (config.width <= 0 || config.height <= 0) {
+        setError("摄像头宽高必须大于 0");
         return false;
     }
 
@@ -44,7 +78,8 @@ bool CamManager::addCamera(const CameraConfig& config)
         return false;
     }
 
-    if (!camera.configure(config.videoConfig)) {
+    const V4L2CameraSource::CamConfig v4l2Config = toV4L2CameraConfig(config);
+    if (!camera.configure(v4l2Config)) {
         slot.state = CameraState::Error;
         slot.lastError = "配置摄像头失败: " + camera.lastError();
         setError(slot.lastError);

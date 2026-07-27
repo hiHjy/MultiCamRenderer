@@ -9,6 +9,13 @@
 
 class CamManager {
 public:
+    enum class PixelFormat {
+        Auto,
+        NV12,
+        YUYV,
+        YUV420P
+    };
+
     enum class CameraState {
         Created,
         Ready,
@@ -20,7 +27,10 @@ public:
     struct CameraConfig {
         int cameraId = -1;
         std::string devicePath;
-        V4L2CameraSource::CamConfig videoConfig;
+        int width = 0;
+        int height = 0;
+        int fps = 0;
+        PixelFormat format = PixelFormat::Auto;
         int bufferCount = 4;
         std::string dmaHeapPath = "/dev/dma_heap/system";
     };

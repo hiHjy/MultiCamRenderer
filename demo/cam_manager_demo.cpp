@@ -56,10 +56,10 @@ int main(int argc, char** argv)
         CamManager::CameraConfig config {};
         config.cameraId = static_cast<int>(i);
         config.devicePath = devices[i];
-        config.videoConfig.width = width;
-        config.videoConfig.height = height;
-        config.videoConfig.fps = fps;
-        config.videoConfig.format = V4L2CameraSource::PixelFormat::Auto;
+        config.width = width;
+        config.height = height;
+        config.fps = fps;
+        config.format = CamManager::PixelFormat::Auto;
         config.bufferCount = 4;
 
         if (!manager.addCamera(config)) {
