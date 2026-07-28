@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DmaAllocator.hpp"
+#include "VideoTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,13 +19,6 @@ public:
         Configured,
         BufferAllocated,
         Streaming
-    };
-
-    enum class PixelFormat {
-        Auto,
-        NV12,
-        YUYV,
-        YUV420P
     };
 
     struct DmaBuffer {

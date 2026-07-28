@@ -59,7 +59,7 @@ int main(int argc, char** argv)
         config.width = width;
         config.height = height;
         config.fps = fps;
-        config.format = CamManager::PixelFormat::Auto;
+        config.format = PixelFormat::Auto;
         config.bufferCount = 4;
 
         if (!manager.addCamera(config)) {

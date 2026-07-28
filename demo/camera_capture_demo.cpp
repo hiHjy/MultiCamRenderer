@@ -13,16 +13,18 @@
 
 namespace {
 
-const char* pixelFormatName(V4L2CameraSource::PixelFormat format)
+const char* pixelFormatName(PixelFormat format)
 {
     switch (format) {
-    case V4L2CameraSource::PixelFormat::Auto:
+    case PixelFormat::Unknown:
+        return "Unknown";
+    case PixelFormat::Auto:
         return "Auto";
-    case V4L2CameraSource::PixelFormat::NV12:
+    case PixelFormat::NV12:
         return "NV12";
-    case V4L2CameraSource::PixelFormat::YUYV:
+    case PixelFormat::YUYV:
         return "YUYV";
-    case V4L2CameraSource::PixelFormat::YUV420P:
+    case PixelFormat::YUV420P:
         return "YUV420P";
     }
     return "Unknown";
@@ -190,7 +192,7 @@ int main(int argc, char** argv)
     cfg.width = width;
     cfg.height = height;
     cfg.fps = fps;
-    cfg.format = V4L2CameraSource::PixelFormat::Auto;
+    cfg.format = PixelFormat::Auto;
 
     if (!camera.configure(cfg)) {
         std::cerr << "configure 失败: " << camera.lastError() << "\n";

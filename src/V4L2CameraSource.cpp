@@ -31,46 +31,48 @@ std::string errnoText(const std::string& prefix)
     return oss.str();
 }
 
-uint32_t toV4L2Format(V4L2CameraSource::PixelFormat format)
+uint32_t toV4L2Format(PixelFormat format)
 {
     switch (format) {
-    case V4L2CameraSource::PixelFormat::NV12:
+    case PixelFormat::Unknown:
+        return 0;
+    case PixelFormat::NV12:
         return V4L2_PIX_FMT_NV12;
-    case V4L2CameraSource::PixelFormat::YUYV:
+    case PixelFormat::YUYV:
         return V4L2_PIX_FMT_YUYV;
-    case V4L2CameraSource::PixelFormat::YUV420P:
+    case PixelFormat::YUV420P:
         return V4L2_PIX_FMT_YUV420;
-    case V4L2CameraSource::PixelFormat::Auto:
+    case PixelFormat::Auto:
         return 0;
     }
     return 0;
 }
 
-V4L2CameraSource::PixelFormat fromV4L2Format(uint32_t format)
+PixelFormat fromV4L2Format(uint32_t format)
 {
     switch (format) {
     case V4L2_PIX_FMT_NV12:
-        return V4L2CameraSource::PixelFormat::NV12;
+        return PixelFormat::NV12;
     case V4L2_PIX_FMT_YUYV:
-        return V4L2CameraSource::PixelFormat::YUYV;
+        return PixelFormat::YUYV;
     case V4L2_PIX_FMT_YUV420:
-        return V4L2CameraSource::PixelFormat::YUV420P;
+        return PixelFormat::YUV420P;
     default:
-        return V4L2CameraSource::PixelFormat::Auto;
+        return PixelFormat::Unknown;
     }
 }
 
-std::vector<V4L2CameraSource::PixelFormat> formatCandidates(
-    V4L2CameraSource::PixelFormat format)
+std::vector<PixelFormat> formatCandidates(
+    PixelFormat format)
 {
-    if (format != V4L2CameraSource::PixelFormat::Auto) {
+    if (format != PixelFormat::Auto) {
         return {format};
     }
 
     return {
-        V4L2CameraSource::PixelFormat::NV12,
-        V4L2CameraSource::PixelFormat::YUYV,
-        V4L2CameraSource::PixelFormat::YUV420P,
+        PixelFormat::NV12,
+        PixelFormat::YUYV,
+        PixelFormat::YUV420P,
     };
 }
 

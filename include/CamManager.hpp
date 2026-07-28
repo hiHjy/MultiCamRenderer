@@ -9,13 +9,6 @@
 
 class CamManager {
 public:
-    enum class PixelFormat {
-        Auto,
-        NV12,
-        YUYV,
-        YUV420P
-    };
-
     enum class CameraState {
         Created,
         Ready,

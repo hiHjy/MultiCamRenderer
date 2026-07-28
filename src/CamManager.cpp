@@ -10,19 +10,21 @@
 
 namespace {
 
-V4L2CameraSource::PixelFormat toV4L2PixelFormat(CamManager::PixelFormat format)
+PixelFormat toV4L2PixelFormat(PixelFormat format)
 {
     switch (format) {
-    case CamManager::PixelFormat::Auto:
-        return V4L2CameraSource::PixelFormat::Auto;
-    case CamManager::PixelFormat::NV12:
-        return V4L2CameraSource::PixelFormat::NV12;
-    case CamManager::PixelFormat::YUYV:
-        return V4L2CameraSource::PixelFormat::YUYV;
-    case CamManager::PixelFormat::YUV420P:
-        return V4L2CameraSource::PixelFormat::YUV420P;
+    case PixelFormat::Unknown:
+        return PixelFormat::Auto;
+    case PixelFormat::Auto:
+        return PixelFormat::Auto;
+    case PixelFormat::NV12:
+        return PixelFormat::NV12;
+    case PixelFormat::YUYV:
+        return PixelFormat::YUYV;
+    case PixelFormat::YUV420P:
+        return PixelFormat::YUV420P;
     }
-    return V4L2CameraSource::PixelFormat::Auto;
+    return PixelFormat::Auto;
 }
 
 V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig& config)
