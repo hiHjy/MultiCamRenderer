@@ -1,12 +1,13 @@
 #pragma once
 
+#include "FrameHub.hpp"
 #include "V4L2CameraSource.hpp"
 
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-
+#include "Consumer.hpp"
 class CamManager {
 public:
     enum class CameraState {
@@ -28,6 +29,7 @@ public:
         std::string dmaHeapPath = "/dev/dma_heap/system";
     };
 
+	
     struct CameraSlot {
         CameraConfig config;
         std::unique_ptr<V4L2CameraSource> source;
@@ -42,7 +44,7 @@ public:
     // 后续若要支持热插拔，应改成事件队列或 shared_ptr 快照。
     bool addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
-
+	void addConsumerForHub(uint32_t cameraId, std::unique_ptr<Consumer> consumer);
     bool startAll();
     void stopAll();
 
@@ -59,7 +61,8 @@ private:
 
 private:
     std::mutex m_camChangeMutex;
-    std::unordered_map<int, CameraSlot> m_cameraMap;
+    std::unordered_map<int, CameraSlot> m_cameraMap{};
     std::string m_lastError;
-    bool m_stopRequested = false;
+    std::unordered_map<uint32_t, std::unique_ptr<FrameHub>> m_FrameHubMap;
+	bool m_stopRequested = false;
 };

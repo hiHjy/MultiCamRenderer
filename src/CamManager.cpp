@@ -1,5 +1,6 @@
 #include "CamManager.hpp"
-
+#include "FrameHub.hpp"
+#include "VideoFrame.hpp"
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -98,9 +99,21 @@ bool CamManager::addCamera(const CameraConfig& config)
     slot.state = CameraState::Ready;
     m_cameraMap.emplace(config.cameraId, std::move(slot));
     m_lastError.clear();
+
+	auto hub = std::make_unique<FrameHub>(config.cameraId);
+	m_FrameHubMap.emplace(config.cameraId, std::move(hub));
+
     return true;
 }
-
+void CamManager::addConsumerForHub(uint32_t cameraId, std::unique_ptr<Consumer> consumer) 
+{
+	auto it = m_FrameHubMap.find(cameraId);
+    if (it == m_FrameHubMap.end()) {
+        // 处理找不到的情况（比如创建新的 Hub，或返回错误）
+        return;
+    }
+	it->second->addConsumer(std::move(consumer));
+}
 bool CamManager::delCamera(int cameraId)
 {
     std::lock_guard<std::mutex> lock(m_camChangeMutex);
@@ -241,14 +254,35 @@ bool CamManager::pollOnce(int timeoutMs)
             continue;
         }
 
-        std::cout << "camera " << camera->cameraId()
-                  << " frame seq=" << frame.sequence
-                  << " ts_us=" << frame.timestampUs
-                  << " bytes=" << frame.bytesUsed
-                  << " fd=" << frame.dmaFd
-                  << " index=" << frame.index
-                  << "\n";
+        // std::cout << "camera " << camera->cameraId()
+        //           << " frame seq=" << frame.sequence
+        //           << " ts_us=" << frame.timestampUs
+        //           << " bytes=" << frame.bytesUsed
+        //           << " fd=" << frame.dmaFd
+        //           << " index=" << frame.index
+        //           << "\n";
 
+		VideoFrame _frame {
+			.streamId = camera->cameraId(),
+			.dmaFd = frame.dmaFd,
+			.va = frame.va,
+			.capacity = frame.capacity,
+			.bytesUsed = frame.bytesUsed,
+			.width = frame.width,
+			.height = frame.height,
+			.stride = frame.stride,
+			.format = frame.format,
+			.nativeFormat = frame.v4l2Format,
+			.timestampUs = frame.timestampUs,
+			.sequence = frame.sequence,
+			.bufferIndex = frame.index,
+		};
+
+		auto& hub = m_FrameHubMap[camera->cameraId()];
+		// if (!hub) {
+			
+		// }
+		hub->publishFrame(_frame);
         if (!camera->requeueFrame(frame)) {
             setError("requeueFrame 失败: " + camera->lastError());
             return false;
