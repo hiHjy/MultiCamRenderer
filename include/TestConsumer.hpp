@@ -6,8 +6,11 @@
 
 class TestConsumer : public Consumer {
 public:
-	void onFrame(const VideoFrame &frame) override {
+
+	void onFrame(const VideoFrame& frame) override
+	{
 		std::cout << " TestConsumer:"
+				  <<  m_n
 		          << " stream=" << frame.streamId
 		          << " seq=" << frame.sequence
 		          << " ts=" << frame.timestampUs
@@ -22,8 +25,11 @@ public:
 		          << std::endl;
 	}
 
-
 	TestConsumer() = default;
-	~TestConsumer() = default;
+	TestConsumer(uint32_t n): m_n(n)
+	{
 
+	};
+	~TestConsumer() override = default;
+	uint32_t m_n;
 };

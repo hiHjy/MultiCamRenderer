@@ -4,32 +4,29 @@
 #include "VideoFrame.hpp"
 
 #include <cstddef>
-#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 class FrameHub {
-
 public:
 	FrameHub() = default;
-	explicit FrameHub(uint32_t streamId)
-		: m_streamId(streamId)
-	{
-	}
-	void addConsumer(std::unique_ptr<Consumer> consumer) {
-		m_consumers.push_back(std::move(consumer));
-		
-	}
+	explicit FrameHub(int streamId);
 
-	bool publishFrame(const VideoFrame& frame) {
-		for(auto& consumer :  m_consumers) {
-			consumer->onFrame(frame);
-		}
-		return true;
-	}
+	bool addConsumer(std::unique_ptr<Consumer> consumer);
+	bool publishFrame(const VideoFrame& frame);
+
+	int streamId() const;
+	size_t consumerCount() const;
+	const std::string& lastError() const;
 
 private:
-	uint32_t m_streamId = 0;
+	void setError(const std::string& message);
+
+private:
+	int m_streamId = -1;
+	mutable std::mutex m_mutex;
 	std::vector<std::unique_ptr<Consumer>> m_consumers;
+	std::string m_lastError;
 };

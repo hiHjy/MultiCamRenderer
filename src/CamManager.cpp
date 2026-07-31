@@ -1,6 +1,7 @@
 #include "CamManager.hpp"
 #include "FrameHub.hpp"
 #include "VideoFrame.hpp"
+
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -97,23 +98,43 @@ bool CamManager::addCamera(const CameraConfig& config)
     }
 
     slot.state = CameraState::Ready;
-    m_cameraMap.emplace(config.cameraId, std::move(slot));
-    m_lastError.clear();
+    auto hub = std::make_unique<FrameHub>(config.cameraId);
 
-	auto hub = std::make_unique<FrameHub>(config.cameraId);
-	m_FrameHubMap.emplace(config.cameraId, std::move(hub));
+    m_cameraMap.emplace(config.cameraId, std::move(slot));
+    m_frameHubMap.emplace(config.cameraId, std::move(hub));
+    m_lastError.clear();
 
     return true;
 }
-void CamManager::addConsumerForHub(uint32_t cameraId, std::unique_ptr<Consumer> consumer) 
+
+bool CamManager::addFrameConsumer(int cameraId, std::unique_ptr<Consumer> consumer)
 {
-	auto it = m_FrameHubMap.find(cameraId);
-    if (it == m_FrameHubMap.end()) {
-        // 处理找不到的情况（比如创建新的 Hub，或返回错误）
-        return;
-    }
-	it->second->addConsumer(std::move(consumer));
+	if (!consumer) {
+		setError("consumer 不能为空");
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(m_camChangeMutex);
+	auto it = m_frameHubMap.find(cameraId);
+	if (it == m_frameHubMap.end() || !it->second) {
+		setError("cameraId 对应的 FrameHub 不存在");
+		return false;
+	}
+
+	if (!it->second->addConsumer(std::move(consumer))) {
+		setError("添加 consumer 失败: " + it->second->lastError());
+		return false;
+	}
+
+	m_lastError.clear();
+	return true;
 }
+
+bool CamManager::addConsumerForHub(int cameraId, std::unique_ptr<Consumer> consumer)
+{
+	return addFrameConsumer(cameraId, std::move(consumer));
+}
+
 bool CamManager::delCamera(int cameraId)
 {
     std::lock_guard<std::mutex> lock(m_camChangeMutex);
@@ -128,6 +149,7 @@ bool CamManager::delCamera(int cameraId)
         it->second.state = CameraState::Stopped;
     }
     m_cameraMap.erase(it);
+    m_frameHubMap.erase(cameraId);
     m_lastError.clear();
     return true;
 }
@@ -183,11 +205,13 @@ bool CamManager::pollOnce(int timeoutMs)
 {
     std::vector<pollfd> fds;
     std::vector<V4L2CameraSource*> cameras;
+    std::vector<FrameHub*> hubs;
 
     {
         std::lock_guard<std::mutex> lock(m_camChangeMutex);
         fds.reserve(m_cameraMap.size());
         cameras.reserve(m_cameraMap.size());
+        hubs.reserve(m_cameraMap.size());
 
         // 这里复制 fd 和裸指针快照后立刻释放锁，避免 poll 阻塞期间卡住
         // addCamera/stopAll 等管理操作。
@@ -208,6 +232,8 @@ bool CamManager::pollOnce(int timeoutMs)
             pfd.events = POLLIN | POLLERR | POLLHUP;
             fds.push_back(pfd);
             cameras.push_back(camera);
+            auto hubIt = m_frameHubMap.find(camera->cameraId());
+            hubs.push_back(hubIt == m_frameHubMap.end() ? nullptr : hubIt->second.get());
         }
     }
 
@@ -236,6 +262,7 @@ bool CamManager::pollOnce(int timeoutMs)
         }
 
         V4L2CameraSource* camera = cameras[i];
+        FrameHub* hub = hubs[i];
         if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             setError("摄像头 fd 异常");
             return false;
@@ -262,29 +289,41 @@ bool CamManager::pollOnce(int timeoutMs)
         //           << " index=" << frame.index
         //           << "\n";
 
-		VideoFrame _frame {
-			.streamId = camera->cameraId(),
-			.dmaFd = frame.dmaFd,
-			.va = frame.va,
-			.capacity = frame.capacity,
-			.bytesUsed = frame.bytesUsed,
-			.width = frame.width,
-			.height = frame.height,
-			.stride = frame.stride,
-			.format = frame.format,
-			.nativeFormat = frame.v4l2Format,
-			.timestampUs = frame.timestampUs,
-			.sequence = frame.sequence,
-			.bufferIndex = frame.index,
-		};
+        VideoFrame videoFrame {
+            .streamId = camera->cameraId(),
+            .dmaFd = frame.dmaFd,
+            .va = frame.va,
+            .capacity = frame.capacity,
+            .bytesUsed = frame.bytesUsed,
+            .width = frame.width,
+            .height = frame.height,
+            .stride = frame.stride,
+            .format = frame.format,
+            .nativeFormat = frame.v4l2Format,
+            .timestampUs = frame.timestampUs,
+            .sequence = frame.sequence,
+            .bufferIndex = frame.index,
+        };
 
-		auto& hub = m_FrameHubMap[camera->cameraId()];
-		// if (!hub) {
-			
-		// }
-		hub->publishFrame(_frame);
+        bool publishOk = true;
+        std::string publishError;
+        if (hub) {
+            publishOk = hub->publishFrame(videoFrame);
+            if (!publishOk) {
+                publishError = hub->lastError();
+            }
+        } else {
+            publishOk = false;
+            publishError = "cameraId 对应的 FrameHub 不存在";
+        }
+
         if (!camera->requeueFrame(frame)) {
             setError("requeueFrame 失败: " + camera->lastError());
+            return false;
+        }
+
+        if (!publishOk) {
+            setError("publishFrame 失败: " + publishError);
             return false;
         }
     }
