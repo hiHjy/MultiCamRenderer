@@ -417,6 +417,9 @@ bool V4L2CameraSource::dequeueFrame(Frame& frame)
     frame.width = m_currentMode.width;
     frame.height = m_currentMode.height;
     frame.stride = m_currentMode.stride;
+    // V4L2 这里当前只可靠拿到 bytesperline 对应的横向 stride。
+    // 纵向 stride 不乱猜，保持 0，让 RGA/消费者按 height 默认处理。
+    frame.heightStride = 0;
     frame.format = m_currentMode.format;
     frame.v4l2Format = m_currentMode.v4l2Format;
     frame.bytesUsed = m_multiPlanar ? planes[0].bytesused : buf.bytesused;

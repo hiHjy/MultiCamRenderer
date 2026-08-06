@@ -51,6 +51,7 @@ public:
         int width = 0;
         int height = 0;
         int stride = 0;
+        int heightStride = 0;
         PixelFormat format = PixelFormat::Auto;
         uint32_t v4l2Format = 0;
         size_t bytesUsed = 0;

@@ -298,6 +298,7 @@ bool CamManager::pollOnce(int timeoutMs)
             .width = frame.width,
             .height = frame.height,
             .stride = frame.stride,
+            .heightStride = frame.heightStride,
             .format = frame.format,
             .nativeFormat = frame.v4l2Format,
             .timestampUs = frame.timestampUs,
