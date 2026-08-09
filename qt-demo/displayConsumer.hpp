@@ -9,7 +9,10 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
+#include <optional>
+#include <thread>
 
 // 跨线程传递帧的轻量结构体——只包含标量字段，不含指针/fd 所有权
 struct DisplayFrame {
@@ -33,7 +36,8 @@ public:
     static constexpr int BUFFER_COUNT = 4;
 
     explicit DisplayConsumer(QObject *parent = nullptr);
-    void onFrame(const FramePacket &packet) override;
+    ~DisplayConsumer() override;
+    void onFrame(FramePacket packet) override;
 
 public slots:
     void releaseFrameByIndex(int bufferIndex);
@@ -42,10 +46,19 @@ signals:
     void frameReady(const DisplayFrame &frame);
 
 private:
+    void workerLoop();
+    void processFrame(FramePacket packet);
+
+private:
     RgaEngine m_rga;
     DmaBufferPool m_rgbaPool;
     std::array<VideoFrame*, BUFFER_COUNT> m_inFlightFrames {};
     std::mutex m_inFlightMutex;
+    std::mutex m_pendingMutex;
+    std::condition_variable m_pendingCv;
+    std::optional<FramePacket> m_latestPacket;
+    bool m_stopping = false;
+    std::thread m_workerThread;
     std::chrono::steady_clock::time_point m_fpsLogStart {};
     int m_fpsLogFrames = 0;
 };

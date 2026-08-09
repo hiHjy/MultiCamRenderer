@@ -7,7 +7,7 @@
 class TestConsumer : public Consumer {
 public:
 
-	void onFrame(const FramePacket& packet) override
+	void onFrame(FramePacket packet) override
 	{
 		const VideoFrame& frame = packet.frame;
 		std::cout << " TestConsumer:"

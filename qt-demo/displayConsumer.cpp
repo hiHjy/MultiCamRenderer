@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
+#include <utility>
 
 namespace {
 
@@ -37,19 +38,63 @@ DisplayConsumer::DisplayConsumer(QObject *parent)
     const size_t bufferSize = RgaEngine::bufferSizeFor(PixelFormat::RGBA8888, WIDTH, HEIGHT);
     if (bufferSize == 0) {
         qWarning() << "DisplayConsumer: 计算 RGA 目标 DMA buffer size 失败";
-        return;
-    }
-
-    if (!m_rgbaPool.init(BUFFER_COUNT, bufferSize)) {
+    } else if (!m_rgbaPool.init(BUFFER_COUNT, bufferSize)) {
         qWarning() << "DisplayConsumer: 分配 RGA 目标 DMA buffer pool 失败:"
                    << QString::fromStdString(m_rgbaPool.lastError());
     }
+
+    m_workerThread = std::thread(&DisplayConsumer::workerLoop, this);
 }
 
-void DisplayConsumer::onFrame(const FramePacket &packet)
+DisplayConsumer::~DisplayConsumer()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_stopping = true;
+        m_latestPacket.reset();
+    }
+    m_pendingCv.notify_all();
+
+    if (m_workerThread.joinable())
+        m_workerThread.join();
+}
+
+void DisplayConsumer::onFrame(FramePacket packet)
+{
+    // 摄像头线程调用，只保留最新帧并立刻返回。
+    // 如果 worker 还没来得及处理上一帧，旧 packet 会在这里析构并释放 lease。
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_latestPacket = std::move(packet);
+    }
+    m_pendingCv.notify_one();
+}
+
+void DisplayConsumer::workerLoop()
+{
+    while (true) {
+        FramePacket packet;
+        {
+            std::unique_lock<std::mutex> lock(m_pendingMutex);
+            m_pendingCv.wait(lock, [this] {
+                return m_stopping || m_latestPacket.has_value();
+            });
+
+            if (m_stopping && !m_latestPacket)
+                break;
+
+            packet = std::move(*m_latestPacket);
+            m_latestPacket.reset();
+        }
+
+        processFrame(std::move(packet));
+    }
+}
+
+void DisplayConsumer::processFrame(FramePacket packet)
 {
     const VideoFrame &frame = packet.frame;
-    // 摄像头线程调用，需快速返回。
+    // DisplayConsumer worker 线程调用。
     // 通过 RgaEngine::rga() 把摄像头 YUYV 转成 RGBA，存进我们私有 buffer。
     if (frame.width != WIDTH || frame.height != HEIGHT) {
         qWarning() << "DisplayConsumer: 帧尺寸不匹配:"
@@ -95,6 +140,10 @@ void DisplayConsumer::onFrame(const FramePacket &packet)
         releaseFrameByIndex(dstFrame->bufferIndex);
         return;
     }
+
+    // RGA 已经把 V4L2 帧拷贝到显示私有 pool，后面只使用 dstFrame。
+    // 这里主动释放 lease，让摄像头 buffer 可以尽早回到 CamManager 的 return queue。
+    packet.lease.reset();
 
     // 转换成功，把稳定数据的 fd 抛给主线程
     DisplayFrame df;

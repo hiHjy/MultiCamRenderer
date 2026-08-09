@@ -17,7 +17,7 @@ public:
 	}
     ~RgaCopyConsumer() override = default;
 
-    void onFrame(const FramePacket& packet) override
+    void onFrame(FramePacket packet) override
 	{
 		const VideoFrame& frame = packet.frame;
 		if (m_pool.state() == DmaBufferPool::PoolState::Busy || m_pool.state() == DmaBufferPool::PoolState::Uninitialized) {

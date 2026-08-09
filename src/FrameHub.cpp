@@ -1,6 +1,5 @@
 #include "FrameHub.hpp"
 
-#include <exception>
 #include <string>
 #include <vector>
 
@@ -51,15 +50,7 @@ bool FrameHub::publishFrame(const FramePacket& packet)
 	}
 
 	for (const std::shared_ptr<Consumer>& consumer : consumers) {
-		try {
-			consumer->onFrame(packet);
-		} catch (const std::exception& e) {
-			setError(std::string("consumer onFrame 异常: ") + e.what());
-			return false;
-		} catch (...) {
-			setError("consumer onFrame 未知异常");
-			return false;
-		}
+		consumer->onFrame(packet);
 	}
 
 	m_lastError.clear();

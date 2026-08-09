@@ -237,7 +237,7 @@ V4L2CameraSource
    virtual void onFrame(const VideoFrame& frame) = 0;
    ```
 
-   新接口：
+   第一版新接口：
 
    ```cpp
    virtual void onFrame(const FramePacket& packet) = 0;
@@ -253,6 +253,16 @@ V4L2CameraSource
    ```
 
    这样 sink 如果需要异步持有 V4L2 帧，可以复制 `lease` 延长生命周期；如果只是快速 RGA 到自己的池子，则处理完直接返回即可。
+
+   后续复盘时发现这里还不够准确：如果希望 sink 真正拥有自己的 lease 引用，接口应该按值传递 `FramePacket`，否则 `const FramePacket&` 只是借看。
+
+   因此本次继续调整为：
+
+   ```cpp
+   virtual void onFrame(FramePacket packet) = 0;
+   ```
+
+   这样每个 sink 都会拿到自己那份 `shared_ptr<FrameLease>` 引用。同步 sink 可以函数结束自动释放；异步 sink 可以 `std::move(packet)` 到自己的队列或 latest slot 中，处理完成后再释放 lease。
 
 9. `FrameHub` 改为弱引用消费者。
 
@@ -282,6 +292,36 @@ V4L2CameraSource
     ```
 
     当前第一版 return queue 已经落地，但还没有接 `eventfd/pipe` 唤醒 `poll()`。代码中已留 TODO：后续应把 return queue 接进 `poll()` 的 fd 集合，避免极端情况下等到 poll timeout 才处理归还。
+
+11. `DisplayConsumer` 改为异步 latest sink。
+
+    第一版 `DisplayConsumer::onFrame()` 虽然已经使用 `FramePacket`，但 RGA 仍然发生在采集线程回调里，本质还是同步显示 sink。为了让多消费者、多摄像头时更容易并发，本次改成：
+
+    ```text
+    onFrame(packet)
+      -> std::move(packet) 到 m_latestPacket
+      -> notify worker
+      -> 立刻返回
+
+    workerLoop()
+      -> 从 m_latestPacket move 出局部 packet
+      -> 清空 latest slot 并释放锁
+      -> RGA 到显示私有 DmaBufferPool
+      -> packet.lease.reset()
+      -> emit frameReady()
+    ```
+
+    这里的关键点是：锁只保护 `m_latestPacket` 这个共享槽位，不覆盖 RGA 慢操作。worker 把 packet 从槽位中 `std::move` 到局部变量后，采集线程可以继续塞入新的最新帧。
+
+12. 去掉 `FrameHub` 对 `onFrame()` 的异常捕获。
+
+    `FrameHub` 现在直接调用：
+
+    ```cpp
+    consumer->onFrame(packet);
+    ```
+
+    不再用 `try/catch` 包住每个 sink。设计约定是：`onFrame()` 不应该抛异常，sink 的错误由自己记录、丢帧或释放私有资源处理。这里没有给接口加 `noexcept`，避免现阶段某个 sink 内部意外异常直接导致 `std::terminate`；后续如果全项目明确禁异常，再统一收紧。
 
 ### 重要设计结论
 
