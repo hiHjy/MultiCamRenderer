@@ -9,7 +9,7 @@ FrameHub::FrameHub(int streamId)
 {
 }
 
-bool FrameHub::addConsumer(std::unique_ptr<Consumer> consumer)
+bool FrameHub::addConsumer(std::shared_ptr<Consumer> consumer)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -18,14 +18,14 @@ bool FrameHub::addConsumer(std::unique_ptr<Consumer> consumer)
 		return false;
 	}
 
-	m_consumers.push_back(std::move(consumer));
+	m_consumers.push_back(consumer);
 	m_lastError.clear();
 	return true;
 }
 
-bool FrameHub::publishFrame(const VideoFrame& frame)
+bool FrameHub::publishFrame(const FramePacket& packet)
 {
-	std::vector<Consumer*> consumers;
+	std::vector<std::shared_ptr<Consumer>> consumers;
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -34,24 +34,25 @@ bool FrameHub::publishFrame(const VideoFrame& frame)
 			return false;
 		}
 
-		if (frame.streamId != m_streamId) {
+		if (packet.frame.streamId != m_streamId) {
 			setError("VideoFrame streamId 和 FrameHub streamId 不匹配");
 			return false;
 		}
 
 		consumers.reserve(m_consumers.size());
-		for (const std::unique_ptr<Consumer>& consumer : m_consumers) {
-			if (!consumer) {
-				setError("consumer 对象为空");
-				return false;
+		for (auto it = m_consumers.begin(); it != m_consumers.end();) {
+			if (auto consumer = it->lock()) {
+				consumers.push_back(std::move(consumer));
+				++it;
+			} else {
+				it = m_consumers.erase(it);
 			}
-			consumers.push_back(consumer.get());
 		}
 	}
 
-	for (Consumer* consumer : consumers) {
+	for (const std::shared_ptr<Consumer>& consumer : consumers) {
 		try {
-			consumer->onFrame(frame);
+			consumer->onFrame(packet);
 		} catch (const std::exception& e) {
 			setError(std::string("consumer onFrame 异常: ") + e.what());
 			return false;

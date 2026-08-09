@@ -6,9 +6,9 @@ class Consumer {
 public:
 	virtual ~Consumer() = default;
 
-	// 同步帧回调：frame 只在 onFrame 调用期间有效。
-	// 如果 Consumer 需要异步处理，必须在 onFrame 内部立即拷贝到自己的 buffer。
-	// onFrame 必须快速返回，不能做长时间阻塞操作，否则会拖住摄像头 requeue。
-	// 第一版由 Consumer 自己负责慢处理隔离，例如 RGA copy 到私有 buffer 后返回。
-	virtual void onFrame(const VideoFrame& frame) = 0;
+	// 帧回调：packet.lease 保护底层 V4L2 buffer 生命周期。
+	// sink 如果要长时间处理，应该尽快 RGA/copy 到自己的 buffer pool，
+	// 然后释放 packet/lease，让摄像头 buffer 可以回到采集线程 QBUF。
+	// onFrame 可以做一次快速硬件处理，但不能做编码等待、写盘、网络等慢操作。
+	virtual void onFrame(const FramePacket& packet) = 0;
 };

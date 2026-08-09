@@ -1,4 +1,16 @@
 .clangd
 .vscode
-build*
+build
+build-aarch64
+
 *json
+
+# Qt/CMake 本地构建产物
+qt-demo/build/
+qt-demo/build-aarch64/
+qt-demo/deploy/
+qt-demo/CMakeLists.txt.user*
+
+# demo 运行生成物
+demo/rga/rga_ops_demo
+demo/frame_lease/frame_lease_demo

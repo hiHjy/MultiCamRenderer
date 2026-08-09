@@ -113,3 +113,208 @@ CamManager
 - 队列满时由消费者自己决定丢旧帧还是丢新帧。
 
 这样 `FrameHub` 和 `CamManager` 保持简单，摄像头原始 V4L2 buffer 可以尽快 `QBUF` 归还。
+
+## 2026-08-09
+
+### 项目当前进度
+
+这一版从“摄像头采集 + RGA copy 测试”推进到了可用的 Qt Quick DMA-BUF 显示 demo，并且开始把底层帧生命周期模型收紧。当前主链路已经变成：
+
+```text
+V4L2CameraSource
+  -> CamManager DQBUF
+  -> FramePacket + FrameLease
+  -> FrameHub weak_ptr 分发
+  -> Consumer/Sink 快速处理
+  -> lease 释放后投递 return queue
+  -> CamManager 统一 QBUF
+```
+
+这里的核心变化是：`VideoFrame` 仍然只描述图像和 DMA 资源，真正保护 V4L2 buffer 生命周期的是外层 `FramePacket::lease`。
+
+### 今天完成的事
+
+1. 新增 Qt Quick DMA-BUF 显示 demo。
+
+   新增 `qt-demo`，实现了从摄像头 YUYV 帧到 Qt Quick 纹理显示的链路：
+
+   ```text
+   V4L2 YUYV DMA-BUF
+     -> DisplayConsumer 使用 RGA 转 RGBA
+     -> DmaBufferPool 保存稳定 RGBA 帧
+     -> Qt Quick 通过 EGLImage 导入 DMA-BUF
+     -> QSGTexture 缓存后显示
+   ```
+
+   当前板端测试约 `30fps`，纹理按 DMA fd 缓存，不再每帧重建 EGL/GL 纹理。
+
+2. 新增 `DisplayConsumer`。
+
+   `DisplayConsumer` 作为显示 sink，目前策略是：
+
+   - 收到 V4L2 `FramePacket` 后快速 RGA 到自己的 RGBA `DmaBufferPool`。
+   - 转换成功后把稳定的 `DisplayFrame` 通过 Qt signal 发给 QML item。
+   - Qt 渲染侧显示完成后，再释放对应 RGBA pool buffer。
+
+   这一版没有强制给 `DisplayConsumer` 增加额外 worker 队列，因为它的工作就是一次快速硬件转换，符合“sink 自己决定处理策略”的原则。
+
+3. 扩展 `RgaEngine` 为统一操作封装。
+
+   `RgaEngine` 从简单 `copy/resize` 扩展为统一入口：
+
+   ```cpp
+   bool rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& op);
+   ```
+
+   当前支持：
+
+   - copy
+   - resize
+   - color convert
+   - crop
+   - rotate 0/90/180/270
+   - mirror horizontal/vertical/both
+
+   同时补充了输出几何计算逻辑：例如旋转 90/270 时自动交换宽高，crop 时按裁剪区域决定输出尺寸。
+
+4. 明确了 RGA stride 和 buffer size 的边界。
+
+   当前约定：
+
+   - `DmaBufferPool` 仍然只是通用 DMA 内存池，不绑定 RGA。
+   - RGA 运行时 layout 默认按 16 字节 pitch 对齐处理。
+   - `RgaEngine::bufferSizeFor()` 默认按 64 字节 pitch 对齐估算容量，用于给 DMA 池预留更保守的空间。
+
+   这里要注意：64 字节是池子容量预留策略，不是强行把所有 RGA 运行时 stride 都改成 64 字节。
+
+5. 增强 `DmaAllocator`。
+
+   DMA 分配现在优先尝试 `/dev/dma_heap`，失败后 fallback 到 DRM dumb buffer：
+
+   ```text
+   dma_heap
+     -> /dev/dri/card*
+     -> /dev/dri/renderD*
+     -> 全部失败后返回错误
+   ```
+
+   DRM fallback 使用 ioctl 直接实现，不额外依赖 libdrm。`DmaMemory` 也补齐了 DRM dumb handle 的 RAII 清理，避免 fd/handle 泄漏。
+
+6. 新增 RGA 操作测试 demo。
+
+   新增 `demo/rga`，从 `img/1.png` 读取图片，在板端通过 RGA 生成各类操作结果：
+
+   - copy
+   - resize
+   - crop
+   - rotate
+   - mirror
+   - RGBA -> YUYV -> RGBA 转换链路
+   - crop + rotate / crop + mirror 组合操作
+
+   测试输出 png 本次作为样例结果提交到仓库，方便后续对照 RGA 输出是否符合预期。
+
+7. 新增 `FrameLease` 生命周期演示 demo。
+
+   新增 `demo/frame_lease`，用纯 C++ 模拟：
+
+   ```text
+   FakeCamera DQBUF
+     -> 创建 FrameLease
+     -> 分发给 display/record sink
+     -> sink 只保留最新帧
+     -> 最后一个 shared_ptr 释放
+     -> 自动归还 buffer
+   ```
+
+   这个 demo 用来理解 `shared_ptr + RAII release callback` 的语义，不依赖真实摄像头。
+
+8. 将 `Consumer` 接口升级为 `FramePacket`。
+
+   原接口：
+
+   ```cpp
+   virtual void onFrame(const VideoFrame& frame) = 0;
+   ```
+
+   新接口：
+
+   ```cpp
+   virtual void onFrame(const FramePacket& packet) = 0;
+   ```
+
+   `FramePacket` 包含：
+
+   ```cpp
+   struct FramePacket {
+       VideoFrame frame;
+       std::shared_ptr<FrameLease> lease;
+   };
+   ```
+
+   这样 sink 如果需要异步持有 V4L2 帧，可以复制 `lease` 延长生命周期；如果只是快速 RGA 到自己的池子，则处理完直接返回即可。
+
+9. `FrameHub` 改为弱引用消费者。
+
+   `FrameHub` 不再拥有消费者对象，而是保存 `std::weak_ptr<Consumer>`：
+
+   ```text
+   真正消费者模块持有 shared_ptr
+   FrameHub 只保存 weak_ptr
+   publish 时 lock()
+   失效则自动清理
+   ```
+
+   这样消费者生命周期由真正使用它的模块控制，`CamManager/FrameHub` 不再反向持有业务模块。
+
+10. `CamManager` 引入 return queue。
+
+    `CamManager` 现在不会在 `publishFrame()` 后立刻 `QBUF`，而是：
+
+    ```text
+    DQBUF
+      -> 创建 FramePacket/FrameLease
+      -> publish
+      -> 最后一个 lease 释放
+      -> postReturnedFrame(cameraId, bufferIndex)
+      -> drainReturnedFrames()
+      -> requeueFrame/QBUF
+    ```
+
+    当前第一版 return queue 已经落地，但还没有接 `eventfd/pipe` 唤醒 `poll()`。代码中已留 TODO：后续应把 return queue 接进 `poll()` 的 fd 集合，避免极端情况下等到 poll timeout 才处理归还。
+
+### 重要设计结论
+
+1. 采用路线 A：V4L2 frame lease 异步分发。
+
+   这一版选择让 sink 可以持有 V4L2 frame lease。这样性能和灵活性最好，但要求 sink 自己遵守规则：
+
+   ```text
+   如果处理时间可能较长，就尽快 RGA/copy 到自己的 DmaBufferPool，
+   然后释放 V4L2 lease。
+   ```
+
+2. sink 策略由 sink 自己决定。
+
+   显示 sink 可以只保留最新帧；录像/推流 sink 可以维护自己的 DMA-BUF 队列、MPP 编码队列和丢帧策略。基座只负责生命周期安全，不替业务层决定缓存策略。
+
+3. `AppRuntime` 暂时不落地。
+
+   已经确认未来可以用应用级 `AppRuntime` 持有唯一 `CamManager`，但这一版先不引入，避免把“应用资源组织”和“帧生命周期模型”混在一次改动里。
+
+4. 当前仍需后续收紧。
+
+   后面要重点补：
+
+   - return queue 通过 `eventfd/pipe` 唤醒采集线程。
+   - `CamManager` 线程启动/停止和析构清理。
+   - 多路摄像头压力测试。
+   - 慢 sink 持有 lease 的耗时统计。
+   - 录像/推流 sink 的 bounded queue 策略。
+
+### 本次验证
+
+- `qt-demo/build.sh build` 可以完成 aarch64 Qt demo 编译。
+- `demo/frame_lease` 可以构建并运行，验证 lease 释放回调模型。
+- `demo/test.cpp`、`demo/rga_test.cpp` 已做头文件级编译检查。
+- 板端 Qt demo 可稳定输出约 `30fps` 的显示日志。

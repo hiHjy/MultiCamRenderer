@@ -62,6 +62,23 @@ PixelFormat fromV4L2Format(uint32_t format)
     }
 }
 
+/// bytes-per-pixel 查表，用于将 V4L2 bytesperline（字节）转换为像素 stride。
+/// 只返回已知格式的 bpp；未知格式返回 1 以避免除零，调用方需自行确保格式正确。
+int bytesPerPixel(PixelFormat format)
+{
+    switch (format) {
+    case PixelFormat::YUYV:
+        return 2;
+    case PixelFormat::NV12:
+    case PixelFormat::YUV420P:
+        return 1;
+    case PixelFormat::Unknown:
+    case PixelFormat::Auto:
+        return 1;
+    }
+    return 1;
+}
+
 std::vector<PixelFormat> formatCandidates(
     PixelFormat format)
 {
@@ -224,13 +241,15 @@ bool V4L2CameraSource::configure(const CamConfig& cfg)
         if (m_multiPlanar) {
             m_currentMode.width = static_cast<int>(currentFmt.fmt.pix_mp.width);
             m_currentMode.height = static_cast<int>(currentFmt.fmt.pix_mp.height);
-            m_currentMode.stride =
+            const int strideBytes =
                 static_cast<int>(currentFmt.fmt.pix_mp.plane_fmt[0].bytesperline);
+            m_currentMode.stride = strideBytes / bytesPerPixel(fromV4L2Format(currentV4L2Format));
             m_currentMode.sizeimg = currentFmt.fmt.pix_mp.plane_fmt[0].sizeimage;
         } else {
             m_currentMode.width = static_cast<int>(currentFmt.fmt.pix.width);
             m_currentMode.height = static_cast<int>(currentFmt.fmt.pix.height);
-            m_currentMode.stride = static_cast<int>(currentFmt.fmt.pix.bytesperline);
+            const int strideBytes = static_cast<int>(currentFmt.fmt.pix.bytesperline);
+            m_currentMode.stride = strideBytes / bytesPerPixel(fromV4L2Format(currentV4L2Format));
             m_currentMode.sizeimg = currentFmt.fmt.pix.sizeimage;
         }
         m_currentMode.format = fromV4L2Format(currentV4L2Format);
@@ -417,7 +436,7 @@ bool V4L2CameraSource::dequeueFrame(Frame& frame)
     frame.width = m_currentMode.width;
     frame.height = m_currentMode.height;
     frame.stride = m_currentMode.stride;
-    // V4L2 这里当前只可靠拿到 bytesperline 对应的横向 stride。
+    // stride 已从 V4L2 bytesperline（字节）转换为像素值，供 RGA 直接使用。
     // 纵向 stride 不乱猜，保持 0，让 RGA/消费者按 height 默认处理。
     frame.heightStride = 0;
     frame.format = m_currentMode.format;

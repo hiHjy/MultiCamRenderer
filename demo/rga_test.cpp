@@ -7,6 +7,7 @@
 int main () 
 {
 	CamManager manager;
+	auto consumer = std::make_shared<RgaCopyConsumer>();
 
     CamManager::CameraConfig config0 {};
     config0.cameraId = 0;
@@ -21,7 +22,7 @@ int main ()
         std::cerr << "addCamera camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
-	manager.addConsumerForHub(0, std::make_unique<RgaCopyConsumer>());
+	manager.addConsumerForHub(0, consumer);
 	manager.startAll();
 	manager.run();
 

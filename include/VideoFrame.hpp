@@ -4,6 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <utility>
 
 struct VideoFrame {
     int streamId = -1;
@@ -34,4 +37,37 @@ struct VideoFrame {
     uint64_t sequence = 0;
 
     int bufferIndex = -1;
+};
+
+// FrameLease 只负责“最后一个使用者释放后执行归还动作”。
+// 对 V4L2 摄像头帧来说，release 通常不是直接 QBUF，
+// 而是把 bufferIndex 投递回采集线程，由采集线程统一 QBUF。
+class FrameLease {
+public:
+    explicit FrameLease(std::function<void()> release)
+        : m_release(std::move(release))
+    {
+    }
+
+    FrameLease(const FrameLease&) = delete;
+    FrameLease& operator=(const FrameLease&) = delete;
+
+    FrameLease(FrameLease&&) = delete;
+    FrameLease& operator=(FrameLease&&) = delete;
+
+    ~FrameLease()
+    {
+        if (m_release)
+            m_release();
+    }
+
+private:
+    std::function<void()> m_release;
+};
+
+// FramePacket 是跨层传递的一帧：frame 描述图像和 DMA 资源，
+// lease 保护这块资源在 sink 使用期间不会被提前归还给生产者。
+struct FramePacket {
+    VideoFrame frame;
+    std::shared_ptr<FrameLease> lease;
 };

@@ -5,8 +5,10 @@
 
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 class CamManager {
 public:
@@ -44,8 +46,8 @@ public:
     // 后续若要支持热插拔，应改成事件队列或 shared_ptr 快照。
     bool addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
-    bool addFrameConsumer(int cameraId, std::unique_ptr<Consumer> consumer);
-    bool addConsumerForHub(int cameraId, std::unique_ptr<Consumer> consumer);
+    bool addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consumer);
+    bool addConsumerForHub(int cameraId, std::shared_ptr<Consumer> consumer);
     bool startAll();
     void stopAll();
 
@@ -59,6 +61,8 @@ public:
 
 private:
     void setError(const std::string& message);
+    void postReturnedFrame(int cameraId, int bufferIndex);
+    bool drainReturnedFrames();
 
 private:
     std::mutex m_camChangeMutex;
@@ -66,4 +70,6 @@ private:
     std::string m_lastError;
     std::unordered_map<int, std::unique_ptr<FrameHub>> m_frameHubMap;
     bool m_stopRequested = false;
+    std::mutex m_returnMutex;
+    std::queue<std::pair<int, int>> m_returnQueue;
 };

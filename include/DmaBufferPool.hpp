@@ -31,6 +31,9 @@ public:
     DmaBufferPool& operator=(DmaBufferPool&&) = delete;
 
     // 这里只按 bufferSize 申请 DMA 内存，不绑定宽高、格式、stride。
+    // 如果这个 pool 要给 RGA/MPP 做图像目标 buffer，调用方必须用对应模块的
+    // stride/pitch 对齐规则先算好 bufferSize。比如 RGA 目标建议使用
+    // RgaEngine::bufferSizeFor(format, width, height, 64)，而不是 visibleWidth * height * bpp。
     // 取出的 VideoFrame 只有 dmaFd/va/capacity/bufferIndex 是固定资源信息；
     // 图像 layout 由 RGA/MPP/V4L2 等真正写入图像的一方填写。
     bool init(int count,

@@ -107,7 +107,7 @@ bool CamManager::addCamera(const CameraConfig& config)
     return true;
 }
 
-bool CamManager::addFrameConsumer(int cameraId, std::unique_ptr<Consumer> consumer)
+bool CamManager::addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consumer)
 {
 	if (!consumer) {
 		setError("consumer 不能为空");
@@ -121,7 +121,7 @@ bool CamManager::addFrameConsumer(int cameraId, std::unique_ptr<Consumer> consum
 		return false;
 	}
 
-	if (!it->second->addConsumer(std::move(consumer))) {
+		if (!it->second->addConsumer(std::move(consumer))) {
 		setError("添加 consumer 失败: " + it->second->lastError());
 		return false;
 	}
@@ -130,7 +130,7 @@ bool CamManager::addFrameConsumer(int cameraId, std::unique_ptr<Consumer> consum
 	return true;
 }
 
-bool CamManager::addConsumerForHub(int cameraId, std::unique_ptr<Consumer> consumer)
+bool CamManager::addConsumerForHub(int cameraId, std::shared_ptr<Consumer> consumer)
 {
 	return addFrameConsumer(cameraId, std::move(consumer));
 }
@@ -203,6 +203,10 @@ void CamManager::stopAll()
 
 bool CamManager::pollOnce(int timeoutMs)
 {
+    if (!drainReturnedFrames()) {
+        return false;
+    }
+
     std::vector<pollfd> fds;
     std::vector<V4L2CameraSource*> cameras;
     std::vector<FrameHub*> hubs;
@@ -306,28 +310,36 @@ bool CamManager::pollOnce(int timeoutMs)
             .bufferIndex = frame.index,
         };
 
-        bool publishOk = true;
-        std::string publishError;
-        if (hub) {
-            publishOk = hub->publishFrame(videoFrame);
-            if (!publishOk) {
-                publishError = hub->lastError();
-            }
+	        bool publishOk = true;
+	        std::string publishError;
+            FramePacket packet {
+                .frame = videoFrame,
+                .lease = std::make_shared<FrameLease>(
+                    [this, cameraId = camera->cameraId(), bufferIndex = frame.index]() {
+                        postReturnedFrame(cameraId, bufferIndex);
+                    }),
+            };
+
+	        if (hub) {
+	            publishOk = hub->publishFrame(packet);
+	            if (!publishOk) {
+	                publishError = hub->lastError();
+	            }
         } else {
             publishOk = false;
             publishError = "cameraId 对应的 FrameHub 不存在";
         }
 
-        if (!camera->requeueFrame(frame)) {
-            setError("requeueFrame 失败: " + camera->lastError());
-            return false;
-        }
+	        if (!publishOk) {
+	            setError("publishFrame 失败: " + publishError);
+	            return false;
+	        }
 
-        if (!publishOk) {
-            setError("publishFrame 失败: " + publishError);
-            return false;
-        }
-    }
+            packet.lease.reset();
+            if (!drainReturnedFrames()) {
+                return false;
+            }
+	    }
 
     m_lastError.clear();
     return true;
@@ -356,4 +368,50 @@ const std::string& CamManager::lastError() const
 void CamManager::setError(const std::string& message)
 {
     m_lastError = message;
+}
+
+void CamManager::postReturnedFrame(int cameraId, int bufferIndex)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_returnMutex);
+        m_returnQueue.emplace(cameraId, bufferIndex);
+    }
+
+    // TODO: 后续把这里接到 eventfd/pipe，加入 poll() 的 fd 集合。
+    // 这样 sink 在线程里释放 lease 时，可以立刻唤醒采集线程处理 QBUF，
+    // 而不是最坏等到 poll timeout 后才 drain return queue。
+}
+
+bool CamManager::drainReturnedFrames()
+{
+    std::queue<std::pair<int, int>> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_returnMutex);
+        pending.swap(m_returnQueue);
+    }
+
+    if (pending.empty()) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(m_camChangeMutex);
+    while (!pending.empty()) {
+        const auto [cameraId, bufferIndex] = pending.front();
+        pending.pop();
+
+        auto it = m_cameraMap.find(cameraId);
+        if (it == m_cameraMap.end() || !it->second.source) {
+            setError("归还帧失败: cameraId 不存在");
+            return false;
+        }
+
+        V4L2CameraSource::Frame frame {};
+        frame.index = bufferIndex;
+        if (!it->second.source->requeueFrame(frame)) {
+            setError("requeueFrame 失败: " + it->second.source->lastError());
+            return false;
+        }
+    }
+
+    return true;
 }

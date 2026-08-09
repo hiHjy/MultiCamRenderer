@@ -14,8 +14,8 @@ public:
 	FrameHub() = default;
 	explicit FrameHub(int streamId);
 
-	bool addConsumer(std::unique_ptr<Consumer> consumer);
-	bool publishFrame(const VideoFrame& frame);
+	bool addConsumer(std::shared_ptr<Consumer> consumer);
+	bool publishFrame(const FramePacket& packet);
 
 	int streamId() const;
 	size_t consumerCount() const;
@@ -27,6 +27,6 @@ private:
 private:
 	int m_streamId = -1;
 	mutable std::mutex m_mutex;
-	std::vector<std::unique_ptr<Consumer>> m_consumers;
+	std::vector<std::weak_ptr<Consumer>> m_consumers;
 	std::string m_lastError;
 };

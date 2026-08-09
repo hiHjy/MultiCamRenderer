@@ -2,10 +2,13 @@
 #include "TestConsumer.hpp"
 
 #include <iostream>
+#include <memory>
+#include <vector>
 
 int main()
 {
     CamManager manager;
+    std::vector<std::shared_ptr<Consumer>> consumers;
 
     CamManager::CameraConfig config0 {};
     config0.cameraId = 0;
@@ -21,17 +24,20 @@ int main()
         return 1;
     }
 
-    if (!manager.addFrameConsumer(config0.cameraId, std::make_unique<TestConsumer>(0))) {
+    consumers.push_back(std::make_shared<TestConsumer>(0));
+    if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-	if (!manager.addFrameConsumer(config0.cameraId, std::make_unique<TestConsumer>(1))) {
+    consumers.push_back(std::make_shared<TestConsumer>(1));
+	if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-	if (!manager.addFrameConsumer(config0.cameraId, std::make_unique<TestConsumer>(2))) {
+    consumers.push_back(std::make_shared<TestConsumer>(2));
+	if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
@@ -51,23 +57,27 @@ int main()
         return 1;
     }
 
-    if (!manager.addFrameConsumer(config1.cameraId, std::make_unique<TestConsumer>(3))) {
+    consumers.push_back(std::make_shared<TestConsumer>(3));
+    if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
 
-    if (!manager.addFrameConsumer(config1.cameraId, std::make_unique<TestConsumer>(4))) {
+    consumers.push_back(std::make_shared<TestConsumer>(4));
+    if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-	if (!manager.addFrameConsumer(config1.cameraId, std::make_unique<TestConsumer>(5))) {
+    consumers.push_back(std::make_shared<TestConsumer>(5));
+	if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-	if (!manager.addFrameConsumer(config1.cameraId, std::make_unique<TestConsumer>(6))) {
+    consumers.push_back(std::make_shared<TestConsumer>(6));
+	if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
         std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }

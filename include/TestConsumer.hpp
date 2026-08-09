@@ -7,8 +7,9 @@
 class TestConsumer : public Consumer {
 public:
 
-	void onFrame(const VideoFrame& frame) override
+	void onFrame(const FramePacket& packet) override
 	{
+		const VideoFrame& frame = packet.frame;
 		std::cout << " TestConsumer:"
 				  <<  m_n
 		          << " stream=" << frame.streamId
