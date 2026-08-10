@@ -27,7 +27,7 @@ qt_add_executable(appqt-demo
 target_include_directories(appqt-demo PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/hw
-    /home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/aarch64-buildroot-linux-gnu/sysroot/usr/include/rga
+    ${CMAKE_SYSROOT}/usr/include/rga
 )
 
 qt_add_qml_module(appqt-demo

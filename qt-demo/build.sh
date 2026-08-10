@@ -40,6 +40,10 @@ cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
 
 echo "=== 编译完成：${BUILD_DIR}/appqt-demo ==="
 
+if [ -x "${SCRIPT_DIR}/../tools/update_compile_commands.sh" ]; then
+    "${SCRIPT_DIR}/../tools/update_compile_commands.sh" || true
+fi
+
 # ---- 部署 --------------------------------------------------------------------
 if [ "$MODE" = "build" ]; then
     echo "=== 仅编译模式，跳过部署 ==="

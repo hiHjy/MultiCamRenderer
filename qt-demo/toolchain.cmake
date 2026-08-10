@@ -5,21 +5,20 @@ set(CMAKE_SYSTEM_PROCESSOR aarch64)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 
-set(CMAKE_C_COMPILER 
-/home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/bin/aarch64-buildroot-linux-gnu-gcc)
+set(RK3568_TOOLCHAIN_ROOT "/home/hjy/rk3568_kernel_pack/toolchain/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu")
+set(RK3568_SYSROOT "/home/hjy/rk3568_kernel_pack/sysroot")
+set(QT_HOST_PATH "/opt/Qt/6.10.3")
+set(QT_TARGET_PATH "/opt/6.10.3-rk3568-aarch64")
 
-set(CMAKE_CXX_COMPILER
-/home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/bin/aarch64-buildroot-linux-gnu-g++)
+set(CMAKE_C_COMPILER "${RK3568_TOOLCHAIN_ROOT}/bin/aarch64-none-linux-gnu-gcc")
+set(CMAKE_CXX_COMPILER "${RK3568_TOOLCHAIN_ROOT}/bin/aarch64-none-linux-gnu-g++")
 
-
-set(CMAKE_SYSROOT
-/home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/aarch64-buildroot-linux-gnu/sysroot
-)
+set(CMAKE_SYSROOT "${RK3568_SYSROOT}")
 
 
 set(CMAKE_FIND_ROOT_PATH
-/home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/aarch64-buildroot-linux-gnu/sysroot
-/opt/Qt/6.10.3-rk3568-aarch64
+    "${RK3568_SYSROOT}"
+    "${QT_TARGET_PATH}"
 )
 
 
@@ -28,5 +27,4 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-
-set(QT_HOST_PATH /opt/Qt/6.10.3)
+set(CMAKE_PREFIX_PATH "${QT_TARGET_PATH}")

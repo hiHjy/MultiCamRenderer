@@ -14,3 +14,6 @@ qt-demo/CMakeLists.txt.user*
 # demo 运行生成物
 demo/rga/rga_ops_demo
 demo/frame_lease/frame_lease_demo
+build_test_aarch64.sh
+build_test_aarch64.sh
+.cache
