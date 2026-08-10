@@ -7,15 +7,191 @@
 #include <drm/drm_fourcc.h>
 
 #include <QDebug>
+#include <QCoreApplication>
 #include <QHash>
 #include <QMetaType>
+#include <QPointer>
 #include <QQuickWindow>
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
 
 #include <CamManager.hpp>
 
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 namespace {
+
+class SharedDisplayPipeline {
+public:
+    static SharedDisplayPipeline& instance()
+    {
+        static SharedDisplayPipeline pipeline;
+        return pipeline;
+    }
+
+    void registerItem(MyItem *item)
+    {
+        if (!item)
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto exists = std::any_of(m_items.begin(), m_items.end(), [item](const QPointer<MyItem>& current) {
+                return current == item;
+            });
+            if (!exists)
+                m_items.push_back(item);
+        }
+
+        // MyItem 在 updatePaintNode()/setFrame() 中发出 displayFrameDone。
+        // 这里先不让每个 Item 直接 release DisplayConsumer 的 buffer，而是汇总引用计数：
+        // 同一帧广播给 3 个 Item，就收到 3 次 done 后再真正归还 buffer。
+        QObject::connect(item, &MyItem::displayFrameDone, qApp, [this](int bufferIndex) {
+            releaseDisplayReference(bufferIndex);
+        }, Qt::QueuedConnection);
+
+        QObject::connect(item, &QObject::destroyed, qApp, [this, item]() {
+            unregisterItem(item);
+        }, Qt::QueuedConnection);
+
+        ensureStarted();
+    }
+
+    void unregisterItem(MyItem *item)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_items.erase(std::remove_if(m_items.begin(), m_items.end(), [item](const QPointer<MyItem>& current) {
+            return current.isNull() || current == item;
+        }), m_items.end());
+    }
+
+private:
+    SharedDisplayPipeline() = default;
+
+    void ensureStarted()
+    {
+        bool needStart = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_started) {
+                m_started = true;
+                needStart = true;
+            }
+        }
+
+        if (!needStart)
+            return;
+
+        m_cameraThread = std::thread([this] {
+            auto mgr = std::make_unique<CamManager>();
+
+            CamManager::CameraConfig config {};
+            config.cameraId = 0;
+            config.width = 640;
+            config.height = 480;
+            config.fps = 30;
+            config.devicePath = "/dev/video10";
+            config.format = PixelFormat::YUYV;
+
+            if (!mgr->addCamera(config)) {
+                qWarning() << "SharedDisplayPipeline: addCamera failed:"
+                           << QString::fromStdString(mgr->lastError());
+                return;
+            }
+
+            auto consumer = std::make_shared<DisplayConsumer>();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_consumer = consumer.get();
+            }
+
+            // DisplayConsumer 在自己的 worker 线程里 emit frameReady。
+            // 通过 qApp 作为 receiver/context，下面的 lambda 会排队到 Qt 主线程执行，
+            // 然后再把同一帧分发给所有 MyItem。
+            QObject::connect(consumer.get(), &DisplayConsumer::frameReady, qApp, [this](const DisplayFrame& frame) {
+                publishFrame(frame);
+            }, Qt::QueuedConnection);
+
+            if (!mgr->addConsumerForHub(0, consumer)) {
+                qWarning() << "SharedDisplayPipeline: addConsumerForHub failed:"
+                           << QString::fromStdString(mgr->lastError());
+                return;
+            }
+
+            if (!mgr->startAll()) {
+                qWarning() << "SharedDisplayPipeline: startAll failed:"
+                           << QString::fromStdString(mgr->lastError());
+                return;
+            }
+
+            mgr->run();
+        });
+        m_cameraThread.detach();
+    }
+
+    void publishFrame(const DisplayFrame& frame)
+    {
+        std::vector<QPointer<MyItem>> targets;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_items.erase(std::remove_if(m_items.begin(), m_items.end(), [](const QPointer<MyItem>& item) {
+                return item.isNull();
+            }), m_items.end());
+
+            targets = m_items;
+            if (frame.bufferIndex >= 0 && frame.bufferIndex < static_cast<int>(m_pendingRefs.size()))
+                m_pendingRefs[static_cast<size_t>(frame.bufferIndex)] = static_cast<int>(targets.size());
+        }
+
+        if (targets.empty()) {
+            releaseDisplayReference(frame.bufferIndex);
+            return;
+        }
+
+        // 模拟多路显示：同一个 RGA 输出帧广播给 3 个 MyItem。
+        // 每个 MyItem 只负责把同一个 dmaFd 找到/导入成自己 Scene Graph 里的 texture。
+        for (const QPointer<MyItem>& target : targets) {
+            if (target)
+                target->setFrame(frame);
+        }
+    }
+
+    void releaseDisplayReference(int bufferIndex)
+    {
+        DisplayConsumer *consumer = nullptr;
+        bool shouldRelease = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (bufferIndex < 0 || bufferIndex >= static_cast<int>(m_pendingRefs.size()))
+                return;
+
+            int& refs = m_pendingRefs[static_cast<size_t>(bufferIndex)];
+            if (refs <= 0)
+                return;
+
+            --refs;
+            if (refs == 0) {
+                consumer = m_consumer;
+                shouldRelease = true;
+            }
+        }
+
+        if (shouldRelease && consumer)
+            consumer->releaseFrameByIndex(bufferIndex);
+    }
+
+private:
+    std::mutex m_mutex;
+    std::vector<QPointer<MyItem>> m_items;
+    std::array<int, DisplayConsumer::BUFFER_COUNT> m_pendingRefs {};
+    DisplayConsumer *m_consumer = nullptr;
+    bool m_started = false;
+    std::thread m_cameraThread;
+};
 
 // QQuickItem 不能直接拿 dma-buf 画图。
 // 我们这里用一个 QSGSimpleTextureNode 表示“贴了一张纹理的矩形”：
@@ -144,29 +320,7 @@ MyItem::MyItem()
 {
     setFlag(ItemHasContents, true);
     qRegisterMetaType<DisplayFrame>("DisplayFrame");
-
-    m_camT = std::thread([this](){
-        CamManager *mgr = new CamManager();
-        CamManager::CameraConfig config {};
-        config.cameraId = 0;
-        config.width = 640;
-        config.height = 480;
-        config.fps = 30;
-        config.devicePath = "/dev/video10";
-        config.format = PixelFormat::YUYV;
-        mgr->addCamera(config);
-
-        auto p = std::make_shared<DisplayConsumer>();
-        DisplayConsumer *consumer = p.get();
-        mgr->addConsumerForHub(0, p);
-
-        connect(consumer, &DisplayConsumer::frameReady, this, &MyItem::setFrame);
-        connect(this, &MyItem::displayFrameDone, consumer, &DisplayConsumer::releaseFrameByIndex,
-                Qt::DirectConnection);
-
-        mgr->startAll();
-        mgr->run();
-    });
+    SharedDisplayPipeline::instance().registerItem(this);
 }
 
 MyItem::~MyItem()

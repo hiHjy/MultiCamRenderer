@@ -2,47 +2,69 @@ import QtQuick
 import QtQuick.Controls
 
 Window {
-    width: 640
-    height: 480
+    width: 1280
+    height: 720
     visible: true
-    // title: qsTr("Hello World")
-    
-    // Rectangle {
-    //     width: 960
-    //     height: 540
-    //     color: "red"
-    // }
+    color: "black"
 
-    // Button {
-    //     text:"我是按钮点我"
-    //     x: 200
-    //     y: 200
-    //     anchors.centerIn: parent       
-    // }
-    MyItem {
-        //text: "MyItem"
-        width:640
-        height:480
-        x:0
-        y:0
-		
-		Button {
+    property real tileGap: 16
+    property real tileWidth: Math.min(600, (width - tileGap * 4) / 3)
+    property real tileHeight: tileWidth * 3 / 4
 
-			width: 30
-			height: 50
-			anchors.bottom: parent.bottom
-			anchors.horizontalCenter: parent.horizontalCenter
+    Row {
+        anchors.centerIn: parent
+        spacing: tileGap
 
-			background: Rectangle {
-				color: "red"
-				radius: 4
-				
-			}
-			opacity:0.2
-			
-			onClicked: {
-				console.log("Button clicked!")
-			}
-		}
+        Repeater {
+            model: 3
+
+            delegate: Item {
+                width: tileWidth
+                height: tileHeight
+                clip: true
+
+                MyItem {
+                    anchors.fill: parent
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: "transparent"
+                    border.width: 2
+                    border.color: index === 0 ? '#fd3ff892' : index === 1 ? "#4da3ff" : "#ffcc33"
+                }
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.margins: 10
+                    width: 96
+                    height: 34
+                    color: "#99000000"
+                    radius: 4
+
+                    Text {
+                        anchors.centerIn: parent
+                        color: "white"
+                        text: "view " + (index + 1)
+                        font.pixelSize: 16
+                    }
+                }
+
+                Button {
+                    width: 54
+                    height: 34
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: 10
+                    text: "OK"
+                    opacity: 0.75
+
+                    onClicked: {
+                        console.log("Button clicked on view", index + 1)
+                    }
+                }
+            }
+        }
     }
 }
