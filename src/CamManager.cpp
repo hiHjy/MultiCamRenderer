@@ -7,6 +7,9 @@
 #include <iostream>
 #include <memory>
 #include <poll.h>
+#include <stdint.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -25,6 +28,8 @@ PixelFormat toV4L2PixelFormat(PixelFormat format)
         return PixelFormat::YUYV;
     case PixelFormat::YUV420P:
         return PixelFormat::YUV420P;
+    case PixelFormat::RGBA8888:
+        return PixelFormat::Auto;
     }
     return PixelFormat::Auto;
 }
@@ -40,6 +45,22 @@ V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig& c
 }
 
 } // namespace
+
+CamManager::CamManager()
+{
+    m_returnEventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (m_returnEventFd < 0) {
+        setError(std::string("eventfd 创建失败: ") + std::strerror(errno));
+    }
+}
+
+CamManager::~CamManager()
+{
+    if (m_returnEventFd >= 0) {
+        close(m_returnEventFd);
+        m_returnEventFd = -1;
+    }
+}
 
 bool CamManager::addCamera(const CameraConfig& config)
 {
@@ -190,15 +211,18 @@ bool CamManager::startAll()
 
 void CamManager::stopAll()
 {
-    std::lock_guard<std::mutex> lock(m_camChangeMutex);
-    for (auto& item : m_cameraMap) {
-        CameraSlot& slot = item.second;
-        if (slot.source) {
-            slot.source->stop();
-            slot.state = CameraState::Stopped;
+    {
+        std::lock_guard<std::mutex> lock(m_camChangeMutex);
+        for (auto& item : m_cameraMap) {
+            CameraSlot& slot = item.second;
+            if (slot.source) {
+                slot.source->stop();
+                slot.state = CameraState::Stopped;
+            }
         }
+        m_stopRequested = true;
     }
-    m_stopRequested = true;
+    notifyReturnEvent();
 }
 
 bool CamManager::pollOnce(int timeoutMs)
@@ -210,12 +234,13 @@ bool CamManager::pollOnce(int timeoutMs)
     std::vector<pollfd> fds;
     std::vector<V4L2CameraSource*> cameras;
     std::vector<FrameHub*> hubs;
+    bool hasCameraFd = false;
 
     {
         std::lock_guard<std::mutex> lock(m_camChangeMutex);
-        fds.reserve(m_cameraMap.size());
-        cameras.reserve(m_cameraMap.size());
-        hubs.reserve(m_cameraMap.size());
+        fds.reserve(m_cameraMap.size() + 1);
+        cameras.reserve(m_cameraMap.size() + 1);
+        hubs.reserve(m_cameraMap.size() + 1);
 
         // 这里复制 fd 和裸指针快照后立刻释放锁，避免 poll 阻塞期间卡住
         // addCamera/stopAll 等管理操作。
@@ -238,12 +263,22 @@ bool CamManager::pollOnce(int timeoutMs)
             cameras.push_back(camera);
             auto hubIt = m_frameHubMap.find(camera->cameraId());
             hubs.push_back(hubIt == m_frameHubMap.end() ? nullptr : hubIt->second.get());
+            hasCameraFd = true;
         }
     }
 
-    if (fds.empty()) {
+    if (!hasCameraFd) {
         setError("没有处于 Streaming 状态的摄像头");
         return false;
+    }
+
+    if (m_returnEventFd >= 0) {
+        pollfd pfd {};
+        pfd.fd = m_returnEventFd;
+        pfd.events = POLLIN | POLLERR | POLLHUP;
+        fds.push_back(pfd);
+        cameras.push_back(nullptr);
+        hubs.push_back(nullptr);
     }
 
     const int ret = ::poll(fds.data(), fds.size(), timeoutMs);
@@ -267,6 +302,20 @@ bool CamManager::pollOnce(int timeoutMs)
 
         V4L2CameraSource* camera = cameras[i];
         FrameHub* hub = hubs[i];
+
+        if (camera == nullptr) {
+            if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                setError("return eventfd 异常");
+                return false;
+            }
+
+            if ((revents & POLLIN) != 0 &&
+                (!drainReturnEvent() || !drainReturnedFrames())) {
+                return false;
+            }
+            continue;
+        }
+
         if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             setError("摄像头 fd 异常");
             return false;
@@ -358,6 +407,7 @@ void CamManager::run(int timeoutMs)
 void CamManager::requestStop()
 {
     m_stopRequested = true;
+    notifyReturnEvent();
 }
 
 const std::string& CamManager::lastError() const
@@ -377,9 +427,58 @@ void CamManager::postReturnedFrame(int cameraId, int bufferIndex)
         m_returnQueue.emplace(cameraId, bufferIndex);
     }
 
-    // TODO: 后续把这里接到 eventfd/pipe，加入 poll() 的 fd 集合。
-    // 这样 sink 在线程里释放 lease 时，可以立刻唤醒采集线程处理 QBUF，
-    // 而不是最坏等到 poll timeout 后才 drain return queue。
+    notifyReturnEvent();
+}
+
+void CamManager::notifyReturnEvent()
+{
+    if (m_returnEventFd < 0)
+        return;
+
+    uint64_t value = 1;
+    ssize_t ret = 0;
+    do {
+        ret = write(m_returnEventFd, &value, sizeof(value));
+    } while (ret < 0 && errno == EINTR);
+
+    // eventfd 计数器满时说明 poll 线程已经有待处理通知。
+    // 这里可能由 consumer 线程调用，保持非致命，避免跨线程写 m_lastError。
+    (void)ret;
+}
+
+bool CamManager::drainReturnEvent()
+{
+    if (m_returnEventFd < 0)
+        return true;
+
+    uint64_t value = 0;
+    while (true) {
+        // eventfd 默认不是 EFD_SEMAPHORE 模式：
+        // 一次 read 会读出当前累计计数，并把计数清零。
+        // value 只表示“期间收到过多少次唤醒”，这里不需要逐个使用，
+        // 真正要归还哪些 buffer 以后面的 drainReturnedFrames() 队列为准。
+        const ssize_t ret = read(m_returnEventFd, &value, sizeof(value));
+        if (ret == static_cast<ssize_t>(sizeof(value))) {
+            // 成功读掉一批通知。继续读一次，是为了把同时到来的通知也清空；
+            // 读到 EAGAIN 时才说明 eventfd 已经彻底没通知了。
+            continue;
+        }
+
+        if (ret < 0 && errno == EINTR) {
+            // read 被信号打断，不代表 eventfd 出错，重试即可。
+            continue;
+        }
+
+        if (ret < 0 && errno == EAGAIN) {
+            // 非阻塞 fd 在没有数据可读时返回 EAGAIN。
+            // 对这里来说，这正是“通知已经读空”的成功条件。
+            return true;
+        }
+
+        // 其他错误才是真失败，比如 fd 异常关闭或内核返回了非预期错误。
+        setError(std::string("读 return eventfd 失败: ") + std::strerror(errno));
+        return false;
+    }
 }
 
 bool CamManager::drainReturnedFrames()

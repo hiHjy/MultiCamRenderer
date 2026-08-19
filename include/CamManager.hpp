@@ -12,6 +12,9 @@
 
 class CamManager {
 public:
+    CamManager();
+    ~CamManager();
+
     enum class CameraState {
         Created,
         Ready,
@@ -62,6 +65,8 @@ public:
 private:
     void setError(const std::string& message);
     void postReturnedFrame(int cameraId, int bufferIndex);
+    void notifyReturnEvent();
+    bool drainReturnEvent();
     bool drainReturnedFrames();
 
 private:
@@ -72,4 +77,5 @@ private:
     bool m_stopRequested = false;
     std::mutex m_returnMutex;
     std::queue<std::pair<int, int>> m_returnQueue;
+    int m_returnEventFd = -1;
 };
