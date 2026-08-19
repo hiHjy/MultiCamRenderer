@@ -380,3 +380,106 @@ V4L2CameraSource
 - `demo/frame_lease` 可以构建并运行，验证 lease 释放回调模型。
 - `demo/test.cpp`、`demo/rga_test.cpp` 已做头文件级编译检查。
 - 板端 Qt demo 可稳定输出约 `30fps` 的显示日志。
+
+## 2026-08-20
+
+### 项目当前进度
+
+本次继续收紧 `FrameLease -> return queue -> QBUF` 这条生命周期链路。
+
+上一版中，`FrameLease` 最后一个引用释放后会调用 `postReturnedFrame(cameraId, bufferIndex)`，把 V4L2 buffer 投递回 `CamManager` 的 return queue。但是采集线程如果正阻塞在 `poll()` 中，可能要等到摄像头 fd 再次就绪或 `poll timeout` 后才会处理归还。
+
+本次给 `CamManager` 增加 `eventfd` 唤醒机制，让消费者线程释放 lease 后可以立刻唤醒采集线程：
+
+```text
+FrameLease 析构
+  -> CamManager::postReturnedFrame()
+  -> push return queue
+  -> write(return eventfd)
+
+CamManager::pollOnce()
+  -> poll(camera fd + return eventfd)
+  -> return eventfd 可读
+  -> drainReturnEvent()
+  -> drainReturnedFrames()
+  -> requeueFrame/QBUF
+```
+
+### 今天完成的事
+
+1. `CamManager` 初始化并持有 return eventfd。
+
+   `CamManager` 构造函数中创建：
+
+   ```cpp
+   eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
+   ```
+
+   析构函数中关闭 fd。`eventfd` 只作为 `CamManager` 内部跨线程唤醒机制，不暴露给 `V4L2CameraSource`、`FrameHub` 或 sink。
+
+2. `postReturnedFrame()` 接入 eventfd 唤醒。
+
+   现在最后一个 `FrameLease` 释放时，会先把 `(cameraId, bufferIndex)` 放入 return queue，然后调用 `notifyReturnEvent()` 写 eventfd。
+
+   这样异步 sink 完成 RGA/copy 后释放原始 V4L2 lease，不需要等待下一次 `poll timeout`，采集线程会尽快醒来执行 QBUF。
+
+3. `pollOnce()` 同时监听摄像头 fd 和 return eventfd。
+
+   `pollOnce()` 构造 fd 列表时，会额外加入 `m_returnEventFd`。当 eventfd 可读时，先通过 `drainReturnEvent()` 读空 eventfd 计数，再调用 `drainReturnedFrames()` 统一归还 V4L2 buffer。
+
+   `eventfd` 默认不是 `EFD_SEMAPHORE` 模式，一次 `read()` 会读出当前累计计数并清零。这里不依赖计数值决定归还哪些帧，真正的归还信息仍然以 return queue 为准。
+
+4. `requestStop()` / `stopAll()` 也会唤醒 `poll()`。
+
+   停机请求设置 `m_stopRequested` 后会写 eventfd，避免采集线程正阻塞在 `poll()` 时还要等 timeout 才退出。
+
+5. `DisplayConsumer` 增加 pending 帧丢帧统计。
+
+   显示 sink 仍然使用 latest-slot 策略：
+
+   ```text
+   onFrame(packet)
+     -> 如果 m_latestPacket 已有旧帧，统计一次 dropped frame
+     -> 用新 packet 覆盖旧 packet
+     -> notify worker
+   ```
+
+   这里统计的是“worker 尚未取走的 pending 旧帧被新帧覆盖”，适合显示场景追最新帧的策略。日志做了节流，避免频繁 `qWarning()` 反过来影响性能。
+
+### 重要设计结论
+
+1. `eventfd` 解决的是归还及时性，不改变帧生命周期所有权。
+
+   原始 V4L2 buffer 仍然由 `FramePacket::lease` 保护。只有最后一个 `shared_ptr<FrameLease>` 释放后，才会进入 return queue。`eventfd` 只是把“return queue 有新任务”通知给正在 `poll()` 的采集线程。
+
+2. 软件异步不等于 RGA 硬件并行。
+
+   当前 `RgaEngine` 使用同步 `IM_SYNC` 调用。多个 sink worker 可以并发提交 RGA，但在 RK3568 上，RGA2 硬件大概率仍按驱动队列串行执行任务。
+
+   因此性能估算应按：
+
+   ```text
+   CamManager 不被 RGA 阻塞
+   但同一帧原始 V4L2 lease 的释放时间受所有持有该 lease 的 sink 影响
+   多个 RGA job 在 RK3568 上应按硬件队列串行预算
+   ```
+
+   例如同一帧被 4 个 sink 分别异步 RGA，每个约 `1.8ms`，则原始 buffer 归还时间可能接近 `1.8ms * 4` 加驱动调度开销，而不是只看最慢一个 sink。
+
+3. 继续坚持 `onFrame()` 快速返回。
+
+   当前基座仍然保持：
+
+   ```text
+   CamManager 只负责 poll / DQBUF / publish / QBUF
+   FrameHub 只负责同步分发到 sink
+   sink 自己决定 latest-slot、有界队列、RGA copy、编码投递和丢帧策略
+   ```
+
+   对显示类 sink，可以丢旧帧追最新；对录像/推流类 sink，后续应使用有界队列，并且不能长期持有原始 V4L2 lease。慢处理应先 copy/encode 到 sink 自己的资源，再释放原始 lease。
+
+### 本次验证
+
+- `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/CamManager.cpp` 通过。
+- `bash -n build.sh`、`bash -n qt-demo/build.sh`、`bash -n qt-demo/run.sh` 通过。
+- Qt 文件的普通主机 `g++ -fsyntax-only` 检查会因为缺少 Qt include 路径失败，需以后以 `qt-demo/build.sh build` 的交叉编译结果为准。

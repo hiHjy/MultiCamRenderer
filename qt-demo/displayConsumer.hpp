@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -57,6 +58,7 @@ private:
     std::mutex m_pendingMutex;
     std::condition_variable m_pendingCv;
     std::optional<FramePacket> m_latestPacket;
+    uint64_t m_droppedFrames = 0;
     bool m_stopping = false;
     std::thread m_workerThread;
     std::chrono::steady_clock::time_point m_fpsLogStart {};

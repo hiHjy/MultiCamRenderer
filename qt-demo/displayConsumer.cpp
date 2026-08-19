@@ -65,6 +65,15 @@ void DisplayConsumer::onFrame(FramePacket packet)
     // 如果 worker 还没来得及处理上一帧，旧 packet 会在这里析构并释放 lease。
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
+        if (m_latestPacket.has_value()) {
+            ++m_droppedFrames;
+            if (m_droppedFrames % 60 == 1) {
+                qWarning() << "<DisplayConsumer> drop pending frame sequence:"
+                           << m_latestPacket->frame.sequence
+                           << "total:" << m_droppedFrames;
+            }
+        }
+
         m_latestPacket = std::move(packet);
     }
     m_pendingCv.notify_one();
