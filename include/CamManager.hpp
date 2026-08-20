@@ -49,8 +49,8 @@ public:
     // 后续若要支持热插拔，应改成事件队列或 shared_ptr 快照。
     bool addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
-    bool addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consumer);
-    bool addConsumerForHub(int cameraId, std::shared_ptr<Consumer> consumer);
+    bool addFrameSink(int cameraId, std::shared_ptr<Sink> sink);
+    bool addSinkForHub(int cameraId, std::shared_ptr<Sink> sink);
     bool startAll();
     void stopAll();
 

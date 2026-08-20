@@ -433,7 +433,7 @@ CamManager::pollOnce()
 
    停机请求设置 `m_stopRequested` 后会写 eventfd，避免采集线程正阻塞在 `poll()` 时还要等 timeout 才退出。
 
-5. `DisplayConsumer` 增加 pending 帧丢帧统计。
+5. `DisplaySink` 增加 pending 帧丢帧统计。
 
    显示 sink 仍然使用 latest-slot 策略：
 
@@ -445,6 +445,50 @@ CamManager::pollOnce()
    ```
 
    这里统计的是“worker 尚未取走的 pending 旧帧被新帧覆盖”，适合显示场景追最新帧的策略。日志做了节流，避免频繁 `qWarning()` 反过来影响性能。
+
+6. 将 `Consumer` 命名统一迁移为 `Sink`。
+
+   当前架构里这些对象处在 `FrameHub` 下游，职责是接收某一路流并执行显示、RGA copy、编码、推流、AI 等落地处理，语义上更接近 sink。因此本次统一改名：
+
+   ```text
+   Consumer           -> Sink
+   TestConsumer       -> TestSink
+   RgaCopyConsumer    -> RgaCopySink
+   DisplayConsumer    -> DisplaySink
+   addFrameConsumer   -> addFrameSink
+   addConsumerForHub  -> addSinkForHub
+   FrameHub::addConsumer -> FrameHub::addSink
+   ```
+
+   同时将 `include/consumer`、`src/consumer` 目录改为 `include/sink`、`src/sink`，避免路径上继续残留旧语义。
+
+7. 新增轻量统一调试日志工具。
+
+   新增 `include/Log.hpp`，提供：
+
+   ```cpp
+   LOG_TRACE(module, expr)
+   LOG_DEBUG(module, expr)
+   LOG_INFO(module, expr)
+   LOG_WARN(module, expr)
+   LOG_ERROR(module, expr)
+   ```
+
+   当前日志输出包含：
+
+   ```text
+   time [level] [module] [thread-id] file:line function | message
+   ```
+
+   第一版先不引入第三方库和异步日志线程，只把核心调试路径统一起来。已替换 `CamManager`、`DisplaySink`、`QtVideoItem`、`RgaCopySink`、`TestSink` 中的散乱 `std::cout/std::cerr/qDebug/qWarning`。demo 中用于展示设备信息的正常输出暂时保留。
+
+   日志支持编译期开关：
+
+   ```bash
+   -DLOG_ACTIVE_LEVEL=LOG_LEVEL_WARN  # 只保留 WARN/ERROR
+   -DLOG_ACTIVE_LEVEL=LOG_LEVEL_ERROR # 只保留 ERROR
+   -DLOG_DISABLE                      # 全部关闭
+   ```
 
 ### 重要设计结论
 
@@ -483,3 +527,5 @@ CamManager::pollOnce()
 - `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/CamManager.cpp` 通过。
 - `bash -n build.sh`、`bash -n qt-demo/build.sh`、`bash -n qt-demo/run.sh` 通过。
 - Qt 文件的普通主机 `g++ -fsyntax-only` 检查会因为缺少 Qt include 路径失败，需以后以 `qt-demo/build.sh build` 的交叉编译结果为准。
+- `./build.sh` 通过，RV1126 32 位 demo 目标均完成构建。
+- `./qt-demo/build.sh` 通过，Qt aarch64 demo 完成构建和部署。

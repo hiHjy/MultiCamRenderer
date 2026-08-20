@@ -1,5 +1,6 @@
 #include "CamManager.hpp"
 #include "FrameHub.hpp"
+#include "Log.hpp"
 #include "VideoFrame.hpp"
 
 #include <cerrno>
@@ -128,10 +129,10 @@ bool CamManager::addCamera(const CameraConfig& config)
     return true;
 }
 
-bool CamManager::addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consumer)
+bool CamManager::addFrameSink(int cameraId, std::shared_ptr<Sink> sink)
 {
-	if (!consumer) {
-		setError("consumer 不能为空");
+	if (!sink) {
+		setError("sink 不能为空");
 		return false;
 	}
 
@@ -142,8 +143,8 @@ bool CamManager::addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consum
 		return false;
 	}
 
-		if (!it->second->addConsumer(std::move(consumer))) {
-		setError("添加 consumer 失败: " + it->second->lastError());
+	if (!it->second->addSink(std::move(sink))) {
+		setError("添加 sink 失败: " + it->second->lastError());
 		return false;
 	}
 
@@ -151,9 +152,9 @@ bool CamManager::addFrameConsumer(int cameraId, std::shared_ptr<Consumer> consum
 	return true;
 }
 
-bool CamManager::addConsumerForHub(int cameraId, std::shared_ptr<Consumer> consumer)
+bool CamManager::addSinkForHub(int cameraId, std::shared_ptr<Sink> sink)
 {
-	return addFrameConsumer(cameraId, std::move(consumer));
+	return addFrameSink(cameraId, std::move(sink));
 }
 
 bool CamManager::delCamera(int cameraId)
@@ -334,13 +335,12 @@ bool CamManager::pollOnce(int timeoutMs)
             continue;
         }
 
-        // std::cout << "camera " << camera->cameraId()
+        // LOG_DEBUG("CamManager", "camera=" << camera->cameraId()
         //           << " frame seq=" << frame.sequence
         //           << " ts_us=" << frame.timestampUs
         //           << " bytes=" << frame.bytesUsed
         //           << " fd=" << frame.dmaFd
-        //           << " index=" << frame.index
-        //           << "\n";
+        //           << " index=" << frame.index);
 
         VideoFrame videoFrame {
             .streamId = camera->cameraId(),
@@ -398,7 +398,7 @@ void CamManager::run(int timeoutMs)
 {
     while (!m_stopRequested) {
         if (!pollOnce(timeoutMs)) {
-            std::cerr << "CamManager pollOnce 失败: " << lastError() << "\n";
+            LOG_ERROR("CamManager", "pollOnce failed: " << lastError());
             break;
         }
     }
@@ -442,7 +442,7 @@ void CamManager::notifyReturnEvent()
     } while (ret < 0 && errno == EINTR);
 
     // eventfd 计数器满时说明 poll 线程已经有待处理通知。
-    // 这里可能由 consumer 线程调用，保持非致命，避免跨线程写 m_lastError。
+    // 这里可能由 sink 线程调用，保持非致命，避免跨线程写 m_lastError。
     (void)ret;
 }
 

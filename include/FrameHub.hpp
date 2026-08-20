@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Consumer.hpp"
+#include "Sink.hpp"
 #include "VideoFrame.hpp"
 
 #include <cstddef>
@@ -14,11 +14,11 @@ public:
 	FrameHub() = default;
 	explicit FrameHub(int streamId);
 
-	bool addConsumer(std::shared_ptr<Consumer> consumer);
+	bool addSink(std::shared_ptr<Sink> sink);
 	bool publishFrame(const FramePacket& packet);
 
 	int streamId() const;
-	size_t consumerCount() const;
+	size_t sinkCount() const;
 	const std::string& lastError() const;
 
 private:
@@ -27,6 +27,6 @@ private:
 private:
 	int m_streamId = -1;
 	mutable std::mutex m_mutex;
-	std::vector<std::weak_ptr<Consumer>> m_consumers;
+	std::vector<std::weak_ptr<Sink>> m_sinks;
 	std::string m_lastError;
 };

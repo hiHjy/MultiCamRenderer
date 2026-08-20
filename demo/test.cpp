@@ -1,5 +1,5 @@
 #include "CamManager.hpp"
-#include "TestConsumer.hpp"
+#include "TestSink.hpp"
 
 #include <iostream>
 #include <memory>
@@ -8,7 +8,7 @@
 int main()
 {
     CamManager manager;
-    std::vector<std::shared_ptr<Consumer>> consumers;
+    std::vector<std::shared_ptr<Sink>> sinks;
 
     CamManager::CameraConfig config0 {};
     config0.cameraId = 0;
@@ -24,21 +24,21 @@ int main()
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(0));
-    if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(0));
+    if (!manager.addFrameSink(config0.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(1));
-	if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(1));
+	if (!manager.addFrameSink(config0.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(2));
-	if (!manager.addFrameConsumer(config0.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera0 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(2));
+	if (!manager.addFrameSink(config0.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
@@ -57,28 +57,28 @@ int main()
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(3));
-    if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(3));
+    if (!manager.addFrameSink(config1.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
 
-    consumers.push_back(std::make_shared<TestConsumer>(4));
-    if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(4));
+    if (!manager.addFrameSink(config1.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(5));
-	if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(5));
+	if (!manager.addFrameSink(config1.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 
-    consumers.push_back(std::make_shared<TestConsumer>(6));
-	if (!manager.addFrameConsumer(config1.cameraId, consumers.back())) {
-        std::cerr << "addFrameConsumer camera1 failed: " << manager.lastError() << "\n";
+    sinks.push_back(std::make_shared<TestSink>(6));
+	if (!manager.addFrameSink(config1.cameraId, sinks.back())) {
+        std::cerr << "addFrameSink camera1 failed: " << manager.lastError() << "\n";
         return 1;
     }
 

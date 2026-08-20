@@ -1,17 +1,17 @@
 #pragma once
 
-#include "Consumer.hpp"
+#include "Sink.hpp"
+#include "Log.hpp"
 
 #include <iostream>
 
-class TestConsumer : public Consumer {
+class TestSink : public Sink {
 public:
 
 	void onFrame(FramePacket packet) override
 	{
 		const VideoFrame& frame = packet.frame;
-		std::cout << " TestConsumer:"
-				  <<  m_n
+		LOG_INFO("TestSink", "id=" << m_n
 		          << " stream=" << frame.streamId
 		          << " seq=" << frame.sequence
 		          << " ts=" << frame.timestampUs
@@ -22,15 +22,14 @@ public:
 		          << " va=" << frame.va
 		          << " bytes=" << frame.bytesUsed
 		          << "/" << frame.capacity
-		          << " bufIdx=" << frame.bufferIndex
-		          << std::endl;
+		          << " bufIdx=" << frame.bufferIndex);
 	}
 
-	TestConsumer() = default;
-	TestConsumer(uint32_t n): m_n(n)
+	TestSink() = default;
+	TestSink(uint32_t n): m_n(n)
 	{
 
 	};
-	~TestConsumer() override = default;
+	~TestSink() override = default;
 	uint32_t m_n;
 };

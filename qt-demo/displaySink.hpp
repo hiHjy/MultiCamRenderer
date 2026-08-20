@@ -1,8 +1,8 @@
-#ifndef DISPLAYCONSUMER_HPP
-#define DISPLAYCONSUMER_HPP
+#ifndef DISPLAY_SINK_HPP
+#define DISPLAY_SINK_HPP
 
 #include <QObject>
-#include "Consumer.hpp"
+#include "Sink.hpp"
 #include "VideoFrame.hpp"
 #include "DmaBufferPool.hpp"
 #include "hw/RgaEngine.hpp"
@@ -29,15 +29,15 @@ struct DisplayFrame {
 };
 Q_DECLARE_METATYPE(DisplayFrame)
 
-class DisplayConsumer : public QObject, public Consumer {
+class DisplaySink : public QObject, public Sink {
     Q_OBJECT
 public:
     static constexpr int WIDTH = 640;
     static constexpr int HEIGHT = 480;
     static constexpr int BUFFER_COUNT = 4;
 
-    explicit DisplayConsumer(QObject *parent = nullptr);
-    ~DisplayConsumer() override;
+    explicit DisplaySink(QObject *parent = nullptr);
+    ~DisplaySink() override;
     void onFrame(FramePacket packet) override;
 
 public slots:
@@ -65,4 +65,4 @@ private:
     int m_fpsLogFrames = 0;
 };
 
-#endif // DISPLAYCONSUMER_HPP
+#endif // DISPLAY_SINK_HPP

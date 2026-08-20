@@ -1,11 +1,11 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickItem>
-#include <QDebug>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
-#include <QDebug>
+
+#include "Log.hpp"
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
@@ -24,7 +24,7 @@ int main(int argc, char *argv[])
     if (!roots.isEmpty()) {
         QQuickWindow *window = qobject_cast<QQuickWindow *>(roots.first());
         if (window) {
-            qDebug() << "Window size:" << window->size();
+            LOG_INFO("QtDemo", "window size=" << window->width() << "x" << window->height());
         }
     }
     return app.exec();

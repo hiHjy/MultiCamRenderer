@@ -1,5 +1,5 @@
 #include "CamManager.hpp"
-#include "../include/consumer/RgaCopyConsumer.hpp"
+#include "../include/sink/RgaCopySink.hpp"
 
 #include <iostream>
 #include <memory>
@@ -7,7 +7,7 @@
 int main () 
 {
 	CamManager manager;
-	auto consumer = std::make_shared<RgaCopyConsumer>();
+	auto sink = std::make_shared<RgaCopySink>();
 
     CamManager::CameraConfig config0 {};
     config0.cameraId = 0;
@@ -22,7 +22,7 @@ int main ()
         std::cerr << "addCamera camera0 failed: " << manager.lastError() << "\n";
         return 1;
     }
-	manager.addConsumerForHub(0, consumer);
+	manager.addSinkForHub(0, sink);
 	manager.startAll();
 	manager.run();
 

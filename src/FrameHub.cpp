@@ -8,23 +8,23 @@ FrameHub::FrameHub(int streamId)
 {
 }
 
-bool FrameHub::addConsumer(std::shared_ptr<Consumer> consumer)
+bool FrameHub::addSink(std::shared_ptr<Sink> sink)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 
-	if (!consumer) {
-		setError("consumer 不能为空");
+	if (!sink) {
+		setError("sink 不能为空");
 		return false;
 	}
 
-	m_consumers.push_back(consumer);
+	m_sinks.push_back(sink);
 	m_lastError.clear();
 	return true;
 }
 
 bool FrameHub::publishFrame(const FramePacket& packet)
 {
-	std::vector<std::shared_ptr<Consumer>> consumers;
+	std::vector<std::shared_ptr<Sink>> sinks;
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -38,19 +38,19 @@ bool FrameHub::publishFrame(const FramePacket& packet)
 			return false;
 		}
 
-		consumers.reserve(m_consumers.size());
-		for (auto it = m_consumers.begin(); it != m_consumers.end();) {
-			if (auto consumer = it->lock()) {
-				consumers.push_back(std::move(consumer));
+		sinks.reserve(m_sinks.size());
+		for (auto it = m_sinks.begin(); it != m_sinks.end();) {
+			if (auto sink = it->lock()) {
+				sinks.push_back(std::move(sink));
 				++it;
 			} else {
-				it = m_consumers.erase(it);
+				it = m_sinks.erase(it);
 			}
 		}
 	}
 
-	for (const std::shared_ptr<Consumer>& consumer : consumers) {
-		consumer->onFrame(packet);
+	for (const std::shared_ptr<Sink>& sink : sinks) {
+		sink->onFrame(packet);
 	}
 
 	m_lastError.clear();
@@ -62,10 +62,10 @@ int FrameHub::streamId() const
 	return m_streamId;
 }
 
-size_t FrameHub::consumerCount() const
+size_t FrameHub::sinkCount() const
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	return m_consumers.size();
+	return m_sinks.size();
 }
 
 const std::string& FrameHub::lastError() const

@@ -2,9 +2,9 @@
 
 #include "VideoFrame.hpp"
 
-class Consumer {
+class Sink {
 public:
-	virtual ~Consumer() = default;
+	virtual ~Sink() = default;
 
 	// 帧回调：packet 按值传入，sink 会拿到自己那份 lease 引用。
 	// sink 如果要长时间处理，应该尽快 RGA/copy 到自己的 buffer pool，

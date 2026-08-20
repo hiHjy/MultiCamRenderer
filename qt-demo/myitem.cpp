@@ -1,12 +1,13 @@
 #include "myitem.h"
 
+#include "Log.hpp"
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <drm/drm_fourcc.h>
 
-#include <QDebug>
 #include <QHash>
 #include <QMetaType>
 #include <QQuickWindow>
@@ -37,7 +38,7 @@ public:
         if (!window || frame.dmaFd < 0 || frame.width <= 0 || frame.height <= 0)
             return nullptr;
 
-        // DisplayConsumer 的显示 pool 是固定几块 DMA buffer 循环使用。
+        // DisplaySink 的显示 pool 是固定几块 DMA buffer 循环使用。
         // 同一个 dmaFd 会反复出现，所以第一次导入成纹理后缓存起来。
         // 这样每帧只换内容，不重复创建/销毁 EGLImage、GL texture、QSGTexture。
         auto it = m_textures.find(frame.dmaFd);
@@ -48,7 +49,7 @@ public:
         // eglGetCurrentDisplay() 拿到的就是 Qt 正在用的 EGL display。
         EGLDisplay eglDisplay = eglGetCurrentDisplay();
         if (eglDisplay == EGL_NO_DISPLAY) {
-            qWarning() << "eglGetCurrentDisplay failed";
+            LOG_ERROR("QtVideoItem", "eglGetCurrentDisplay failed");
             return nullptr;
         }
 
@@ -63,7 +64,7 @@ public:
             reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
 
         if (!eglCreateImageKHRFunc || !eglDestroyImageKHRFunc || !glEGLImageTargetTexture2DOESFunc) {
-            qWarning() << "EGL dmabuf import functions unavailable";
+            LOG_ERROR("QtVideoItem", "EGL dmabuf import functions unavailable");
             return nullptr;
         }
 
@@ -88,7 +89,11 @@ public:
         EGLImageKHR eglImage = eglCreateImageKHRFunc(
             eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
         if (eglImage == EGL_NO_IMAGE_KHR) {
-            qWarning() << "eglCreateImageKHR failed, eglError:" << Qt::hex << eglGetError();
+            LOG_ERROR("QtVideoItem", "eglCreateImageKHR failed eglError=0x"
+                      << std::hex << eglGetError() << std::dec
+                      << " fd=" << frame.dmaFd
+                      << " size=" << frame.width << "x" << frame.height
+                      << " pitch=" << frame.stride * 4);
             return nullptr;
         }
 
@@ -97,7 +102,7 @@ public:
         GLuint textureId = 0;
         glGenTextures(1, &textureId);
         if (!textureId) {
-            qWarning() << "glGenTextures failed";
+            LOG_ERROR("QtVideoItem", "glGenTextures failed");
             eglDestroyImageKHRFunc(eglDisplay, eglImage);
             return nullptr;
         }
@@ -113,7 +118,7 @@ public:
         glBindTexture(GL_TEXTURE_2D, 0);
 
         // texture 已经引用了 EGLImage 对应的底层图像，EGLImage 包装对象可以销毁。
-        // 真正的 DMA buffer 生命周期仍然由 DisplayConsumer 的 pool 管。
+        // 真正的 DMA buffer 生命周期仍然由 DisplaySink 的 pool 管。
         eglDestroyImageKHRFunc(eglDisplay, eglImage);
 
         // OpenGL texture id -> Qt Scene Graph 的 QSGTexture。
@@ -156,12 +161,12 @@ MyItem::MyItem()
         config.format = PixelFormat::YUYV;
         mgr->addCamera(config);
 
-        auto p = std::make_shared<DisplayConsumer>();
-        DisplayConsumer *consumer = p.get();
-        mgr->addConsumerForHub(0, p);
+        auto p = std::make_shared<DisplaySink>();
+        DisplaySink *sink = p.get();
+        mgr->addSinkForHub(0, p);
 
-        connect(consumer, &DisplayConsumer::frameReady, this, &MyItem::setFrame);
-        connect(this, &MyItem::displayFrameDone, consumer, &DisplayConsumer::releaseFrameByIndex,
+        connect(sink, &DisplaySink::frameReady, this, &MyItem::setFrame);
+        connect(this, &MyItem::displayFrameDone, sink, &DisplaySink::releaseFrameByIndex,
                 Qt::DirectConnection);
 
         mgr->startAll();
@@ -228,7 +233,7 @@ void MyItem::setFrame(DisplayFrame frame)
     {
         QMutexLocker lock(&m_frameMutex);
         // 如果旧的 latest 还没被 updatePaintNode 接走，新帧又来了，
-        // 就丢掉旧 latest，并通知 DisplayConsumer 归还对应 buffer。
+        // 就丢掉旧 latest，并通知 DisplaySink 归还对应 buffer。
         if (m_hasFrame && m_latestFrame.bufferIndex != m_displayedBufferIndex &&
             m_latestFrame.bufferIndex != frame.bufferIndex) {
             droppedIndex = m_latestFrame.bufferIndex;

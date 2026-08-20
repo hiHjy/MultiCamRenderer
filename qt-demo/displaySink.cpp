@@ -1,6 +1,7 @@
-#include "displayConsumer.hpp"
+#include "displaySink.hpp"
 
-#include <QDebug>
+#include "Log.hpp"
+
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <utility>
@@ -32,21 +33,20 @@ void dmabufSyncEnd(int fd, __u64 rw)
 
 }
 
-DisplayConsumer::DisplayConsumer(QObject *parent)
+DisplaySink::DisplaySink(QObject *parent)
     : QObject(parent)
 {
     const size_t bufferSize = RgaEngine::bufferSizeFor(PixelFormat::RGBA8888, WIDTH, HEIGHT);
     if (bufferSize == 0) {
-        qWarning() << "DisplayConsumer: 计算 RGA 目标 DMA buffer size 失败";
+        LOG_ERROR("DisplaySink", "计算 RGA 目标 DMA buffer size 失败");
     } else if (!m_rgbaPool.init(BUFFER_COUNT, bufferSize)) {
-        qWarning() << "DisplayConsumer: 分配 RGA 目标 DMA buffer pool 失败:"
-                   << QString::fromStdString(m_rgbaPool.lastError());
+        LOG_ERROR("DisplaySink", "分配 RGA 目标 DMA buffer pool 失败: " << m_rgbaPool.lastError());
     }
 
-    m_workerThread = std::thread(&DisplayConsumer::workerLoop, this);
+    m_workerThread = std::thread(&DisplaySink::workerLoop, this);
 }
 
-DisplayConsumer::~DisplayConsumer()
+DisplaySink::~DisplaySink()
 {
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
@@ -59,7 +59,7 @@ DisplayConsumer::~DisplayConsumer()
         m_workerThread.join();
 }
 
-void DisplayConsumer::onFrame(FramePacket packet)
+void DisplaySink::onFrame(FramePacket packet)
 {
     // 摄像头线程调用，只保留最新帧并立刻返回。
     // 如果 worker 还没来得及处理上一帧，旧 packet 会在这里析构并释放 lease。
@@ -68,9 +68,9 @@ void DisplayConsumer::onFrame(FramePacket packet)
         if (m_latestPacket.has_value()) {
             ++m_droppedFrames;
             if (m_droppedFrames % 60 == 1) {
-                qWarning() << "<DisplayConsumer> drop pending frame sequence:"
-                           << m_latestPacket->frame.sequence
-                           << "total:" << m_droppedFrames;
+                LOG_WARN("DisplaySink", "drop pending frame seq="
+                         << m_latestPacket->frame.sequence
+                         << " total=" << m_droppedFrames);
             }
         }
 
@@ -79,7 +79,7 @@ void DisplayConsumer::onFrame(FramePacket packet)
     m_pendingCv.notify_one();
 }
 
-void DisplayConsumer::workerLoop()
+void DisplaySink::workerLoop()
 {
     while (true) {
         FramePacket packet;
@@ -100,21 +100,20 @@ void DisplayConsumer::workerLoop()
     }
 }
 
-void DisplayConsumer::processFrame(FramePacket packet)
+void DisplaySink::processFrame(FramePacket packet)
 {
     const VideoFrame &frame = packet.frame;
-    // DisplayConsumer worker 线程调用。
+    // DisplaySink worker 线程调用。
     // 通过 RgaEngine::rga() 把摄像头 YUYV 转成 RGBA，存进我们私有 buffer。
     if (frame.width != WIDTH || frame.height != HEIGHT) {
-        qWarning() << "DisplayConsumer: 帧尺寸不匹配:"
-                   << frame.width << "x" << frame.height;
+        LOG_WARN("DisplaySink", "帧尺寸不匹配: " << frame.width << "x" << frame.height
+                 << " expected=" << WIDTH << "x" << HEIGHT);
         return;
     }
 
     VideoFrame *dstFrame = m_rgbaPool.acquireFrame();
     if (!dstFrame) {
-        qWarning() << "DisplayConsumer: RGA 目标 DMA buffer pool 无空闲帧:"
-                   << QString::fromStdString(m_rgbaPool.lastError());
+        LOG_WARN("DisplaySink", "RGA 目标 DMA buffer pool 无空闲帧: " << m_rgbaPool.lastError());
         return;
     }
 
@@ -144,8 +143,7 @@ void DisplayConsumer::processFrame(FramePacket packet)
     dmabufSyncEnd(frame.dmaFd, DMA_BUF_SYNC_READ);
 
     if (!rgaOk) {
-        qWarning() << "DisplayConsumer: RGA YUYV->RGBA 转换失败:"
-                   << QString::fromStdString(m_rga.lastError());
+        LOG_ERROR("DisplaySink", "RGA YUYV->RGBA 转换失败: " << m_rga.lastError());
         releaseFrameByIndex(dstFrame->bufferIndex);
         return;
     }
@@ -173,9 +171,9 @@ void DisplayConsumer::processFrame(FramePacket packet)
     if (m_fpsLogFrames >= 60) {
         const std::chrono::duration<double> elapsed = now - m_fpsLogStart;
         if (elapsed.count() > 0.0) {
-            qDebug() << "DisplayConsumer FPS:" << (m_fpsLogFrames / elapsed.count())
-                     << "sequence:" << df.sequence
-                     << "buffer:" << df.bufferIndex;
+            LOG_INFO("DisplaySink", "fps=" << (m_fpsLogFrames / elapsed.count())
+                     << " sequence=" << df.sequence
+                     << " buffer=" << df.bufferIndex);
         }
         m_fpsLogFrames = 0;
         m_fpsLogStart = now;
@@ -184,7 +182,7 @@ void DisplayConsumer::processFrame(FramePacket packet)
     emit frameReady(df);
 }
 
-void DisplayConsumer::releaseFrameByIndex(int bufferIndex)
+void DisplaySink::releaseFrameByIndex(int bufferIndex)
 {
     if (bufferIndex < 0 || bufferIndex >= BUFFER_COUNT)
         return;

@@ -93,8 +93,8 @@ cat > "$BASE/compile_commands.base.json" <<EOF
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/src/consumer/RgaCopyConsumer.cpp -o $BASE/build/RgaCopyConsumer.o",
-    "file": "$BASE/src/consumer/RgaCopyConsumer.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/src/sink/RgaCopySink.cpp -o $BASE/build/RgaCopySink.o",
+    "file": "$BASE/src/sink/RgaCopySink.cpp"
   }
 ]
 EOF
@@ -146,7 +146,7 @@ set -x
     "$BASE/src/FrameHub.cpp" \
     "$BASE/src/DmaBufferPool.cpp" \
     "$BASE/src/hw/RgaEngine.cpp" \
-    "$BASE/src/consumer/RgaCopyConsumer.cpp" \
+    "$BASE/src/sink/RgaCopySink.cpp" \
     "$BASE/demo/rga_test.cpp" \
     -o "$BASE/build/rga_test" \
     $RGA_LINK_FLAGS

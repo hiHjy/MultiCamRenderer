@@ -16,7 +16,7 @@
 #include <qqmlregistration.h>
 #include <QTimer>
 #include <thread>
-#include <displayConsumer.hpp>
+#include <displaySink.hpp>
 
 
 
@@ -39,7 +39,7 @@
 //
 // 当前第一版仍使用 m_retiredDisplayedIndexes 延迟一帧 release：
 // updatePaintNode() setTexture 后不立刻归还旧 buffer，避免 Qt/GPU 还没采样完，
-// DisplayConsumer/RGA 就把同一块 dma-buf 重新写成下一帧导致闪烁或撕裂。
+// DisplaySink/RGA 就把同一块 dma-buf 重新写成下一帧导致闪烁或撕裂。
 class MyItem : public QQuickItem
 {
     Q_OBJECT
@@ -57,13 +57,13 @@ signals:
     void displayFrameDone(int bufferIndex);
 
 public slots:
-    // DisplayConsumer 把 RGA 转好的 RGBA dma-buf 通过这个槽送进 Qt。
+    // DisplaySink 把 RGA 转好的 RGBA dma-buf 通过这个槽送进 Qt。
     // 这里不能直接画，只能记住最新帧，然后 update() 请求下一轮 Scene Graph 重绘。
     void setFrame(DisplayFrame frame);
 
 private:
     // 最新待显示帧。DisplayFrame 只保存 fd/宽高/stride/index 这些标量信息，
-    // 真正 DMA buffer 的所有权还在 DisplayConsumer 的 pool 里。
+    // 真正 DMA buffer 的所有权还在 DisplaySink 的 pool 里。
     DisplayFrame m_latestFrame;
     QMutex m_frameMutex;
     bool m_hasFrame = false;
