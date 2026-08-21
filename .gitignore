@@ -18,3 +18,5 @@ build_test_aarch64.sh
 build_test_aarch64.sh
 .cache
 compile_flags.txt
+build-wsl-aarch64/
+deploy-wsl-aarch64/

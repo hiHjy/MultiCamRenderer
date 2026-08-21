@@ -37,16 +37,16 @@ public:
 	
     struct CameraSlot {
         CameraConfig config;
-        std::unique_ptr<V4L2CameraSource> source;
+        std::shared_ptr<V4L2CameraSource> source;
         CameraState state = CameraState::Created;
         std::string lastError;
     };
 
     // 第一版并发约束：
     // addCamera/delCamera 只能在 run()/pollOnce() 没有并发执行时调用。
-    // 当前内部用 unique_ptr 持有摄像头，pollOnce() 会临时复制裸指针快照；
-    // 如果运行中删除摄像头，快照里的裸指针可能悬空。
-    // 后续若要支持热插拔，应改成事件队列或 shared_ptr 快照。
+    // 当前内部用 shared_ptr 持有摄像头，pollOnce() 会复制 shared_ptr 快照，
+    // 避免 poll 阻塞期间 delCamera() 删除对象导致快照悬空。
+    // 这只解决对象生命周期，不等于完整热插拔；运行中增删摄像头仍建议后续改成事件队列。
     bool addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
     bool addFrameSink(int cameraId, std::shared_ptr<Sink> sink);
@@ -73,7 +73,7 @@ private:
     std::mutex m_camChangeMutex;
     std::unordered_map<int, CameraSlot> m_cameraMap {};
     std::string m_lastError;
-    std::unordered_map<int, std::unique_ptr<FrameHub>> m_frameHubMap;
+    std::unordered_map<int, std::shared_ptr<FrameHub>> m_frameHubMap;
     bool m_stopRequested = false;
     std::mutex m_returnMutex;
     std::queue<std::pair<int, int>> m_returnQueue;

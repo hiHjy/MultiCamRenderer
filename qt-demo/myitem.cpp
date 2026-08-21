@@ -160,13 +160,13 @@ MyItem::MyItem()
         config.devicePath = "/dev/video10";
         config.format = PixelFormat::YUYV;
         mgr->addCamera(config);
-
+        
         auto p = std::make_shared<DisplaySink>();
-        DisplaySink *sink = p.get();
+        //DisplaySink *sink = p.get();
         mgr->addSinkForHub(0, p);
 
-        connect(sink, &DisplaySink::frameReady, this, &MyItem::setFrame);
-        connect(this, &MyItem::displayFrameDone, sink, &DisplaySink::releaseFrameByIndex,
+        connect(p.get(), &DisplaySink::frameReady, this, &MyItem::setFrame);
+        connect(this, &MyItem::displayFrameDone, p.get(), &DisplaySink::releaseFrameByIndex,
                 Qt::DirectConnection);
 
         mgr->startAll();

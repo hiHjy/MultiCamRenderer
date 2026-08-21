@@ -5,14 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_FILE="$ROOT_DIR/compile_commands.json"
 
 inputs=()
-if [ -f "$ROOT_DIR/compile_commands.base.json" ]; then
-    inputs+=("$ROOT_DIR/compile_commands.base.json")
-elif [ -f "$OUT_FILE" ]; then
-    inputs+=("$OUT_FILE")
+
+if [ -f "$ROOT_DIR/qt-demo/build-wsl-aarch64/compile_commands.json" ]; then
+    inputs+=("$ROOT_DIR/qt-demo/build-wsl-aarch64/compile_commands.json")
 fi
 
-if [ -f "$ROOT_DIR/qt-demo/build/compile_commands.json" ]; then
-    inputs+=("$ROOT_DIR/qt-demo/build/compile_commands.json")
+if [ -f "$ROOT_DIR/compile_commands.base.json" ]; then
+    inputs+=("$ROOT_DIR/compile_commands.base.json")
 fi
 
 if [ "${#inputs[@]}" -eq 0 ]; then

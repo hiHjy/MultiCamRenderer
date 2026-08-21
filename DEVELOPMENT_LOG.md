@@ -529,3 +529,110 @@ CamManager::pollOnce()
 - Qt 文件的普通主机 `g++ -fsyntax-only` 检查会因为缺少 Qt include 路径失败，需以后以 `qt-demo/build.sh build` 的交叉编译结果为准。
 - `./build.sh` 通过，RV1126 32 位 demo 目标均完成构建。
 - `./qt-demo/build.sh` 通过，Qt aarch64 demo 完成构建和部署。
+
+## 2026-08-21
+
+### 项目当前进度
+
+本次继续打磨 `CamManager` 的摄像头生命周期边界，重点处理 `pollOnce()` 已经拿到摄像头快照后，外部又调用 `delCamera()` 的情况。
+
+上一版已经用 `eventfd` 解决了 return queue 唤醒问题，但 `CamManager` 内部仍然用 `unique_ptr` 持有 `V4L2CameraSource` 和 `FrameHub`。如果后续支持运行中删除摄像头，`pollOnce()` 里的裸指针快照存在悬空风险。
+
+本次将 camera/hub 快照改为 `shared_ptr` 生命周期保护，并让 `FrameLease` 间接保住对应的 `V4L2CameraSource`，避免异步 sink 还在使用原始 DMA-BUF 时 source 提前析构。
+
+### 今天完成的事
+
+1. `CameraSlot::source` 改为 `std::shared_ptr<V4L2CameraSource>`。
+
+   `CamManager` 仍然通过 `m_cameraMap` 管理 camera，但 `pollOnce()` 不再保存裸指针快照，而是复制 `shared_ptr`：
+
+   ```text
+   m_cameraMap
+     -> shared_ptr<V4L2CameraSource>
+     -> pollOnce() shared_ptr snapshot
+   ```
+
+   这样 `delCamera()` 从 map 中移除 camera 后，已经进入本轮 `pollOnce()` 的快照仍然能保证对象活着，不会出现悬空指针。
+
+2. `m_frameHubMap` 改为 `std::shared_ptr<FrameHub>`。
+
+   `pollOnce()` 同时会拿 camera 和 hub 快照。只保护 camera 不够，hub 也可能在 `delCamera()` 时从 map 中移除，因此同步改成 `shared_ptr` 快照。
+
+3. `FrameLease` 捕获 `sourceLifetime`。
+
+   创建 `FramePacket` 时，release callback 现在会捕获当前 camera 的 `shared_ptr`：
+
+   ```cpp
+   [this, sourceLifetime = camera, cameraId, bufferIndex]() {
+       (void)sourceLifetime;
+       postReturnedFrame(cameraId, bufferIndex);
+   }
+   ```
+
+   这表示只要还有 sink 持有这帧原始 V4L2 lease，对应的 `V4L2CameraSource` 就不会析构。sink 完成 RGA/copy 后释放 lease，source 才允许释放。
+
+4. `publishFrame()` 前增加 active check。
+
+   在 `DQBUF` 之后、发布给 sink 之前，会重新检查当前快照是否仍然是 map 中的 active camera/hub：
+
+   ```text
+   cameraId 仍存在
+   hub 仍存在
+   map 中的 source 仍等于本轮快照 source
+   map 中的 hub 仍等于本轮快照 hub
+   camera state 仍为 Streaming
+   ```
+
+   如果 camera 已经被删除或停止，则跳过本帧发布，立即释放本帧 lease，并尝试 drain return queue。
+
+5. `drainReturnedFrames()` 对已删除 camera 改为跳过。
+
+   return queue 中可能存在已经删除的 cameraId。此时不再把它当作错误中断，而是跳过 QBUF，让 `FrameLease` 捕获的 `sourceLifetime` 在最后释放时带着 `V4L2CameraSource` 析构清理 fd 和 DMA buffer。
+
+6. 将 return queue 中的结构化绑定改成传统写法。
+
+   原写法：
+
+   ```cpp
+   const auto [cameraId, bufferIndex] = pending.front();
+   ```
+
+   改成更直观的 C++17 以前写法：
+
+   ```cpp
+   const std::pair<int, int> item = pending.front();
+   const int cameraId = item.first;
+   const int bufferIndex = item.second;
+   ```
+
+7. 补充 WSL Qt 交叉编译辅助文件。
+
+   新增 `qt-demo/wsl-build.sh` 和 `qt-demo/wsl-toolchain.cmake`，用于 WSL 环境下走 Ninja/CMake 构建 RK3568 aarch64 Qt demo。`.gitignore` 同步忽略 WSL 构建和部署输出目录。
+
+### 重要设计结论
+
+1. `shared_ptr` 快照解决对象生命周期，不等于完整热插拔。
+
+   这一版可以避免 `delCamera()` 导致 `pollOnce()` 快照悬空，也能避免异步 sink 持有原始帧时 source 提前析构。
+
+   但如果要严格支持运行中增删摄像头，后续仍建议把 `addCamera/delCamera/start/stop` 改成 command queue，由 `CamManager` 所在线程统一执行状态变化。
+
+2. 删除摄像头的语义变成“停止可见”和“资源最终释放”分离。
+
+   ```text
+   delCamera()
+     -> 从 map 删除，后续不再进入新快照，也不再 publish 新帧
+     -> 已经分发出去的 FrameLease 继续保护原始 buffer
+     -> 最后一个 lease 释放后，sourceLifetime 释放，source 析构清理资源
+   ```
+
+   这会让资源释放延迟到最后一个原始 lease 释放，但这是为了保证异步 sink 不读到已经释放的 DMA-BUF。
+
+3. `onFrame()` 仍然必须快速返回。
+
+   如果 sink 长时间持有原始 V4L2 lease，删除摄像头和 buffer 回收都会被拖慢。录像/推流/AI 等慢处理后续应先 copy/encode 到自己的资源，再释放原始 lease。
+
+### 本次验证
+
+- `g++ -std=c++17 -Wall -Wextra -Iinclude -Iinclude/hw -Iinclude/sink -Ithird_party/rga/include -fsyntax-only src/CamManager.cpp src/FrameHub.cpp src/DmaBufferPool.cpp src/sink/RgaCopySink.cpp demo/test.cpp demo/rga_test.cpp` 通过。
+- `bash -n build.sh`、`bash -n qt-demo/build.sh`、`bash -n qt-demo/run.sh`、`bash -n qt-demo/wsl-build.sh` 通过。
