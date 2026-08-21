@@ -611,11 +611,11 @@ CamManager::pollOnce()
 
 ### 重要设计结论
 
-1. `shared_ptr` 快照解决对象生命周期，不等于完整热插拔。
+1. `shared_ptr` 快照支持基础运行中删除。
 
    这一版可以避免 `delCamera()` 导致 `pollOnce()` 快照悬空，也能避免异步 sink 持有原始帧时 source 提前析构。
 
-   但如果要严格支持运行中增删摄像头，后续仍建议把 `addCamera/delCamera/start/stop` 改成 command queue，由 `CamManager` 所在线程统一执行状态变化。
+   当前 `delCamera()` 的语义是从 `m_cameraMap/m_frameHubMap` 摘除管理引用，不主动 `stop()` 快照里的 V4L2 fd。已经在 `pollOnce()` 或 sink 中流转的帧，依靠 `shared_ptr` 快照和 `FrameLease::sourceLifetime` 自然收尾。
 
 2. 删除摄像头的语义变成“停止可见”和“资源最终释放”分离。
 
@@ -631,6 +631,19 @@ CamManager::pollOnce()
 3. `onFrame()` 仍然必须快速返回。
 
    如果 sink 长时间持有原始 V4L2 lease，删除摄像头和 buffer 回收都会被拖慢。录像/推流/AI 等慢处理后续应先 copy/encode 到自己的资源，再释放原始 lease。
+
+4. 当前不要在旧 lease 完全释放前复用同一个 `cameraId`。
+
+   现在 return queue 里保存的是：
+
+   ```cpp
+   cameraId
+   bufferIndex
+   ```
+
+   如果 `delCamera(0)` 后旧 camera 的 lease 还没完全释放，又立刻 `addCamera(0)`，旧 lease 的归还事件可能和新 cameraId 混淆。
+
+   后续计划将 cameraId 改为内部自动生成并返回给上层，或者给 cameraId 增加 generation 校验，避免旧归还事件误投到新摄像头。
 
 ### 本次验证
 

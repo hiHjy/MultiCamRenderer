@@ -42,11 +42,12 @@ public:
         std::string lastError;
     };
 
-    // 第一版并发约束：
-    // addCamera/delCamera 只能在 run()/pollOnce() 没有并发执行时调用。
     // 当前内部用 shared_ptr 持有摄像头，pollOnce() 会复制 shared_ptr 快照，
-    // 避免 poll 阻塞期间 delCamera() 删除对象导致快照悬空。
-    // 这只解决对象生命周期，不等于完整热插拔；运行中增删摄像头仍建议后续改成事件队列。
+    // delCamera() 只从 map 中摘除管理引用，不主动 stop 快照中的 V4L2 fd。
+    // 已经 DQBUF/publish 出去的帧由 FrameLease 继续保护 source 生命周期；
+    // 最后一个引用释放后，V4L2CameraSource 析构时统一清理 fd/DMA buffer。
+    // 这支持基础运行中删除；当前不要在旧 lease 完全释放前复用同一个 cameraId。
+    // 后续应改成内部生成 cameraId，或给 cameraId 增加 generation 校验。
     bool addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
     bool addFrameSink(int cameraId, std::shared_ptr<Sink> sink);

@@ -159,13 +159,13 @@ bool CamManager::delCamera(int cameraId) {
 		return false;
 	}
 
-	if (it->second.source) {
-		it->second.source->stop();
-		it->second.state = CameraState::Stopped;
-	}
+	// delCamera 只摘除 CamManager 对 camera/hub 的管理引用。
+	// 如果 pollOnce() 或某个 FrameLease 仍持有 source shared_ptr，
+	// V4L2CameraSource 会等最后一个引用释放后再析构清理。
 	m_cameraMap.erase(it);
 	m_frameHubMap.erase(cameraId);
 	m_lastError.clear();
+	notifyReturnEvent();
 	return true;
 }
 
@@ -505,6 +505,9 @@ bool CamManager::drainReturnedFrames() {
 			// 摄像头可能已经被 delCamera() 移除。
 			// 如果对应 FrameLease 捕获的 sourceLifetime 是最后一个引用，
 			// 这里跳过 QBUF，让 V4L2CameraSource 析构时关闭 fd/释放 DMA buffer。
+			// 注意：当前 return queue 只记录 cameraId/bufferIndex。
+			// 在旧 lease 完全释放前不要复用同一个 cameraId，否则旧归还事件
+			// 可能和新 cameraId 混淆。后续应改成内部生成 cameraId 或增加 generation。
 			continue;
 		}
 

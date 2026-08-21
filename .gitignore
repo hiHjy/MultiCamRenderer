@@ -20,3 +20,6 @@ build_test_aarch64.sh
 compile_flags.txt
 build-wsl-aarch64/
 deploy-wsl-aarch64/
+compile_commands.json.bak-mixed-paths
+.gitignore
+compile_commands.json.bak-old-path
