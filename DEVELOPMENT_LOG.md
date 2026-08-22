@@ -649,3 +649,138 @@ CamManager::pollOnce()
 
 - `g++ -std=c++17 -Wall -Wextra -Iinclude -Iinclude/hw -Iinclude/sink -Ithird_party/rga/include -fsyntax-only src/CamManager.cpp src/FrameHub.cpp src/DmaBufferPool.cpp src/sink/RgaCopySink.cpp demo/test.cpp demo/rga_test.cpp` 通过。
 - `bash -n build.sh`、`bash -n qt-demo/build.sh`、`bash -n qt-demo/run.sh`、`bash -n qt-demo/wsl-build.sh` 通过。
+
+## 2026-08-22
+
+### 项目当前进度
+
+本次继续收紧 `CamManager` 基座的线程生命周期和摄像头控制语义。上一版已经通过 `shared_ptr` 快照和 `FrameLease::sourceLifetime` 解决了运行中删除摄像头时的对象生命周期问题，本次重点处理另一个维度：`STREAMON/STREAMOFF`、`DQBUF/QBUF` 不应在多个线程同时操作同一个 V4L2 fd。
+
+当前摄像头基座语义调整为：
+
+```text
+addCamera/delCamera
+  -> 仍保持 shared_ptr 管理引用语义
+
+startCamera/stopCamera
+  -> 外部只投递内部命令
+  -> 由 CamManager poll 线程统一执行 STREAMON/STREAMOFF
+
+FrameLease 释放
+  -> 投递 return queue
+  -> CamManager poll 线程统一 QBUF
+```
+
+### 今天完成的事
+
+1. 拆分 `CamManager` 线程生命周期和摄像头流生命周期命名。
+
+   线程生命周期接口改为：
+
+   ```cpp
+   startPolling();
+   shutdownPolling();
+   ```
+
+   摄像头流生命周期接口改为：
+
+   ```cpp
+   startCamera(cameraId);
+   stopCamera(cameraId);
+   startAllCameras();
+   stopAllCameras();
+   ```
+
+   这样 `CamManager` 自己的 poll 线程和 camera 的 `STREAMON/STREAMOFF` 不再混在 `start/stop/startAll/stopAll` 这类含糊名字里。
+
+2. 给 `CamManager` 增加内部命令队列。
+
+   新增内部命令：
+
+   ```cpp
+   StartCamera
+   StopCamera
+   ```
+
+   外部调用 `startCamera()` / `stopCamera()` 时只负责投递命令并唤醒 poll 线程；真正的 `camera.start()` / `camera.stop()` 在 `drainCommands()` 中执行。
+
+   这里没有把 `delCamera()` 放进命令队列，因为当前删除语义是从 map 摘除 `shared_ptr` 管理引用，不主动 `STREAMOFF`，仍然依靠 `shared_ptr` 快照和 `FrameLease` 保证旧帧自然收尾。
+
+3. 修正 `CamManager` 后台线程生命周期。
+
+   `CamManager` 析构时会先 `shutdownPolling()`，再关闭 `eventfd`，避免后台线程仍在 poll/read eventfd 时对象已经析构。
+
+   `m_stopRequested` / `m_running` 改为 atomic，`startPolling()` 使用 `exchange(true)` 防止重复启动。`m_pollThread` 的 join/重建由 `m_threadMutex` 保护。
+
+4. 处理无摄像头时的等待和唤醒。
+
+   `pollOnce()` 在没有 Streaming camera 时不再直接报错退出，而是通过 `condition_variable` 等待：
+
+   ```text
+   有 camera 进入 Streaming
+   或收到内部 command
+   或请求 shutdown
+   ```
+
+   这样可以先启动 poll 线程，再按需添加/启动摄像头。
+
+5. `lastError()` 改为线程安全返回拷贝。
+
+   `m_lastError` 增加独立 mutex。`lastError()` 不再返回 `const std::string&`，而是返回 `std::string` 拷贝，避免后台 poll 线程写错误信息时，其他线程同时读内部字符串引用。
+
+6. 支持 `stopCamera()` 后再次 `startCamera()`。
+
+   `V4L2CameraSource::stop()` 在 `STREAMOFF` 后会把所有 buffer 标记为未 queued。为支持恢复采集，`V4L2CameraSource::start()` 现在会在 `STREAMON` 前重新 QBUF 所有未 queued 的 buffer。
+
+   流程变为：
+
+   ```text
+   stopCamera()
+     -> STREAMOFF
+     -> buffer.queued = false
+
+   startCamera()
+     -> QBUF 未 queued buffer
+     -> STREAMON
+   ```
+
+7. stop 后旧 `FrameLease` 归还不再 QBUF。
+
+   如果某帧已经发布给 sink，随后外部调用 `stopCamera()`，旧 lease 之后释放时仍会进入 return queue。此时 `drainReturnedFrames()` 会检查 camera 是否仍为 Streaming；如果已经停止，则跳过 QBUF。
+
+   这样避免在 `STREAMOFF` 后调用 `requeueFrame()`，下一次 `start()` 会重新 QBUF 全部 buffer。
+
+8. 同步更新 demo 调用名。
+
+   `demo/test.cpp`、`demo/rga_test.cpp`、`demo/cam_manager_demo.cpp`、`qt-demo/myitem.cpp` 中的旧接口名同步调整为 `startAllCameras()` / `stopAllCameras()`。
+
+### 重要设计结论
+
+1. `shared_ptr` 和内部命令队列解决的是两类问题。
+
+   ```text
+   shared_ptr / FrameLease:
+     解决对象和 DMA buffer 生命周期
+
+   内部命令队列:
+     解决 V4L2 fd 状态机操作时序
+   ```
+
+   二者不是互相替代关系，当前基座会同时保留。
+
+2. `startCamera()` / `stopCamera()` 当前返回的是“命令投递成功”。
+
+   因为真正 `STREAMON/STREAMOFF` 在 poll 线程执行，所以外部接口返回 `true` 不表示硬件已经完成启动或停止。后续如果需要同步知道执行结果，可以再给 command 增加结果回传或回调。
+
+3. `delCamera()` 仍保持当前删除语义。
+
+   当前 `delCamera()` 不主动 stop，也不进入命令队列；它只从 `m_cameraMap/m_frameHubMap` 中摘除管理引用。已经被 poll 线程或 sink 持有的旧帧继续依靠 `shared_ptr` 快照和 `FrameLease::sourceLifetime` 收尾。
+
+4. Qt demo 仍未收口。
+
+   当前 Qt demo 仍然在 `MyItem` 内部创建 `CamManager` 并启动线程，生命周期还没有接入正式 `AppRuntime`。下一步应把 Qt 显示路径拆成 runtime 管理，`MyItem` 只负责显示。
+
+### 本次验证
+
+- `g++ -std=c++17 -Wall -Wextra -Iinclude -Iinclude/hw -Iinclude/sink -Ithird_party/rga/include -fsyntax-only src/V4L2CameraSource.cpp src/CamManager.cpp src/FrameHub.cpp src/DmaBufferPool.cpp src/sink/RgaCopySink.cpp demo/test.cpp demo/rga_test.cpp demo/cam_manager_demo.cpp` 通过。
+- 当前仅剩 `V4L2CameraSource.cpp` 中 `PixelFormat::RGBA8888` 未覆盖 switch 的旧 warning，与本次基座变更无关。

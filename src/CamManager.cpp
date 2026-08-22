@@ -54,6 +54,7 @@ CamManager::CamManager() {
 }
 
 CamManager::~CamManager() {
+	shutdownPolling();
 	if (m_returnEventFd >= 0) {
 		close(m_returnEventFd);
 		m_returnEventFd = -1;
@@ -120,7 +121,7 @@ bool CamManager::addCamera(const CameraConfig &config) {
 
 	m_cameraMap.emplace(config.cameraId, std::move(slot));
 	m_frameHubMap.emplace(config.cameraId, std::move(hub));
-	m_lastError.clear();
+	clearError();
 
 	return true;
 }
@@ -143,7 +144,7 @@ bool CamManager::addFrameSink(int cameraId, std::shared_ptr<Sink> sink) {
 		return false;
 	}
 
-	m_lastError.clear();
+	clearError();
 	return true;
 }
 
@@ -164,60 +165,76 @@ bool CamManager::delCamera(int cameraId) {
 	// V4L2CameraSource 会等最后一个引用释放后再析构清理。
 	m_cameraMap.erase(it);
 	m_frameHubMap.erase(cameraId);
-	m_lastError.clear();
+	clearError();
 	notifyReturnEvent();
 	return true;
 }
 
-bool CamManager::startAll() {
-	std::lock_guard<std::mutex> lock(m_camChangeMutex);
-	for (auto &item : m_cameraMap) {
-		CameraSlot &slot = item.second;
-		if (!slot.source) {
-			slot.state = CameraState::Error;
-			slot.lastError = "摄像头对象为空";
-			setError(slot.lastError);
-			return false;
-		}
-
-		V4L2CameraSource &camera = *slot.source;
-		if (slot.state == CameraState::Streaming || camera.isStreaming()) {
-			slot.state = CameraState::Streaming;
-			continue;
-		}
-
-		if (!camera.start()) {
-			slot.state = CameraState::Error;
-			slot.lastError = "启动摄像头失败: " + camera.lastError();
-			setError(slot.lastError);
-			return false;
-		}
-
-		slot.state = CameraState::Streaming;
-		slot.lastError.clear();
-	}
-
-	m_stopRequested = false;
-	m_lastError.clear();
-	return true;
-}
-
-void CamManager::stopAll() {
+bool CamManager::startCamera(int cameraId) {
 	{
 		std::lock_guard<std::mutex> lock(m_camChangeMutex);
-		for (auto &item : m_cameraMap) {
-			CameraSlot &slot = item.second;
-			if (slot.source) {
-				slot.source->stop();
-				slot.state = CameraState::Stopped;
-			}
+		if (m_cameraMap.find(cameraId) == m_cameraMap.end()) {
+			setError("cameraId 不存在");
+			return false;
 		}
-		m_stopRequested = true;
 	}
-	notifyReturnEvent();
+
+	clearError();
+	return postCommand(Command{CommandType::StartCamera, cameraId});
+}
+
+bool CamManager::stopCamera(int cameraId) {
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		if (m_cameraMap.find(cameraId) == m_cameraMap.end()) {
+			setError("cameraId 不存在");
+			return false;
+		}
+	}
+
+	clearError();
+	return postCommand(Command{CommandType::StopCamera, cameraId});
+}
+
+bool CamManager::startAllCameras() {
+	std::vector<int> cameraIds;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		cameraIds.reserve(m_cameraMap.size());
+		for (const auto &item : m_cameraMap) {
+			cameraIds.push_back(item.first);
+		}
+	}
+
+	clearError();
+	for (int cameraId : cameraIds) {
+		if (!postCommand(Command{CommandType::StartCamera, cameraId})) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void CamManager::stopAllCameras() {
+	std::vector<int> cameraIds;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		cameraIds.reserve(m_cameraMap.size());
+		for (const auto &item : m_cameraMap) {
+			cameraIds.push_back(item.first);
+		}
+	}
+
+	for (int cameraId : cameraIds) {
+		(void)postCommand(Command{CommandType::StopCamera, cameraId});
+	}
 }
 
 bool CamManager::pollOnce(int timeoutMs) {
+	if (!drainCommands()) {
+		return false;
+	}
+
 	if (!drainReturnedFrames()) {
 		return false;
 	}
@@ -234,10 +251,9 @@ bool CamManager::pollOnce(int timeoutMs) {
 		hubs.reserve(m_cameraMap.size() + 1);
 
 		// 这里复制 fd 和 shared_ptr 快照后立刻释放锁，避免 poll 阻塞期间卡住
-		// addCamera/stopAll 等管理操作，也避免 delCamera() 后快照对象悬空。
-		//
-		// 注意：shared_ptr 快照只解决对象生命周期，不解决完整热插拔状态机。
-		// 后续若要严格支持运行中删除摄像头，仍建议把增删操作改成事件队列。
+		// addCamera/stopAllCameras 等管理操作，也避免 delCamera() 后快照对象悬空。
+		// start/stop 这类会改变 V4L2 fd 状态机的操作已经通过内部命令队列
+		// 收敛到 poll 线程执行；delCamera 仍只摘除 shared_ptr 管理引用。
 		for (auto &item : m_cameraMap) {
 			CameraSlot &slot = item.second;
 			std::shared_ptr<V4L2CameraSource> camera = slot.source;
@@ -257,8 +273,22 @@ bool CamManager::pollOnce(int timeoutMs) {
 	}
 
 	if (!hasCameraFd) {
-		setError("没有处于 Streaming 状态的摄像头");
-		return false;
+		std::unique_lock<std::mutex> lock(m_camChangeMutex);
+
+		m_camCv.wait(lock, [this] {
+			for (const auto &item : m_cameraMap) {
+				const auto &camSlot = item.second;
+				const auto &camera = camSlot.source;
+				if (camera && camSlot.state == CameraState::Streaming &&
+					camera->isStreaming() && camera->fd() >= 0) {
+					return true;
+				}
+			}
+
+			return m_stopRequested.load() || m_hasPendingCommand.load();
+		});
+
+		return true;
 	}
 
 	if (m_returnEventFd >= 0) {
@@ -298,7 +328,8 @@ bool CamManager::pollOnce(int timeoutMs) {
 				return false;
 			}
 
-			if ((revents & POLLIN) != 0 && (!drainReturnEvent() || !drainReturnedFrames())) {
+			if ((revents & POLLIN) != 0 &&
+				(!drainReturnEvent() || !drainCommands() || !drainReturnedFrames())) {
 				return false;
 			}
 			continue;
@@ -398,30 +429,167 @@ bool CamManager::pollOnce(int timeoutMs) {
 		}
 	}
 
-	m_lastError.clear();
+	clearError();
 	return true;
 }
 
 void CamManager::run(int timeoutMs) {
-	while (!m_stopRequested) {
+	while (!m_stopRequested.load()) {
 		if (!pollOnce(timeoutMs)) {
 			LOG_ERROR("CamManager", "pollOnce failed: " << lastError());
 			break;
 		}
 	}
+	m_running = false;
 }
 
 void CamManager::requestStop() {
 	m_stopRequested = true;
+	m_camCv.notify_one();
 	notifyReturnEvent();
 }
 
-const std::string &CamManager::lastError() const {
+void CamManager::startPolling()
+{
+	std::lock_guard<std::mutex> lock(m_threadMutex);
+
+	if (m_running.exchange(true)) {
+		LOG_WARN("CamManager", "CamManager is already running");
+		return;
+	}
+
+	if (m_pollThread.joinable()) {
+		m_pollThread.join();
+	}
+
+	m_stopRequested = false;
+	m_pollThread = std::thread([this] {
+		run();
+	});
+}
+
+void CamManager::shutdownPolling()
+{
+	std::lock_guard<std::mutex> lock(m_threadMutex);
+	if (!m_running.load() && !m_pollThread.joinable()) {
+		return;
+	}
+
+	m_stopRequested = true;
+	m_camCv.notify_one();
+	notifyReturnEvent();
+
+	if (m_pollThread.joinable()) {
+		m_pollThread.join();
+	}
+	m_running = false;
+}
+
+std::string CamManager::lastError() const {
+	std::lock_guard<std::mutex> lock(m_errorMutex);
 	return m_lastError;
 }
 
 void CamManager::setError(const std::string &message) {
+	std::lock_guard<std::mutex> lock(m_errorMutex);
 	m_lastError = message;
+}
+
+void CamManager::clearError() {
+	std::lock_guard<std::mutex> lock(m_errorMutex);
+	m_lastError.clear();
+}
+
+bool CamManager::postCommand(Command command) {
+	// 外部线程只负责提交命令，不直接执行 STREAMON/STREAMOFF。
+	// poll 线程被 eventfd/CV 唤醒后会 drainCommands()，再统一操作 V4L2 fd。
+	{
+		std::lock_guard<std::mutex> lock(m_commandMutex);
+		m_commandQueue.push(command);
+		m_hasPendingCommand = true;
+	}
+
+	m_camCv.notify_one();
+	notifyReturnEvent();
+	return true;
+}
+
+bool CamManager::drainCommands() {
+	std::queue<Command> pending;
+	{
+		std::lock_guard<std::mutex> lock(m_commandMutex);
+		pending.swap(m_commandQueue);
+		m_hasPendingCommand = false;
+	}
+
+	while (!pending.empty()) {
+		const Command command = pending.front();
+		pending.pop();
+		if (!executeCommand(command)) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool CamManager::executeCommand(const Command& command) {
+	// 这里运行在 CamManager 的 poll 线程上下文中，和 DQBUF/QBUF 串行，
+	// 避免外部线程直接 stop/start 时打断同一个 V4L2 fd 的状态机。
+	std::lock_guard<std::mutex> lock(m_camChangeMutex);
+
+	auto it = m_cameraMap.find(command.cameraId);
+	if (it == m_cameraMap.end()) {
+		LOG_INFO("CamManager", "cameraId=" << command.cameraId << " 已不存在，跳过摄像头控制命令");
+		return true;
+	}
+
+	CameraSlot& slot = it->second;
+	if (!slot.source) {
+		slot.state = CameraState::Error;
+		slot.lastError = "摄像头对象为空";
+		setError(slot.lastError);
+		return false;
+	}
+
+	V4L2CameraSource& camera = *slot.source;
+	switch (command.type) {
+	case CommandType::StartCamera:
+		if (slot.state == CameraState::Streaming || camera.isStreaming()) {
+			slot.state = CameraState::Streaming;
+			slot.lastError.clear();
+			clearError();
+			m_camCv.notify_one();
+			return true;
+		}
+
+		if (!camera.start()) {
+			slot.state = CameraState::Error;
+			slot.lastError = "启动摄像头失败: " + camera.lastError();
+			setError(slot.lastError);
+			return false;
+		}
+
+		slot.state = CameraState::Streaming;
+		slot.lastError.clear();
+		clearError();
+		m_camCv.notify_one();
+		return true;
+
+	case CommandType::StopCamera:
+		if (camera.isStreaming()) {
+			camera.stop();
+		}
+		slot.state = CameraState::Stopped;
+		slot.lastError.clear();
+		clearError();
+		m_camCv.notify_one();
+		notifyReturnEvent();
+		return true;
+	}
+
+	setError("未知 CamManager 命令");
+	return false;
 }
 
 void CamManager::postReturnedFrame(int cameraId, int bufferIndex) {
@@ -508,6 +676,12 @@ bool CamManager::drainReturnedFrames() {
 			// 注意：当前 return queue 只记录 cameraId/bufferIndex。
 			// 在旧 lease 完全释放前不要复用同一个 cameraId，否则旧归还事件
 			// 可能和新 cameraId 混淆。后续应改成内部生成 cameraId 或增加 generation。
+			continue;
+		}
+
+		if (it->second.state != CameraState::Streaming || !it->second.source->isStreaming()) {
+			// stopCamera() 后 STREAMOFF 会重置驱动队列。
+			// 旧 FrameLease 后续释放时不再 QBUF，下一次 start() 会重新 QBUF 全部 buffer。
 			continue;
 		}
 

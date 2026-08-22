@@ -71,20 +71,20 @@ int main(int argc, char** argv)
         std::cout << "camera " << i << " 添加完成: device=" << devices[i] << "\n";
     }
 
-    if (!manager.startAll()) {
-        std::cerr << "startAll 失败: " << manager.lastError() << "\n";
+    if (!manager.startAllCameras()) {
+        std::cerr << "startAllCameras 失败: " << manager.lastError() << "\n";
         return 1;
     }
 
     for (int i = 0; i < frameLimit; ++i) {
         if (!manager.pollOnce(2000)) {
             std::cerr << "pollOnce 失败: " << manager.lastError() << "\n";
-            manager.stopAll();
+            manager.stopAllCameras();
             return 1;
         }
     }
 
-    manager.stopAll();
+    manager.stopAllCameras();
     std::cout << "CamManager demo 完成\n";
     return 0;
 }

@@ -355,6 +355,12 @@ bool V4L2CameraSource::start()
         return false;
     }
 
+    for (DmaBuffer& buffer : m_buffers) {
+        if (!buffer.queued && !queueBuffer(buffer.index)) {
+            return false;
+        }
+    }
+
     v4l2_buf_type type = static_cast<v4l2_buf_type>(m_bufferType);
     if (ioctlRetry(m_v4l2Fd, VIDIOC_STREAMON, &type) < 0) {
         setError(errnoText("VIDIOC_STREAMON 失败"));

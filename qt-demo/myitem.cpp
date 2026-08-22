@@ -169,7 +169,7 @@ MyItem::MyItem()
         connect(this, &MyItem::displayFrameDone, p.get(), &DisplaySink::releaseFrameByIndex,
                 Qt::DirectConnection);
 
-        mgr->startAll();
+        mgr->startAllCameras();
         mgr->run();
     });
 }

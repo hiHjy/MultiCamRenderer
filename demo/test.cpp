@@ -83,20 +83,20 @@ int main()
     }
 
 
-    if (!manager.startAll()) {
-        std::cerr << "startAll failed: " << manager.lastError() << "\n";
+    if (!manager.startAllCameras()) {
+        std::cerr << "startAllCameras failed: " << manager.lastError() << "\n";
         return 1;
     }
 
     // for (int i = 0; i < 10; ++i) {
     //     if (!manager.pollOnce(2000)) {
     //         std::cerr << "pollOnce failed: " << manager.lastError() << "\n";
-    //         manager.stopAll();
+    //         manager.stopAllCameras();
     //         return 1;
     //     }
     // }
 
 	manager.run();
-    manager.stopAll();
+    manager.stopAllCameras();
     return 0;
 }

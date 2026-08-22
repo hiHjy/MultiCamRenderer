@@ -23,7 +23,7 @@ int main ()
         return 1;
     }
 	manager.addSinkForHub(0, sink);
-	manager.startAll();
+	manager.startAllCameras();
 	manager.run();
 
 
