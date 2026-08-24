@@ -2,22 +2,17 @@
 #define MYITEM_H
 
 #include <QObject>
-#include <QQuickItem>
-#include <QSGTexture>
-#include <QSGSimpleTextureNode>
-#include <QSize>
 #include <QMutex>
 #include <QQueue>
+#include <QQuickItem>
+#include <QSGSimpleTextureNode>
+#include <QSGTexture>
+#include <QSize>
 
 #include <GLES2/gl2.h>
-#include <QObject>
-#include <QQuickItem>
-#include <QImage>
 #include <qqmlregistration.h>
-#include <QTimer>
-#include <thread>
-#include <displaySink.hpp>
 
+#include "displaySink.hpp"
 
 
 // 后期如果要把“延迟一帧 release buffer”升级成更明确的 Qt 渲染同步，
@@ -47,7 +42,6 @@ class MyItem : public QQuickItem
 public:
     MyItem();
     ~MyItem();
-    std::thread m_camT;
 
     // Qt Scene Graph 真正要重绘这个 Item 时会调用 updatePaintNode。
     // setFrame() 只保存最新帧并调用 update()，真正的 dmaFd -> texture 导入在这里发生。
@@ -64,6 +58,7 @@ public slots:
 private:
     // 最新待显示帧。DisplayFrame 只保存 fd/宽高/stride/index 这些标量信息，
     // 真正 DMA buffer 的所有权还在 DisplaySink 的 pool 里。
+    std::shared_ptr<DisplaySink> m_displaySink = std::make_shared<DisplaySink>();
     DisplayFrame m_latestFrame;
     QMutex m_frameMutex;
     bool m_hasFrame = false;

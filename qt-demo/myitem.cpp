@@ -14,6 +14,7 @@
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
 
+#include "AppRuntime.hpp"
 #include <CamManager.hpp>
 
 namespace {
@@ -150,28 +151,13 @@ MyItem::MyItem()
     setFlag(ItemHasContents, true);
     qRegisterMetaType<DisplayFrame>("DisplayFrame");
 
-    m_camT = std::thread([this](){
-        CamManager *mgr = new CamManager();
-        CamManager::CameraConfig config {};
-        config.cameraId = 0;
-        config.width = 640;
-        config.height = 480;
-        config.fps = 30;
-        config.devicePath = "/dev/video10";
-        config.format = PixelFormat::YUYV;
-        mgr->addCamera(config);
-        
-        auto p = std::make_shared<DisplaySink>();
-        //DisplaySink *sink = p.get();
-        mgr->addSinkForHub(0, p);
+    CamManager& camManager = AppRuntime::getInstance().getCamManager();
+    if (!camManager.addFrameSink(0, m_displaySink)) {
+        LOG_ERROR("QtVideoItem", "addFrameSink failed: " << camManager.lastError());
+    }
 
-        connect(p.get(), &DisplaySink::frameReady, this, &MyItem::setFrame);
-        connect(this, &MyItem::displayFrameDone, p.get(), &DisplaySink::releaseFrameByIndex,
-                Qt::DirectConnection);
-
-        mgr->startAllCameras();
-        mgr->run();
-    });
+    connect(m_displaySink.get(), &DisplaySink::frameReady, this, &MyItem::setFrame);
+    connect(this, &MyItem::displayFrameDone, m_displaySink.get(), &DisplaySink::releaseFrameByIndex);
 }
 
 MyItem::~MyItem()

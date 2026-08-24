@@ -21,6 +21,7 @@ qt_add_executable(appqt-demo
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaAllocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaBufferPool.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/RgaEngine.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/../src/AppRuntime.cpp
 
 )
 

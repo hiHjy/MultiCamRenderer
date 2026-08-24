@@ -65,14 +65,15 @@ public:
 
     // pollOnce 会阻塞等待摄像头 fd 就绪，并在内部 dequeue/requeue 帧。
     // 当前版本只适合单线程或外部保证 cameraMap 不会被并发修改的场景。
-    bool pollOnce(int timeoutMs = 2000);
-    void run(int timeoutMs = 2000);
+ 
     void requestStop();
 	void startPolling();
 	void shutdownPolling();
     std::string lastError() const;
 
 private:
+
+
     // 内部命令队列只承载会改变 V4L2 fd 状态机的操作。
     // addCamera/delCamera 仍保持当前 shared_ptr 管理引用语义。
     enum class CommandType {
@@ -85,6 +86,8 @@ private:
         int cameraId = -1;
     };
 
+	bool pollOnce(int timeoutMs = 2000);
+    void run(int timeoutMs = 2000);
     void setError(const std::string& message);
     void clearError();
     bool postCommand(Command command);
