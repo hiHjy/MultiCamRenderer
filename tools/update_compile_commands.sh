@@ -6,8 +6,27 @@ OUT_FILE="$ROOT_DIR/compile_commands.json"
 
 inputs=()
 
-if [ -f "$ROOT_DIR/qt-demo/build-wsl-aarch64/compile_commands.json" ]; then
-    inputs+=("$ROOT_DIR/qt-demo/build-wsl-aarch64/compile_commands.json")
+qt_build_dirs=()
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    qt_build_dirs=(
+        "$ROOT_DIR/qt-demo/build-wsl-aarch64"
+        "$ROOT_DIR/qt-demo/build"
+    )
+else
+    qt_build_dirs=(
+        "$ROOT_DIR/qt-demo/build"
+        "$ROOT_DIR/qt-demo/build-wsl-aarch64"
+    )
+fi
+
+for dir in "${qt_build_dirs[@]}"; do
+    if [ -f "$dir/compile_commands.json" ]; then
+        inputs+=("$dir/compile_commands.json")
+    fi
+done
+
+if [ -f "$ROOT_DIR/compile_commands.local.json" ]; then
+    inputs+=("$ROOT_DIR/compile_commands.local.json")
 fi
 
 if [ -f "$ROOT_DIR/compile_commands.base.json" ]; then

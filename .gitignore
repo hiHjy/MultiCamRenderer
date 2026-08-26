@@ -8,7 +8,9 @@ build-aarch64
 # Qt/CMake 本地构建产物
 qt-demo/build/
 qt-demo/build-aarch64/
+qt-demo/build-wsl-aarch64/
 qt-demo/deploy/
+qt-demo/deploy-wsl-aarch64/
 qt-demo/CMakeLists.txt.user*
 
 # demo 运行生成物

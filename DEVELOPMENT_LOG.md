@@ -784,3 +784,185 @@ FrameLease 释放
 
 - `g++ -std=c++17 -Wall -Wextra -Iinclude -Iinclude/hw -Iinclude/sink -Ithird_party/rga/include -fsyntax-only src/V4L2CameraSource.cpp src/CamManager.cpp src/FrameHub.cpp src/DmaBufferPool.cpp src/sink/RgaCopySink.cpp demo/test.cpp demo/rga_test.cpp demo/cam_manager_demo.cpp` 通过。
 - 当前仅剩 `V4L2CameraSource.cpp` 中 `PixelFormat::RGBA8888` 未覆盖 switch 的旧 warning，与本次基座变更无关。
+
+## 2026-08-25
+
+### 项目当前进度
+
+本次把前面计划中的应用级运行上下文 `AppRuntime` 真正落地，并将 Qt demo 里的摄像头管理从 `MyItem` 中移出。
+
+上一版日志里还记录为：
+
+```text
+Qt demo 仍然在 MyItem 内部创建 CamManager 并启动线程，
+生命周期还没有接入正式 AppRuntime。
+```
+
+当前代码已经调整为：
+
+```text
+AppRuntime
+  -> 持有唯一 CamManager
+
+qt-demo/main.cpp
+  -> 从 AppRuntime 获取 CamManager
+  -> addCamera()
+  -> startAllCameras()
+  -> startPolling()
+  -> aboutToQuit 时 shutdownPolling()
+
+MyItem
+  -> 不再创建 CamManager
+  -> 只从 AppRuntime 获取 CamManager
+  -> 注册自己的 DisplaySink
+  -> 负责 dmaFd -> EGLImage -> QSGTexture 显示
+```
+
+这一步把“应用运行资源管理”和“QML Item 视觉显示职责”分开了。`MyItem` 不再自己起摄像头线程，也不再拥有摄像头管理器；它只作为显示控件存在。
+
+### 今天完成的事
+
+1. 新增 `AppRuntime` 单例。
+
+   新增：
+
+   ```text
+   include/AppRuntime.hpp
+   src/AppRuntime.cpp
+   ```
+
+   第一版 `AppRuntime` 只持有：
+
+   ```cpp
+   CamManager m_camManager {};
+   ```
+
+   并通过：
+
+   ```cpp
+   CamManager& getCamManager() noexcept;
+   ```
+
+   向应用层提供唯一的摄像头管理器。
+
+2. Qt demo 的摄像头初始化迁移到 `main.cpp`。
+
+   `qt-demo/main.cpp` 现在负责：
+
+   ```text
+   创建 QGuiApplication
+   获取 AppRuntime::getInstance().getCamManager()
+   配置 /dev/video10 640x480 30fps YUYV 摄像头
+   加载 QML
+   startAllCameras()
+   startPolling()
+   ```
+
+   同时通过 `QCoreApplication::aboutToQuit` 连接：
+
+   ```cpp
+   camManager.shutdownPolling();
+   ```
+
+   这样 Qt 应用退出时会显式停止 CamManager 的后台 poll 线程。
+
+3. `MyItem` 不再创建 `CamManager`。
+
+   旧逻辑中，`MyItem` 构造函数里会起一个线程，在里面 new `CamManager`、add camera、add sink、run。这个职责太重，也会让一个显示控件偷偷拥有全局摄像头运行逻辑。
+
+   当前 `MyItem` 只做：
+
+   ```text
+   创建/持有自己的 DisplaySink
+   从 AppRuntime 获取 CamManager
+   addFrameSink(0, m_displaySink)
+   连接 frameReady/displayFrameDone 信号
+   ```
+
+   这让 `MyItem` 的语义更清晰：它是“显示某一路 stream 的 Qt Quick Item”，不是应用运行入口。
+
+4. `CamManager::pollOnce()` / `run()` 收回为私有接口。
+
+   最新代码中，外部不再直接调用：
+
+   ```cpp
+   pollOnce()
+   run()
+   ```
+
+   而是通过：
+
+   ```cpp
+   startPolling()
+   shutdownPolling()
+   ```
+
+   管理采集线程生命周期。这样可以避免外部随意在当前线程里跑 `run()`，也更符合 `CamManager` 后台 poll 线程的设计。
+
+5. Qt demo 构建接入 `AppRuntime.cpp`。
+
+   `qt-demo/CMakeLists.txt` 已加入：
+
+   ```text
+   ../src/AppRuntime.cpp
+   ```
+
+   保证 Qt demo 链接到新的应用运行上下文实现。
+
+### 重要设计结论
+
+1. `AppRuntime` 是应用级资源所有者，不是业务 pipeline。
+
+   当前 `AppRuntime` 只先放 `CamManager`，后续如果需要，可以继续收纳：
+
+   ```text
+   StreamHub / Sink 注册表
+   硬件模块上下文
+   应用配置
+   Qt 显示侧全局状态
+   ```
+
+   但它不应该变成一个大而乱的处理节点。真正的视频处理策略仍然放在 sink / hw 模块 / 后续 pipeline 节点里。
+
+2. `MyItem` 只负责显示，不负责启动摄像头。
+
+   这是 Qt Quick 路径里比较重要的边界。QML Item 的生命周期可能受界面创建/销毁影响，如果摄像头采集也藏在 Item 内部，后续多画面、切换页面、全屏/缩略图重排都会变得很难控。
+
+   现在摄像头运行跟随应用，显示控件只订阅并显示，这个方向更适合后续多路视频。
+
+3. 当前仍是第一版 AppRuntime。
+
+   这一版先解决 ownership 和入口问题，还没有做：
+
+   - 多路摄像头配置加载。
+   - 多个 `MyItem` 按 streamId 动态订阅。
+   - Sink 重复注册/注销。
+   - AppRuntime 析构时统一停止所有硬件资源。
+
+   后续 Qt 多路显示时，`MyItem` 应该支持配置自己的 `streamId`，而不是固定订阅 `0`。
+
+### 本次代码差异
+
+最近两次提交：
+
+```text
+0810d70 准备程序运行上下文单例类
+2a34dbe 将摄像头管理器交由app运行环境类管理
+```
+
+主要涉及：
+
+```text
+include/AppRuntime.hpp
+src/AppRuntime.cpp
+include/CamManager.hpp
+qt-demo/CMakeLists.txt
+qt-demo/main.cpp
+qt-demo/myitem.cpp
+qt-demo/myitem.h
+```
+
+### 本次验证
+
+- 当前工作区 `git status --short` 为空，说明日志补充前代码处于干净提交状态。
+- 已阅读最新提交差异，确认 `CamManager` 已由 `AppRuntime` 持有，Qt demo 的摄像头启动已经从 `MyItem` 迁移到 `main.cpp`。
