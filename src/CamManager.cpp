@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <poll.h>
@@ -61,36 +62,32 @@ CamManager::~CamManager() {
 	}
 }
 
-bool CamManager::addCamera(const CameraConfig &config) {
-	if (config.cameraId < 0) {
-		setError("cameraId 不能小于 0");
-		return false;
-	}
-
+int CamManager::addCamera(const CameraConfig &config) {
 	if (config.devicePath.empty()) {
 		setError("devicePath 不能为空");
-		return false;
+		return -1;
 	}
 
 	if (config.width <= 0 || config.height <= 0) {
 		setError("摄像头宽高必须大于 0");
-		return false;
+		return -1;
 	}
 
 	if (config.bufferCount <= 0) {
 		setError("bufferCount 必须大于 0");
-		return false;
+		return -1;
 	}
 
 	std::lock_guard<std::mutex> lock(m_camChangeMutex);
-	if (m_cameraMap.find(config.cameraId) != m_cameraMap.end()) {
-		setError("cameraId 已存在");
-		return false;
+	const int cameraId = allocateCameraIdLocked();
+	if (cameraId < 0) {
+		setError("cameraId 已耗尽");
+		return -1;
 	}
 
 	CameraSlot slot{};
 	slot.config = config;
-	slot.source = std::make_shared<V4L2CameraSource>(config.cameraId);
+	slot.source = std::make_shared<V4L2CameraSource>(cameraId);
 	slot.state = CameraState::Created;
 
 	V4L2CameraSource &camera = *slot.source;
@@ -98,7 +95,7 @@ bool CamManager::addCamera(const CameraConfig &config) {
 		slot.state = CameraState::Error;
 		slot.lastError = "打开摄像头失败: " + camera.lastError();
 		setError(slot.lastError);
-		return false;
+		return -1;
 	}
 
 	const V4L2CameraSource::CamConfig v4l2Config = toV4L2CameraConfig(config);
@@ -106,24 +103,24 @@ bool CamManager::addCamera(const CameraConfig &config) {
 		slot.state = CameraState::Error;
 		slot.lastError = "配置摄像头失败: " + camera.lastError();
 		setError(slot.lastError);
-		return false;
+		return -1;
 	}
 
 	if (!camera.setupDmaImportBuffers(config.bufferCount, config.dmaHeapPath)) {
 		slot.state = CameraState::Error;
 		slot.lastError = "准备摄像头 DMA buffer 失败: " + camera.lastError();
 		setError(slot.lastError);
-		return false;
+		return -1;
 	}
 
 	slot.state = CameraState::Ready;
-	auto hub = std::make_shared<FrameHub>(config.cameraId);
+	auto hub = std::make_shared<FrameHub>(cameraId);
 
-	m_cameraMap.emplace(config.cameraId, std::move(slot));
-	m_frameHubMap.emplace(config.cameraId, std::move(hub));
+	m_cameraMap.emplace(cameraId, std::move(slot));
+	m_frameHubMap.emplace(cameraId, std::move(hub));
 	clearError();
 
-	return true;
+	return cameraId;
 }
 
 bool CamManager::addFrameSink(int cameraId, std::shared_ptr<Sink> sink) {
@@ -500,6 +497,19 @@ void CamManager::clearError() {
 	m_lastError.clear();
 }
 
+int CamManager::allocateCameraIdLocked() {
+	const int maxCameraId = std::numeric_limits<int>::max();
+	while (m_nextCameraId < maxCameraId) {
+		const int cameraId = m_nextCameraId;
+		++m_nextCameraId;
+		if (m_cameraMap.find(cameraId) == m_cameraMap.end()) {
+			return cameraId;
+		}
+	}
+
+	return -1;
+}
+
 bool CamManager::postCommand(Command command) {
 	// 外部线程只负责提交命令，不直接执行 STREAMON/STREAMOFF。
 	// poll 线程被 eventfd/CV 唤醒后会 drainCommands()，再统一操作 V4L2 fd。
@@ -673,9 +683,8 @@ bool CamManager::drainReturnedFrames() {
 			// 摄像头可能已经被 delCamera() 移除。
 			// 如果对应 FrameLease 捕获的 sourceLifetime 是最后一个引用，
 			// 这里跳过 QBUF，让 V4L2CameraSource 析构时关闭 fd/释放 DMA buffer。
-			// 注意：当前 return queue 只记录 cameraId/bufferIndex。
-			// 在旧 lease 完全释放前不要复用同一个 cameraId，否则旧归还事件
-			// 可能和新 cameraId 混淆。后续应改成内部生成 cameraId 或增加 generation。
+			// cameraId 由 CamManager 内部单调生成，不对外复用，避免旧 lease
+			// 归还事件误命中新摄像头。
 			continue;
 		}
 

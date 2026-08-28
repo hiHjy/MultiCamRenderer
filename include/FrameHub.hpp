@@ -16,7 +16,7 @@ public:
 
 	bool addSink(std::shared_ptr<Sink> sink);
 	bool publishFrame(const FramePacket& packet);
-
+	void removeSink();
 	int streamId() const;
 	size_t sinkCount() const;
 	const std::string& lastError() const;

@@ -19,6 +19,31 @@
 
 namespace {
 
+QRectF fitFrameRect(const QRectF &itemRect, int frameWidth, int frameHeight)
+{
+    if (itemRect.width() <= 0.0 || itemRect.height() <= 0.0 ||
+        frameWidth <= 0 || frameHeight <= 0) {
+        return itemRect;
+    }
+
+    const qreal itemAspect = itemRect.width() / itemRect.height();
+    const qreal frameAspect = static_cast<qreal>(frameWidth) / static_cast<qreal>(frameHeight);
+
+    qreal targetWidth = itemRect.width();
+    qreal targetHeight = itemRect.height();
+
+    if (frameAspect > itemAspect) {
+        targetHeight = targetWidth / frameAspect;
+    } else {
+        targetWidth = targetHeight * frameAspect;
+    }
+
+    return QRectF(itemRect.x() + (itemRect.width() - targetWidth) / 2.0,
+                  itemRect.y() + (itemRect.height() - targetHeight) / 2.0,
+                  targetWidth,
+                  targetHeight);
+}
+
 // QQuickItem 不能直接拿 dma-buf 画图。
 // 我们这里用一个 QSGSimpleTextureNode 表示“贴了一张纹理的矩形”：
 //   DisplayFrame.dmaFd
@@ -151,11 +176,6 @@ MyItem::MyItem()
     setFlag(ItemHasContents, true);
     qRegisterMetaType<DisplayFrame>("DisplayFrame");
 
-    CamManager& camManager = AppRuntime::getInstance().getCamManager();
-    if (!camManager.addFrameSink(0, m_displaySink)) {
-        LOG_ERROR("QtVideoItem", "addFrameSink failed: " << camManager.lastError());
-    }
-
     connect(m_displaySink.get(), &DisplaySink::frameReady, this, &MyItem::setFrame);
     connect(this, &MyItem::displayFrameDone, m_displaySink.get(), &DisplaySink::releaseFrameByIndex);
 }
@@ -164,35 +184,73 @@ MyItem::~MyItem()
 {
 }
 
+int MyItem::cameraId() const noexcept
+{
+	return m_cameraId;
+}
+
+void MyItem::setCameraId(int cameraId)
+{
+	if (cameraId == m_cameraId)
+		return;
+
+	if (cameraId < 0) {
+		LOG_ERROR("QtVideoItem", "invalid cameraId=" << cameraId);
+		return;
+	}
+
+	if (m_cameraId >= 0) {
+		LOG_ERROR("QtVideoItem", "cameraId already bound: old=" << m_cameraId << " new=" << cameraId);
+		return;
+	}
+
+	m_cameraId = cameraId;
+	CamManager& camManager = AppRuntime::getInstance().getCamManager();
+	if (!camManager.addFrameSink(m_cameraId, m_displaySink)) {
+		LOG_ERROR("QtVideoItem", "addFrameSink failed: " << camManager.lastError());
+		m_cameraId = -1;
+		return;
+	}
+
+	emit cameraIdChanged();
+}
+
 QSGNode *MyItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
-    // Qt 会复用 oldNode。第一次进来没有 node，就创建一个能显示 texture 的节点。
-    auto *node = static_cast<DmaTextureNode *>(oldNode);
-    if (!node)
-        node = new DmaTextureNode();
-
     DisplayFrame frame;
     int oldDisplayedIndex = -1;
     {
         QMutexLocker lock(&m_frameMutex);
         if (!m_hasFrame)
-            return node;
+            return oldNode;
 
         frame = m_latestFrame;
         oldDisplayedIndex = m_displayedBufferIndex;
     }
 
+    // Qt 会复用 oldNode。只有已经拿到有效帧时才创建 texture node，
+    // 避免返回一个没有 texture 的 QSGSimpleTextureNode 让渲染线程踩空。
+    auto *node = static_cast<DmaTextureNode *>(oldNode);
+    const bool createdNode = !node;
+    if (!node)
+        node = new DmaTextureNode();
+
     // 这里是 Qt 显示链路最关键的一步：
     // 把 DisplayFrame 里的 dmaFd 导入成 QSGTexture，之后 Scene Graph 就能绘制它。
     QSGTexture *texture = node->textureForFrame(window(), frame);
-    if (!texture)
+    if (!texture) {
+        if (createdNode) {
+            delete node;
+            return nullptr;
+        }
         return node;
+    }
 
-    // 把纹理贴到这个 QML Item 对应的矩形区域上。
-    // boundingRect() 来自 QML 里 MyItem 的 width/height/x/y。
+    // 按原始宽高比完整显示到 QML Item 里，避免 NVR 格子比例变化时画面被拉伸变形。
+    // 空出来的区域由外层 tile 背景显示成黑边。
     node->setTexture(texture);
     node->setOwnsTexture(false);
-    node->setRect(boundingRect());
+    node->setRect(fitFrameRect(boundingRect(), frame.width, frame.height));
 
     // 显示侧 buffer 不能刚 setTexture 就立刻 release。
     // Qt Scene Graph 可能还要在这一帧渲染里采样它，所以这里延迟一帧归还旧 buffer。

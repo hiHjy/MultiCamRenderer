@@ -26,7 +26,6 @@ public:
     };
 
     struct CameraConfig {
-        int cameraId = -1;
         std::string devicePath;
         int width = 0;
         int height = 0;
@@ -51,9 +50,10 @@ public:
     // startCamera()/stopCamera() 不直接在调用线程里碰 V4L2 状态机，
     // 而是投递内部命令，由 poll 线程统一执行 STREAMON/STREAMOFF，
     // 避免和 DQBUF/QBUF 在不同线程交叉。
-    // 当前不要在旧 lease 完全释放前复用同一个 cameraId。
-    // 后续应改成内部生成 cameraId，或给 cameraId 增加 generation 校验。
-    bool addCamera(const CameraConfig& config);
+    // addCamera() 内部单调生成 cameraId 并返回，避免外部复用 id 时
+    // 旧 FrameLease 的归还事件误命中新摄像头。
+    // 返回 >= 0 表示成功生成的 cameraId，返回 -1 表示失败，错误信息见 lastError()。
+    int addCamera(const CameraConfig& config);
     bool delCamera(int cameraId);
     bool addFrameSink(int cameraId, std::shared_ptr<Sink> sink);
     bool addSinkForHub(int cameraId, std::shared_ptr<Sink> sink);
@@ -90,6 +90,7 @@ private:
     void run(int timeoutMs = 2000);
     void setError(const std::string& message);
     void clearError();
+    int allocateCameraIdLocked();
     bool postCommand(Command command);
     bool drainCommands();
     bool executeCommand(const Command& command);
@@ -101,6 +102,7 @@ private:
 private:
     std::mutex m_camChangeMutex;
 	std::condition_variable m_camCv;
+    int m_nextCameraId = 0;
     std::unordered_map<int, CameraSlot> m_cameraMap {};
     mutable std::mutex m_errorMutex;
     std::string m_lastError;

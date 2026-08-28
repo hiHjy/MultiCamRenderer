@@ -39,6 +39,7 @@ class MyItem : public QQuickItem
 {
     Q_OBJECT
     QML_ELEMENT
+    Q_PROPERTY(int cameraId READ cameraId WRITE setCameraId NOTIFY cameraIdChanged)
 public:
     MyItem();
     ~MyItem();
@@ -46,9 +47,11 @@ public:
     // Qt Scene Graph 真正要重绘这个 Item 时会调用 updatePaintNode。
     // setFrame() 只保存最新帧并调用 update()，真正的 dmaFd -> texture 导入在这里发生。
     QSGNode * updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
-
+    int cameraId() const noexcept;
+	void setCameraId(int cameraId);
 signals:
     void displayFrameDone(int bufferIndex);
+    void cameraIdChanged();
 
 public slots:
     // DisplaySink 把 RGA 转好的 RGBA dma-buf 通过这个槽送进 Qt。
@@ -61,6 +64,7 @@ private:
     std::shared_ptr<DisplaySink> m_displaySink = std::make_shared<DisplaySink>();
     DisplayFrame m_latestFrame;
     QMutex m_frameMutex;
+	int m_cameraId = -1;
     bool m_hasFrame = false;
     int m_displayedBufferIndex = -1;
     QQueue<int> m_retiredDisplayedIndexes;

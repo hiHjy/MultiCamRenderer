@@ -38,6 +38,7 @@ qt_add_qml_module(appqt-demo
         Main.qml
         SOURCES myitem.h myitem.cpp
                 displaySink.hpp displaySink.cpp
+                DisplayController.hpp DisplayController.cpp
 )
 
 target_link_libraries(appqt-demo

@@ -57,6 +57,12 @@ bool FrameHub::publishFrame(const FramePacket& packet)
 	return true;
 }
 
+void FrameHub::removeSink()
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_sinks.clear();
+}
+
 int FrameHub::streamId() const
 {
 	return m_streamId;

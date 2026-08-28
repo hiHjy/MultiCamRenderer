@@ -966,3 +966,132 @@ qt-demo/myitem.h
 
 - 当前工作区 `git status --short` 为空，说明日志补充前代码处于干净提交状态。
 - 已阅读最新提交差异，确认 `CamManager` 已由 `AppRuntime` 持有，Qt demo 的摄像头启动已经从 `MyItem` 迁移到 `main.cpp`。
+
+## 2026-08-28
+
+### 项目当前进度
+
+本次主要推进 Qt 显示链路从 demo 形态向 NVR 预览形态靠拢，同时继续验证摄像头基座的真实性能瓶颈。当前结论比较明确：两路 USB UVC 摄像头下，用户态显示链路不是最大压力，最大压力来自 `uvcvideo` 内核线程把 URB 数据 memcpy 到 vb2 buffer。
+
+### 今天完成的事
+
+1. Qt demo 接入 `AppRuntime` 和 `DisplayController`。
+
+   `DisplayController` 作为 QML 和 C++ 基座之间的轻量控制入口，负责从 `AppRuntime` 获取 `CamManager`，启动 polling，并提供：
+
+   ```cpp
+   addLocalCam(path)
+   startLocalCam(cameraId)
+   ```
+
+   `MyItem` 不再在构造时写死绑定 camera 0，而是通过 `cameraId` 属性绑定具体摄像头。
+
+2. `CamManager::addCamera()` 改为内部生成 cameraId。
+
+   外部不再传入 cameraId，`CamManager` 使用单调递增 int 生成 id，并把成功生成的 id 返回给上层。这样可以避免外部复用 cameraId 时，旧 `FrameLease` 归还事件误命中新摄像头。
+
+   当前语义为：
+
+   ```cpp
+   int addCamera(const CameraConfig& config);
+   ```
+
+   返回 `>= 0` 表示 cameraId，返回 `-1` 表示失败，错误信息通过 `lastError()` 获取。
+
+3. Qt demo 支持 NVR 风格多格预览和拖拽换位。
+
+   QML 使用 `Repeater` 生成 6 个视频格子，通过 `slot` 和 `geometryForSlot()` 控制 2 路、4 宫格、6 路布局。拖拽时只交换 `slot`，QML 绑定会自动更新位置和大小。
+
+4. 视频显示改为等比例完整显示。
+
+   `MyItem::updatePaintNode()` 不再把纹理直接拉伸到整个格子，而是按原始 `frame.width/frame.height` 计算居中目标矩形。这样画面不会变形，空出来的区域由外层 tile 显示为纯黑。
+
+5. 修正 Qt Scene Graph 空纹理节点风险。
+
+   `updatePaintNode()` 在没有有效帧时不再创建空的 `QSGSimpleTextureNode`。只有拿到有效 `DisplayFrame` 后才创建/更新 texture node，避免 Qt 渲染线程拿到无 texture node 后出现崩溃。
+
+6. 当前 demo 为测试两路摄像头，启动时自动打开两路。
+
+   临时测试路径为：
+
+   ```qml
+   /dev/video12
+   /dev/video10
+   ```
+
+   这是为了不依赖鼠标点击，方便在板端直接观察两路摄像头的 CPU 和显示消耗。后续正式 UI 会改为设备列表/按钮选择。
+
+### UVC 性能实测
+
+本次在 RK3568 板端重新打开 kernel function profiler：
+
+```text
+CONFIG_KALLSYMS_ALL=y
+CONFIG_FTRACE=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_FUNCTION_PROFILER=y
+```
+
+然后运行两路 USB UVC 摄像头：
+
+```text
+/dev/video10  640x480 YUYV 30fps
+/dev/video12  640x480 YUYV 30fps
+```
+
+理论输入数据量：
+
+```text
+单路: 640 * 480 * 2 * 30 = 18.4 MB/s
+两路: 约 36.9 MB/s
+```
+
+内核源码路径已经确认：
+
+```text
+uvc_video_complete()
+  -> stream->decode()
+  -> uvc_video_decode_data()
+  -> queue_work(stream->async_wq, &uvc_urb->work)
+  -> uvc_video_copy_data_work()
+  -> memcpy(op->dst, op->src, op->len)
+```
+
+也就是说 UVC 摄像头的数据不是直接进最终 vb2 buffer，而是 USB 控制器先把数据放进 URB buffer，随后 `uvcvideo` 的 worker 线程把 URB payload memcpy 到 vb2 video buffer。
+
+10 秒 function profiler 聚合结果：
+
+```text
+uvc_video_copy_data_work        9.16s / 10s  约 91.6% 单核，约 22.9% 四核
+uvc_video_complete              1.23s / 10s  约 12.3% 单核，约  3.1% 四核
+usb_submit_urb                  0.92s / 10s  约  9.2% 单核，约  2.3% 四核
+ehci_irq                        0.42s / 10s  约  4.2% 单核，约  1.1% 四核
+rga_ioctl                       1.37s / 10s  约 13.7% 单核，约  3.4% 四核
+rga_request_wait                0.83s / 10s  约  8.3% 单核，约  2.1% 四核
+```
+
+注意：`rga_request_wait`、`drm_atomic_helper_wait_for_vblank` 这类大量时间主要是等待硬件完成或等待垂直同步，不能简单当作 CPU 忙算。
+
+### 重要设计结论
+
+1. 当前两路 USB UVC YUYV 最大成本在内核 memcpy。
+
+   两路 640x480 YUYV 30fps 时，`uvc_video_copy_data_work` 接近吃满一个 A55 核。也就是说，如果继续用 USB UVC 原始 YUYV 流，多路扩展时这块会比当前用户态基座更早成为瓶颈。
+
+2. 当前 C++ 基座方向是成立的。
+
+   `CamManager + FrameHub + Sink + FrameLease` 这条链路没有暴露出明显的性能瓶颈。用户态 `appqt-demo` 进程约 0.37 个核，UVC memcpy 约 0.92 个核，说明真正重头在 USB UVC 内核搬运。
+
+3. 如果换成两路 MIPI，CPU 占用有机会显著下降。
+
+   MIPI/CSI 路径通常不需要 UVC 这种 URB 到 vb2 的 CPU memcpy，数据可以更直接地进入视频 buffer。所以两路 MIPI 在相同显示链路下，有机会把总 CPU 拉到十几到二十以内这一档，具体仍需要板端实测。
+
+4. 另一个可行方向是 USB MJPEG + MPP 解码。
+
+   如果摄像头输出 MJPEG，USB 传输数据量会大幅下降，也能减少 UVC memcpy 的字节量。后续可以新增压缩流/解码链路，用 MPP 解码后再进入统一 hub/sink 体系。不过当前解码模块还没做，先不提前侵入现有摄像头基座。
+
+### 本次验证
+
+- `./wsl-build.sh build` 通过，生成 `qt-demo/build-wsl-aarch64/appqt-demo`。
+- 板端运行两路 `/dev/video12`、`/dev/video10` 可启动。
+- 板端 kernel function profiler 已用于 UVC 拷贝占用测试，测试后已关闭 profiler。

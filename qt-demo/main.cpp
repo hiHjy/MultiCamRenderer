@@ -10,25 +10,25 @@ int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
 
-    AppRuntime& runtime = AppRuntime::getInstance();
-    CamManager& camManager = runtime.getCamManager();
+    // AppRuntime& runtime = AppRuntime::getInstance();
+    // CamManager& camManager = runtime.getCamManager();
 
-    CamManager::CameraConfig config{};
-    config.cameraId = 0;
-    config.width = 640;
-    config.height = 480;
-    config.fps = 30;
-    config.devicePath = "/dev/video10";
-    config.format = PixelFormat::YUYV;
+    // CamManager::CameraConfig config{};
+    // config.width = 640;
+    // config.height = 480;
+    // config.fps = 30;
+    // config.devicePath = "/dev/video10";
+    // config.format = PixelFormat::YUYV;
 
-    if (!camManager.addCamera(config)) {
-        LOG_ERROR("QtDemo", "addCamera failed: " << camManager.lastError());
-        return -1;
-    }
+    // const int cameraId = camManager.addCamera(config);
+    // if (cameraId < 0) {
+    //     LOG_ERROR("QtDemo", "addCamera failed: " << camManager.lastError());
+    //     return -1;
+    // }
 
-    QObject::connect(&app, &QCoreApplication::aboutToQuit, [&camManager] {
-        camManager.shutdownPolling();
-    });
+    // QObject::connect(&app, &QCoreApplication::aboutToQuit, [&camManager] {
+    //     camManager.shutdownPolling();
+    // });
 
     QQmlApplicationEngine engine;
     QObject::connect(
@@ -41,19 +41,19 @@ int main(int argc, char *argv[])
     // 直接从 Qt 资源系统加载（QML 编译进二进制，无需外部文件）
     engine.load(QUrl("qrc:/QtDemo/Main.qml"));
 
-    const QList<QObject*> roots = engine.rootObjects();
-    if (!roots.isEmpty()) {
-        QQuickWindow* window = qobject_cast<QQuickWindow*>(roots.first());
-        if (window) {
-            LOG_INFO("QtDemo", "window size=" << window->width() << "x" << window->height());
-        }
-    }
+    // const QList<QObject*> roots = engine.rootObjects();
+    // if (!roots.isEmpty()) {
+    //     QQuickWindow* window = qobject_cast<QQuickWindow*>(roots.first());
+    //     if (window) {
+    //         LOG_INFO("QtDemo", "window size=" << window->width() << "x" << window->height());
+    //     }
+    // }
 
-    if (!camManager.startAllCameras()) {
-        LOG_ERROR("QtDemo", "startAllCameras failed: " << camManager.lastError());
-        return -1;
-    }
+    // if (!camManager.startAllCameras()) {
+    //     LOG_ERROR("QtDemo", "startAllCameras failed: " << camManager.lastError());
+    //     return -1;
+    // }
 
-    camManager.startPolling();
+    // camManager.startPolling();
     return app.exec();
 }
