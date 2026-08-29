@@ -49,6 +49,8 @@ PixelFormat pixelFormatFromFourcc(uint32_t fourcc)
         return PixelFormat::YUYV;
     case V4L2_PIX_FMT_YUV420:
         return PixelFormat::YUV420P;
+    case V4L2_PIX_FMT_MJPEG:
+        return PixelFormat::MJPEG;
     case V4L2_PIX_FMT_RGB32:
     case V4L2_PIX_FMT_ABGR32:
         return PixelFormat::RGBA8888;

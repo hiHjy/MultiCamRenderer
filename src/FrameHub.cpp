@@ -12,6 +12,11 @@ bool FrameHub::addSink(std::shared_ptr<Sink> sink)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 
+	if (m_closed) {
+		setError("FrameHub 已关闭");
+		return false;
+	}
+
 	if (!sink) {
 		setError("sink 不能为空");
 		return false;
@@ -24,9 +29,16 @@ bool FrameHub::addSink(std::shared_ptr<Sink> sink)
 
 bool FrameHub::publishFrame(const FramePacket& packet)
 {
+	std::lock_guard<std::mutex> publishLock(m_publishMutex);
+
 	std::vector<std::shared_ptr<Sink>> sinks;
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
+
+		if (m_closed) {
+			m_lastError.clear();
+			return true;
+		}
 
 		if (m_streamId < 0) {
 			setError("FrameHub 尚未绑定 streamId");
@@ -55,6 +67,15 @@ bool FrameHub::publishFrame(const FramePacket& packet)
 
 	m_lastError.clear();
 	return true;
+}
+
+void FrameHub::close()
+{
+	std::lock_guard<std::mutex> publishLock(m_publishMutex);
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_closed = true;
+	m_sinks.clear();
+	m_lastError.clear();
 }
 
 void FrameHub::removeSink()

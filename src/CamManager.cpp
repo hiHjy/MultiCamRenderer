@@ -30,6 +30,8 @@ PixelFormat toV4L2PixelFormat(PixelFormat format) {
 		return PixelFormat::YUYV;
 	case PixelFormat::YUV420P:
 		return PixelFormat::YUV420P;
+	case PixelFormat::MJPEG:
+		return PixelFormat::MJPEG;
 	case PixelFormat::RGBA8888:
 		return PixelFormat::Auto;
 	}
@@ -136,6 +138,12 @@ bool CamManager::addFrameSink(int cameraId, std::shared_ptr<Sink> sink) {
 		return false;
 	}
 
+	auto cameraIt = m_cameraMap.find(cameraId);
+	if (cameraIt == m_cameraMap.end() || cameraIt->second.state == CameraState::Deleting) {
+		setError("cameraId 不存在或正在删除");
+		return false;
+	}
+
 	if (!it->second->addSink(std::move(sink))) {
 		setError("添加 sink 失败: " + it->second->lastError());
 		return false;
@@ -150,28 +158,44 @@ bool CamManager::addSinkForHub(int cameraId, std::shared_ptr<Sink> sink) {
 }
 
 bool CamManager::delCamera(int cameraId) {
-	std::lock_guard<std::mutex> lock(m_camChangeMutex);
-	auto it = m_cameraMap.find(cameraId);
-	if (it == m_cameraMap.end()) {
-		setError("cameraId 不存在");
-		return false;
+	std::shared_ptr<FrameHub> hubToClose;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		auto it = m_cameraMap.find(cameraId);
+		if (it == m_cameraMap.end()) {
+			setError("cameraId 不存在");
+			return false;
+		}
+
+		it->second.state = CameraState::Deleting;
+		auto hubIt = m_frameHubMap.find(cameraId);
+		if (hubIt != m_frameHubMap.end()) {
+			hubToClose = hubIt->second;
+		}
 	}
 
-	// delCamera 只摘除 CamManager 对 camera/hub 的管理引用。
-	// 如果 pollOnce() 或某个 FrameLease 仍持有 source shared_ptr，
-	// V4L2CameraSource 会等最后一个引用释放后再析构清理。
-	m_cameraMap.erase(it);
-	m_frameHubMap.erase(cameraId);
+	if (hubToClose) {
+		hubToClose->close();
+	}
+
+	if (!m_running.load()) {
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		m_cameraMap.erase(cameraId);
+		m_frameHubMap.erase(cameraId);
+		clearError();
+		return true;
+	}
+
 	clearError();
-	notifyReturnEvent();
-	return true;
+	return postCommand(Command{CommandType::DeleteCamera, cameraId});
 }
 
 bool CamManager::startCamera(int cameraId) {
 	{
 		std::lock_guard<std::mutex> lock(m_camChangeMutex);
-		if (m_cameraMap.find(cameraId) == m_cameraMap.end()) {
-			setError("cameraId 不存在");
+		auto it = m_cameraMap.find(cameraId);
+		if (it == m_cameraMap.end() || it->second.state == CameraState::Deleting) {
+			setError("cameraId 不存在或正在删除");
 			return false;
 		}
 	}
@@ -183,8 +207,9 @@ bool CamManager::startCamera(int cameraId) {
 bool CamManager::stopCamera(int cameraId) {
 	{
 		std::lock_guard<std::mutex> lock(m_camChangeMutex);
-		if (m_cameraMap.find(cameraId) == m_cameraMap.end()) {
-			setError("cameraId 不存在");
+		auto it = m_cameraMap.find(cameraId);
+		if (it == m_cameraMap.end() || it->second.state == CameraState::Deleting) {
+			setError("cameraId 不存在或正在删除");
 			return false;
 		}
 	}
@@ -199,7 +224,9 @@ bool CamManager::startAllCameras() {
 		std::lock_guard<std::mutex> lock(m_camChangeMutex);
 		cameraIds.reserve(m_cameraMap.size());
 		for (const auto &item : m_cameraMap) {
-			cameraIds.push_back(item.first);
+			if (item.second.state != CameraState::Deleting) {
+				cameraIds.push_back(item.first);
+			}
 		}
 	}
 
@@ -218,7 +245,9 @@ void CamManager::stopAllCameras() {
 		std::lock_guard<std::mutex> lock(m_camChangeMutex);
 		cameraIds.reserve(m_cameraMap.size());
 		for (const auto &item : m_cameraMap) {
-			cameraIds.push_back(item.first);
+			if (item.second.state != CameraState::Deleting) {
+				cameraIds.push_back(item.first);
+			}
 		}
 	}
 
@@ -555,6 +584,20 @@ bool CamManager::executeCommand(const Command& command) {
 	}
 
 	CameraSlot& slot = it->second;
+	if (command.type == CommandType::DeleteCamera) {
+		m_cameraMap.erase(command.cameraId);
+		m_frameHubMap.erase(command.cameraId);
+		clearError();
+		m_camCv.notify_one();
+		notifyReturnEvent();
+		return true;
+	}
+
+	if (slot.state == CameraState::Deleting) {
+		LOG_INFO("CamManager", "cameraId=" << command.cameraId << " 正在删除，跳过摄像头控制命令");
+		return true;
+	}
+
 	if (!slot.source) {
 		slot.state = CameraState::Error;
 		slot.lastError = "摄像头对象为空";
@@ -595,6 +638,9 @@ bool CamManager::executeCommand(const Command& command) {
 		clearError();
 		m_camCv.notify_one();
 		notifyReturnEvent();
+		return true;
+
+	case CommandType::DeleteCamera:
 		return true;
 	}
 

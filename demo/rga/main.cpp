@@ -36,6 +36,7 @@ int bytesPerPixel(PixelFormat format)
         return 2;
     case PixelFormat::RGBA8888:
         return 4;
+    case PixelFormat::MJPEG:
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         return 0;
@@ -51,6 +52,7 @@ int minDimensionAlignment(PixelFormat format)
     case PixelFormat::YUYV:
         return 2;
     case PixelFormat::RGBA8888:
+    case PixelFormat::MJPEG:
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         return 1;

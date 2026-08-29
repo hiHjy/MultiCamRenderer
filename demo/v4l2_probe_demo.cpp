@@ -20,6 +20,8 @@ const char *pixelFormatName(PixelFormat format)
         return "YUV420P";
     case PixelFormat::RGBA8888:
         return "RGBA8888";
+    case PixelFormat::MJPEG:
+        return "MJPEG";
     }
     return "Unknown";
 }

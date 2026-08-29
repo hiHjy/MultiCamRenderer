@@ -1273,3 +1273,77 @@ MppDecoder 放在 DecodeHub / DecodeNode 内部
 - `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/V4L2DeviceProbe.cpp demo/v4l2_probe_demo.cpp` 通过。
 - 使用 RK3568 aarch64 工具链编译 `build/v4l2_probe_demo` 通过。
 - 板端运行 `/tmp/v4l2_probe_demo` 能正确列出 `/dev/video10`、`/dev/video12` 的格式和分辨率，并过滤 UVC metadata 节点。
+
+### 追加：MJPEG 格式接入与动态删除语义收紧
+
+1. `PixelFormat` 增加 `MJPEG` 后，补齐了 V4L2 采集链路中的真实格式映射。
+
+   当前 `V4L2CameraSource::configure()` 显式请求 MJPEG 时会执行：
+
+   ```text
+   PixelFormat::MJPEG
+     -> V4L2_PIX_FMT_MJPEG
+     -> VIDIOC_S_FMT
+     -> VIDIOC_G_FMT 回读校验 fourcc
+   ```
+
+   如果驱动没有接受 MJPEG，而是自动退回其他格式，配置会失败，不会静默变成 YUYV/NV12。`VideoFrame::bytesUsed` 用来表示当前 MJPEG 压缩包的真实长度，`capacity/sizeimage` 仍表示 V4L2 buffer 的最大容量。
+
+2. `V4L2DeviceProbe` 和 demo 工具补齐 MJPEG 识别。
+
+   `v4l2_probe_demo` 现在能把 `MJPG` 标成 `MJPEG`。`camera_capture_demo` 增加可选 `format` 参数，便于板端直接验证 MJPEG 采集：
+
+   ```bash
+   ./build/camera_capture_demo /dev/video10 1920 1080 30 5 "" mjpeg
+   ```
+
+   当前板端实测 `/dev/video10`、`/dev/video12` 都能枚举出 `MJPG`，但测试时设备被占用，`VIDIOC_S_FMT` 返回 `Device or resource busy`。
+
+3. RGA 明确拒绝 MJPEG 压缩格式。
+
+   MJPEG 不是裸帧，不能直接送给 RGA 做颜色转换或缩放。当前 `RgaEngine` 遇到 `PixelFormat::MJPEG` 会返回明确错误：
+
+   ```text
+   RGA 不支持 MJPEG 压缩格式，需要先解码成裸帧
+   ```
+
+   这保证后续在 MPP 解码链路完成前，Qt 显示侧不会误把压缩包当裸图像处理。
+
+4. 收紧 `delCamera()` 后的发布语义。
+
+   之前 `pollOnce()` 会复制 `camera/hub` 的 `shared_ptr` 快照。这样虽然对象生命周期安全，但存在一个业务窗口：
+
+   ```text
+   poll 线程拿到旧 hub 快照
+   外部 delCamera() 删除 map
+   poll 线程继续 publish 最后一帧
+   ```
+
+   当前给 `FrameHub` 增加关闭闸门：
+
+   ```text
+   delCamera()
+     -> CameraState::Deleting
+     -> FrameHub::close()
+        -> 等待正在进行的 publishFrame() 结束
+        -> 清空 sink
+        -> 后续 publishFrame() 直接丢弃
+     -> 投递 DeleteCamera 命令
+     -> poll 线程串行 erase camera/hub
+   ```
+
+   因此当前删除语义为：
+
+   ```text
+   delCamera() 调用期间，已经开始发布的一帧允许完成；
+   delCamera() 返回之后，对应 hub 不再向 sink 发布新帧。
+   ```
+
+   这个语义依赖所有 sink 的 `onFrame()` 快速返回。慢操作仍然应该放到 sink 自己的 worker 线程里。
+
+### 追加验证
+
+- `git diff --check` 通过。
+- `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/FrameHub.cpp src/CamManager.cpp src/V4L2CameraSource.cpp` 通过。
+- RK3568 aarch64 工具链手工编译 `build/v4l2_probe_demo`、`build/camera_capture_demo` 通过。
+- `cmake --build qt-demo/build-wsl-aarch64 -j$(nproc)` 通过。

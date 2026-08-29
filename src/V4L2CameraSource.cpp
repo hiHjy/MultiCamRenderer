@@ -42,7 +42,11 @@ uint32_t toV4L2Format(PixelFormat format)
         return V4L2_PIX_FMT_YUYV;
     case PixelFormat::YUV420P:
         return V4L2_PIX_FMT_YUV420;
+    case PixelFormat::MJPEG:
+        return V4L2_PIX_FMT_MJPEG;
     case PixelFormat::Auto:
+        return 0;
+    case PixelFormat::RGBA8888:
         return 0;
     }
     return 0;
@@ -57,6 +61,8 @@ PixelFormat fromV4L2Format(uint32_t format)
         return PixelFormat::YUYV;
     case V4L2_PIX_FMT_YUV420:
         return PixelFormat::YUV420P;
+    case V4L2_PIX_FMT_MJPEG:
+        return PixelFormat::MJPEG;
     default:
         return PixelFormat::Unknown;
     }
@@ -72,8 +78,11 @@ int bytesPerPixel(PixelFormat format)
     case PixelFormat::NV12:
     case PixelFormat::YUV420P:
         return 1;
+    case PixelFormat::MJPEG:
+        return 1;
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
+    case PixelFormat::RGBA8888:
         return 1;
     }
     return 1;
@@ -90,6 +99,7 @@ std::vector<PixelFormat> formatCandidates(
         PixelFormat::NV12,
         PixelFormat::YUYV,
         PixelFormat::YUV420P,
+        PixelFormat::MJPEG,
     };
 }
 

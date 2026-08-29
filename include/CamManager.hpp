@@ -11,7 +11,13 @@
 #include <utility>
 #include <atomic>
 #include <condition_variable>
-
+// 1. CamManager 对外只发布裸帧
+// 2. MJPEG 是 camera 内部输入格式，不暴露给 DisplaySink
+// 3. poll 线程不做 MPP/RGA 重活，只投递 FramePacket
+// 4. decode worker 持有 input lease，解码 + RGA copy 完再释放
+// 5. MPP 原始输出不 publish
+// 6. RGA copy 后的稳定 output pool 才 publish
+// 7. output lease 负责归还 decode worker 的稳定 pool
 class CamManager {
 public:
     CamManager();
@@ -22,6 +28,7 @@ public:
         Ready,
         Streaming,
         Stopped,
+        Deleting,
         Error
     };
 
@@ -44,7 +51,10 @@ public:
     };
 
     // 当前内部用 shared_ptr 持有摄像头，pollOnce() 会复制 shared_ptr 快照，
-    // delCamera() 只从 map 中摘除管理引用，不主动 stop 快照中的 V4L2 fd。
+    // delCamera() 会先关闭 FrameHub，再由 poll 线程摘除 map 管理引用。
+    // 这样 delCamera() 返回后，不再向对应 sink 发布新帧。
+    // 它不直接 stop V4L2 fd；如果有快照/FrameLease 仍持有 source shared_ptr，
+    // V4L2CameraSource 会等最后一个引用释放后再析构清理。
     // 已经 DQBUF/publish 出去的帧由 FrameLease 继续保护 source 生命周期；
     // 最后一个引用释放后，V4L2CameraSource 析构时统一清理 fd/DMA buffer。
     // startCamera()/stopCamera() 不直接在调用线程里碰 V4L2 状态机，
@@ -74,11 +84,11 @@ public:
 private:
 
 
-    // 内部命令队列只承载会改变 V4L2 fd 状态机的操作。
-    // addCamera/delCamera 仍保持当前 shared_ptr 管理引用语义。
+    // 内部命令队列承载需要和 DQBUF/QBUF 串行的操作。
     enum class CommandType {
         StartCamera,
         StopCamera,
+        DeleteCamera,
     };
 
     struct Command {

@@ -26,8 +26,27 @@ const char* pixelFormatName(PixelFormat format)
         return "YUYV";
     case PixelFormat::YUV420P:
         return "YUV420P";
+    case PixelFormat::RGBA8888:
+        return "RGBA8888";
+    case PixelFormat::MJPEG:
+        return "MJPEG";
     }
     return "Unknown";
+}
+
+PixelFormat parsePixelFormat(const std::string& text)
+{
+    if (text == "auto" || text == "AUTO")
+        return PixelFormat::Auto;
+    if (text == "nv12" || text == "NV12")
+        return PixelFormat::NV12;
+    if (text == "yuyv" || text == "YUYV")
+        return PixelFormat::YUYV;
+    if (text == "yuv420p" || text == "YUV420P" || text == "i420" || text == "I420")
+        return PixelFormat::YUV420P;
+    if (text == "mjpeg" || text == "MJPEG" || text == "mjpg" || text == "MJPG")
+        return PixelFormat::MJPEG;
+    return PixelFormat::Unknown;
 }
 
 std::string fourccToString(uint32_t fourcc)
@@ -43,8 +62,9 @@ std::string fourccToString(uint32_t fourcc)
 void printUsage(const char* argv0)
 {
     std::cout
-        << "用法: " << argv0 << " [device] [width] [height] [fps] [frames] [dump_path]\n"
-        << "示例: " << argv0 << " /dev/video32 640 480 30 60 /tmp/frame.raw\n";
+        << "用法: " << argv0 << " [device] [width] [height] [fps] [frames] [dump_path] [format]\n"
+        << "format: auto/nv12/yuyv/yuv420p/mjpeg\n"
+        << "示例: " << argv0 << " /dev/video32 640 480 30 60 /tmp/frame.raw mjpeg\n";
 }
 
 int parseInt(const char* text, int defaultValue)
@@ -174,6 +194,12 @@ int main(int argc, char** argv)
     const int fps = argc > 4 ? parseInt(argv[4], 30) : 30;
     const int frameLimit = argc > 5 ? parseInt(argv[5], 60) : 60;
     const std::string dumpPath = argc > 6 ? argv[6] : "";
+    const PixelFormat requestedFormat = argc > 7 ? parsePixelFormat(argv[7]) : PixelFormat::Auto;
+    if (requestedFormat == PixelFormat::Unknown) {
+        std::cerr << "未知 format: " << argv[7] << "\n";
+        printUsage(argv[0]);
+        return 1;
+    }
 
     V4L2CameraSource camera(0);
     if (!camera.openDevice(device)) {
@@ -192,7 +218,7 @@ int main(int argc, char** argv)
     cfg.width = width;
     cfg.height = height;
     cfg.fps = fps;
-    cfg.format = PixelFormat::Auto;
+    cfg.format = requestedFormat;
 
     if (!camera.configure(cfg)) {
         std::cerr << "configure 失败: " << camera.lastError() << "\n";

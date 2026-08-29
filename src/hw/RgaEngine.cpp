@@ -25,6 +25,7 @@ int bytesPerPixelForFormat(PixelFormat format)
         return 2;
     case PixelFormat::RGBA8888:
         return 4;
+    case PixelFormat::MJPEG:
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         return 0;
@@ -41,6 +42,7 @@ int minDimensionAlignmentForFormat(PixelFormat format)
         return 2;
     case PixelFormat::RGBA8888:
         return 1;
+    case PixelFormat::MJPEG:
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         return 1;
@@ -230,6 +232,7 @@ size_t RgaEngine::bufferSizeFor(PixelFormat format,
         return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 2;
     case PixelFormat::RGBA8888:
         return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 4;
+    case PixelFormat::MJPEG:
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         return 0;
@@ -248,6 +251,9 @@ int RgaEngine::toRgaFormat(PixelFormat format)
         return RK_FORMAT_YUYV_422;
     case PixelFormat::RGBA8888:
         return RK_FORMAT_RGBA_8888;
+    case PixelFormat::MJPEG:
+        setError("RGA 不支持 MJPEG 压缩格式，需要先解码成裸帧");
+        return -1;
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         setError("RGA 不支持 Unknown/Auto PixelFormat，必须传入已协商格式");
@@ -560,6 +566,9 @@ size_t RgaEngine::requiredSize(const VideoFrame& frame)
         return static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride) * 2;
     case PixelFormat::RGBA8888:
         return static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride) * 4;
+    case PixelFormat::MJPEG:
+        setError("RGA 不能计算 MJPEG 压缩格式的裸帧 buffer size，需要先解码");
+        return 0;
     case PixelFormat::Unknown:
     case PixelFormat::Auto:
         setError("RGA 不能计算 Unknown/Auto PixelFormat 的 buffer size");

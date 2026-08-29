@@ -6,5 +6,6 @@ enum class PixelFormat {
     NV12,
     YUYV,
     YUV420P,
-    RGBA8888
+    RGBA8888,
+    MJPEG
 };
