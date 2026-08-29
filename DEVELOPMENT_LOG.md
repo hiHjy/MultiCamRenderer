@@ -1347,3 +1347,9 @@ MppDecoder 放在 DecodeHub / DecodeNode 内部
 - `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/FrameHub.cpp src/CamManager.cpp src/V4L2CameraSource.cpp` 通过。
 - RK3568 aarch64 工具链手工编译 `build/v4l2_probe_demo`、`build/camera_capture_demo` 通过。
 - `cmake --build qt-demo/build-wsl-aarch64 -j$(nproc)` 通过。
+
+### 追加封装mpp解码器
+	有以解码能力
+- mjpeg
+- h264/h265
+> 测试demo demo/mpp_decoder_demo.cpp，测试通过
