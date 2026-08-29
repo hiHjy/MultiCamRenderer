@@ -36,13 +36,6 @@ void dmabufSyncEnd(int fd, __u64 rw)
 DisplaySink::DisplaySink(QObject *parent)
     : QObject(parent)
 {
-    const size_t bufferSize = RgaEngine::bufferSizeFor(PixelFormat::RGBA8888, WIDTH, HEIGHT);
-    if (bufferSize == 0) {
-        LOG_ERROR("DisplaySink", "计算 RGA 目标 DMA buffer size 失败");
-    } else if (!m_rgbaPool.init(BUFFER_COUNT, bufferSize)) {
-        LOG_ERROR("DisplaySink", "分配 RGA 目标 DMA buffer pool 失败: " << m_rgbaPool.lastError());
-    }
-
     m_workerThread = std::thread(&DisplaySink::workerLoop, this);
 }
 
@@ -105,11 +98,8 @@ void DisplaySink::processFrame(FramePacket packet)
     const VideoFrame &frame = packet.frame;
     // DisplaySink worker 线程调用。
     // 通过 RgaEngine::rga() 把摄像头 YUYV 转成 RGBA，存进我们私有 buffer。
-    if (frame.width != WIDTH || frame.height != HEIGHT) {
-        LOG_WARN("DisplaySink", "帧尺寸不匹配: " << frame.width << "x" << frame.height
-                 << " expected=" << WIDTH << "x" << HEIGHT);
+    if (!ensureRgbaPoolInitialized(frame))
         return;
-    }
 
     VideoFrame *dstFrame = m_rgbaPool.acquireFrame();
     if (!dstFrame) {
@@ -180,6 +170,45 @@ void DisplaySink::processFrame(FramePacket packet)
     }
 
     emit frameReady(df);
+}
+
+bool DisplaySink::ensureRgbaPoolInitialized(const VideoFrame &frame)
+{
+    if (m_rgbaPool.initialized()) {
+        if (frame.width != m_poolWidth || frame.height != m_poolHeight) {
+            LOG_WARN("DisplaySink", "当前显示 pool 已绑定尺寸 "
+                     << m_poolWidth << "x" << m_poolHeight
+                     << "，忽略不同尺寸帧 " << frame.width << "x" << frame.height);
+            return false;
+        }
+        return true;
+    }
+
+    if (frame.width <= 0 || frame.height <= 0) {
+        LOG_WARN("DisplaySink", "收到非法帧尺寸: " << frame.width << "x" << frame.height);
+        return false;
+    }
+
+    const size_t bufferSize = RgaEngine::bufferSizeFor(
+        PixelFormat::RGBA8888, frame.width, frame.height);
+    if (bufferSize == 0) {
+        LOG_ERROR("DisplaySink", "计算 RGA 目标 DMA buffer size 失败: "
+                  << frame.width << "x" << frame.height);
+        return false;
+    }
+
+    if (!m_rgbaPool.init(BUFFER_COUNT, bufferSize)) {
+        LOG_ERROR("DisplaySink", "分配 RGA 目标 DMA buffer pool 失败: " << m_rgbaPool.lastError());
+        return false;
+    }
+
+    m_poolWidth = frame.width;
+    m_poolHeight = frame.height;
+    LOG_INFO("DisplaySink", "初始化显示 DMA buffer pool: "
+             << m_poolWidth << "x" << m_poolHeight
+             << " count=" << BUFFER_COUNT
+             << " bufferSize=" << bufferSize);
+    return true;
 }
 
 void DisplaySink::releaseFrameByIndex(int bufferIndex)

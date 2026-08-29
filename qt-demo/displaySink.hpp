@@ -32,8 +32,6 @@ Q_DECLARE_METATYPE(DisplayFrame)
 class DisplaySink : public QObject, public Sink {
     Q_OBJECT
 public:
-    static constexpr int WIDTH = 640;
-    static constexpr int HEIGHT = 480;
     static constexpr int BUFFER_COUNT = 4;
 
     explicit DisplaySink(QObject *parent = nullptr);
@@ -49,11 +47,14 @@ signals:
 private:
     void workerLoop();
     void processFrame(FramePacket packet);
+    bool ensureRgbaPoolInitialized(const VideoFrame &frame);
 
 private:
     RgaEngine m_rga;
     DmaBufferPool m_rgbaPool;
     std::array<VideoFrame*, BUFFER_COUNT> m_inFlightFrames {};
+    int m_poolWidth = 0;
+    int m_poolHeight = 0;
     std::mutex m_inFlightMutex;
     std::mutex m_pendingMutex;
     std::condition_variable m_pendingCv;

@@ -1095,3 +1095,181 @@ rga_request_wait                0.83s / 10s  约  8.3% 单核，约  2.1% 四核
 - `./wsl-build.sh build` 通过，生成 `qt-demo/build-wsl-aarch64/appqt-demo`。
 - 板端运行两路 `/dev/video12`、`/dev/video10` 可启动。
 - 板端 kernel function profiler 已用于 UVC 拷贝占用测试，测试后已关闭 profiler。
+
+## 2026-08-29
+
+### 项目当前进度
+
+今天主要做两件事：把本地摄像头能力查询补成一个独立 probe 工具，同时开始明确后续压缩流 / MPP 解码链路的架构边界。当前判断是：摄像头侧裸帧基座已经基本稳定，下一步真正关键的是把 MJPEG / H264 / H265 这类压缩输入解码成统一 `VideoFrame`，再复用现有 `FrameHub + Sink`。
+
+### 今天完成的事
+
+1. `DisplaySink` 改为按第一帧真实尺寸初始化显示 pool。
+
+   旧逻辑在构造函数里按固定尺寸预分配 RGBA DMA buffer。这样在 640x480、640x360 或其他测试分辨率下会浪费内存，也让 sink 和摄像头配置耦合。
+
+   当前逻辑改为：
+
+   ```text
+   DisplaySink 构造
+     -> 只启动 worker
+
+   第一帧进入 processFrame()
+     -> 读取 frame.width / frame.height
+     -> 计算 RGBA8888 目标 buffer size
+     -> 初始化 DmaBufferPool
+     -> 后续同尺寸帧复用 pool
+   ```
+
+   如果同一个 `DisplaySink` 后续收到不同尺寸帧，当前先打印 warning 并丢弃。热切分辨率后续按“销毁旧 sink / 创建新 sink”的实例生命周期处理，不在已有 sink 内部重置 pool，避免 Qt 渲染线程、RGA worker、in-flight DMA buffer 之间的同步复杂度。
+
+2. 新增非侵入式 V4L2 设备能力查询。
+
+   新增：
+
+   ```text
+   include/V4L2DeviceProbe.hpp
+   src/V4L2DeviceProbe.cpp
+   demo/v4l2_probe_demo.cpp
+   ```
+
+   第一版 probe 只做非侵入查询，不主动 `REQBUFS/STREAMON/DQBUF`，避免抢占正在运行的摄像头。当前查询内容包括：
+
+   ```text
+   VIDIOC_QUERYCAP
+   VIDIOC_G_FMT
+   VIDIOC_ENUM_FMT
+   VIDIOC_ENUM_FRAMESIZES
+   VIDIOC_ENUM_FRAMEINTERVALS
+   ```
+
+   过滤条件为：
+
+   ```text
+   必须支持 VIDEO_CAPTURE 或 VIDEO_CAPTURE_MPLANE
+   必须支持 STREAMING
+   排除 META_CAPTURE
+   必须能枚举出至少一种格式
+   ```
+
+3. 新增 `v4l2_probe_demo` 构建入口。
+
+   `build.sh` 已加入 `v4l2_probe_demo`，用于板端快速列出可用视频节点、当前格式、支持分辨率和 fps。
+
+4. Qt demo 测试配置调整。
+
+   当前 `DisplayController` 默认配置临时改为：
+
+   ```text
+   640x360 YUYV 5fps
+   ```
+
+   `Main.qml` 默认自动打开顺序为：
+
+   ```text
+   /dev/video10
+   /dev/video12
+   ```
+
+   这是为了继续做两路摄像头压测和 UI 显示验证，后续正式 UI 会改为从 probe 结果选择设备和分辨率。
+
+### V4L2 Probe 板端验证
+
+板端运行 `v4l2_probe_demo` 后，USB 摄像头节点识别正常：
+
+```text
+/dev/video10  uvcvideo  current: 640x480 YUYV
+/dev/video11  is not a usable video capture node
+/dev/video12  uvcvideo  current: 640x360 YUYV
+```
+
+其中 `/dev/video11`、`/dev/video13` 是 UVC metadata 节点，不应该作为摄像头采集入口。
+
+同时也确认 RKISP 节点的特殊性：
+
+```text
+/dev/video0  rkisp_mainpath  current: unconfigured
+/dev/video1  rkisp_selfpath  current: unconfigured
+/dev/video2  rkisp_rawwr0    current: unconfigured
+```
+
+这些节点能枚举格式，不代表一定有 sensor 真实接入并能出帧。对 RK MIPI / ISP，稳妥 probe 需要额外结合 media graph 或显式试采一帧。
+
+后续更完整的“确定可出帧”策略应分三层：
+
+```text
+1. QUERYCAP：筛掉 metadata / output / 非 streaming 节点
+2. ENUM_FMT/SIZE/FPS：拿到能力列表
+3. 可选强验证：REQBUFS + STREAMON + DQBUF 试取一帧
+```
+
+USB UVC 一般前两层就够用；RKISP/MIPI 最好增加第三层，或者解析 media graph 中是否存在真实 Sensor entity 且链路闭合。
+
+### MIPI 摄像头设备树结论
+
+当前板端实际启动的模型为：
+
+```text
+Alientek ATK-DLRK3568 Board
+compatible: rockchip,rk3568-evb1-ddr4-v10
+```
+
+当前 ATK 设备树里写过这些 MIPI sensor 节点：
+
+```text
+sony,imx335    module: MTV4-IR-E-P
+sony,imx415    module: CMK-OT1522-FG3
+ovti,ov13850   module: ZC-OV13850R2A-V1
+```
+
+SDK 里另有 `rk3568-evb1-dual-camera.dtsi` 双摄参考：
+
+```text
+galaxycore,gc2053
+galaxycore,gc2093
+```
+
+但当前运行中的 media graph 没有看到具体 MIPI sensor entity 接进 RKISP，说明现有板端镜像虽然有 RKISP video 节点，但没有实际 MIPI 摄像头链路闭环。后续如果买 MIPI 模组，优先买和 ATK / 正点原子板卡配套的完整模组，而不是只看同 sensor 名称。
+
+### MPP 解码架构决策
+
+阅读 `/home/hjy/rockchip_hardware_acceleration` 后确认：
+
+```text
+mpp_simple:
+  适合 H264/H265 流式解码。
+  MJPEG 不走 simple 模式。
+
+mpp_advance:
+  适合 USB 摄像头 MJPEG 单帧解码。
+  输入是一帧 MJPEG dma-buf fd。
+  输出是外部提供的 NV12 dma-buf fd。
+```
+
+后续架构方向：
+
+```text
+CamManager MJPEG / RtspStream H264/H265
+  -> DecodeHub / DecodeNode
+      -> 持有 MppDecoder
+      -> 持有解码输出 DmaBufferPool
+      -> 解码成裸 VideoFrame
+      -> publish 到裸帧 FrameHub
+  -> DisplaySink / RecordSink / AISink
+```
+
+这里的关键边界是：
+
+```text
+FrameHub 继续保持纯裸帧分发
+DisplaySink 继续只负责显示裸帧
+MppDecoder 放在 DecodeHub / DecodeNode 内部
+```
+
+这样后续 USB MJPEG、RTSP H264/H265、IPC 子码流都能统一成 `VideoFrame + FrameLease` 后进入同一套 sink 体系。
+
+### 本次验证
+
+- `g++ -std=c++17 -Wall -Wextra -Iinclude -fsyntax-only src/V4L2DeviceProbe.cpp demo/v4l2_probe_demo.cpp` 通过。
+- 使用 RK3568 aarch64 工具链编译 `build/v4l2_probe_demo` 通过。
+- 板端运行 `/tmp/v4l2_probe_demo` 能正确列出 `/dev/video10`、`/dev/video12` 的格式和分辨率，并过滤 UVC metadata 节点。

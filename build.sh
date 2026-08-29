@@ -29,6 +29,7 @@ echo "OUT=$BASE/build/cam_manager_demo"
 echo "OUT=$BASE/build/dma_allocator_demo"
 echo "OUT=$BASE/build/test"
 echo "OUT=$BASE/build/rga_test"
+echo "OUT=$BASE/build/v4l2_probe_demo"
 
 RGA_INC="$BASE/third_party/rga/include"
 RGA_LIB_DIR="$BASE/third_party/rga/lib/arm32"
@@ -40,6 +41,11 @@ cat > "$BASE/compile_commands.base.json" <<EOF
     "directory": "$BASE",
     "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/V4L2CameraSource.cpp -o $BASE/build/V4L2CameraSource.o",
     "file": "$BASE/src/V4L2CameraSource.cpp"
+  },
+  {
+    "directory": "$BASE",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/V4L2DeviceProbe.cpp -o $BASE/build/V4L2DeviceProbe.o",
+    "file": "$BASE/src/V4L2DeviceProbe.cpp"
   },
   {
     "directory": "$BASE",
@@ -90,6 +96,11 @@ cat > "$BASE/compile_commands.base.json" <<EOF
     "directory": "$BASE",
     "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/demo/rga_test.cpp -o $BASE/build/rga_test.o",
     "file": "$BASE/demo/rga_test.cpp"
+  },
+  {
+    "directory": "$BASE",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/v4l2_probe_demo.cpp -o $BASE/build/v4l2_probe_demo.o",
+    "file": "$BASE/demo/v4l2_probe_demo.cpp"
   },
   {
     "directory": "$BASE",
@@ -151,6 +162,13 @@ set -x
     -o "$BASE/build/rga_test" \
     $RGA_LINK_FLAGS
 "$STRIP" "$BASE/build/rga_test" || true
+
+"$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
+    -I"$BASE/include" \
+    "$BASE/src/V4L2DeviceProbe.cpp" \
+    "$BASE/demo/v4l2_probe_demo.cpp" \
+    -o "$BASE/build/v4l2_probe_demo"
+"$STRIP" "$BASE/build/v4l2_probe_demo" || true
 set +x
 
 echo "Built: $BASE/build/camera_capture_demo"
@@ -163,6 +181,8 @@ echo "Built: $BASE/build/test"
 file "$BASE/build/test" || true
 echo "Built: $BASE/build/rga_test"
 file "$BASE/build/rga_test" || true
+echo "Built: $BASE/build/v4l2_probe_demo"
+file "$BASE/build/v4l2_probe_demo" || true
 
 if [ -x "$BASE/tools/update_compile_commands.sh" ]; then
     "$BASE/tools/update_compile_commands.sh" || true

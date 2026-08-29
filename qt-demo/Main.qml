@@ -12,7 +12,7 @@ Window {
 	visible: true
 	title: "MultiCam Renderer"
 	color: "#1b1f25"
-	property var demoCameraPaths: ["/dev/video12", "/dev/video10"]
+	property var demoCameraPaths: ["/dev/video10", "/dev/video12"]
 	property int nextDemoCameraIndex: 0
 
 	function addDemoCameraToNextTile() {
@@ -209,6 +209,7 @@ Window {
 				property int cameraNumber: index + 1
 				property int slot: index
 				property alias videoItem: videoItem
+				property real videoAspectRatio: 16 / 9
 				property var targetGeometry: videoArea.geometryForSlot(slot)
 				property bool isDropTarget: videoArea.dropTarget === tile
 
@@ -247,9 +248,21 @@ Window {
 					}
 				}
 
-				MyItem {
-					id: videoItem
-					anchors.fill: parent
+
+				// tile 是布局分配到的格子；videoViewport 才是实际视频显示范围。
+				// 无论格子是宽是窄，videoViewport 都保持 16:9 并居中，空余处为黑边。
+				Rectangle {
+					id: videoViewport
+					anchors.centerIn: parent
+					width: Math.min(tile.width, tile.height * tile.videoAspectRatio)
+					height: width / tile.videoAspectRatio
+					color: "black"
+					clip: true
+
+					MyItem {
+						id: videoItem
+						anchors.fill: parent
+					}
 				}
 
 				MouseArea {
