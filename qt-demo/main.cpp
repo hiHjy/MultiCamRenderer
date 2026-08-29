@@ -1,6 +1,3 @@
-#include "AppRuntime.hpp"
-#include "Log.hpp"
-
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>

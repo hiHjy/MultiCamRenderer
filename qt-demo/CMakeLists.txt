@@ -21,6 +21,7 @@ qt_add_executable(appqt-demo
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaAllocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaBufferPool.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/RgaEngine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/MppDecoder.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/../src/AppRuntime.cpp
 
 )
@@ -29,6 +30,8 @@ target_include_directories(appqt-demo PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/hw
     ${CMAKE_SYSROOT}/usr/include/rga
+    ${CMAKE_SYSROOT}/usr/include/rockchip
+    ${CMAKE_SYSROOT}/usr/include/libdrm
 )
 
 qt_add_qml_module(appqt-demo
@@ -46,5 +49,7 @@ target_link_libraries(appqt-demo
     Qt6::Quick
     Qt6::QuickControls2
     rga
+    rockchip_mpp
+    drm
     -lEGL -lGLESv2 -lmali
 )
