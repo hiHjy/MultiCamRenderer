@@ -1353,3 +1353,144 @@ MppDecoder 放在 DecodeHub / DecodeNode 内部
 - mjpeg
 - h264/h265
 > 测试demo demo/mpp_decoder_demo.cpp，测试通过
+
+### 追加：MPP 解码器与编码器基础封装
+
+本次把已经验证过的 Rockchip MPP C 代码接入工程，并在 C++ 层做最小封装。
+
+#### 1. MPP C 适配层
+
+新增：
+
+```text
+include/hw/rkmpp_c/mpp_simple.h
+include/hw/rkmpp_c/mpp_advance.h
+src/hw/rkmpp_c/mpp_simple.c
+src/hw/rkmpp_c/mpp_advance.c
+```
+
+当前分工：
+
+```text
+mpp_advance:
+  用于 MJPEG 单帧解码。
+  输入 MJPEG dma-buf fd，输出外部提供的 NV12 dma-buf fd。
+
+mpp_simple:
+  用于 H264/H265 流式解码和 H264/H265 编码。
+```
+
+H264/H265 decoder 输入缓存从固定 4MB 改成按需扩容，去掉了 `RKMPP_DEC_INPUT_BUF_SIZE` 这个硬上限，也避免每包 `memset 4MB`。
+
+#### 2. MppDecoder 封装收窄
+
+`MppDecoder` 对外只保留必要接口：
+
+```cpp
+bool init(MppCodec codec);
+bool decodeMjpeg(const VideoFrame& input, VideoFrame& output);
+bool sendPacket(const VideoFrame& packet, bool eos = false);
+void setFrameCallback(FrameCallback callback);
+```
+
+删除了 public `MppDecConfig` / `MppDecodedInfo` 这类配置结构。解码器不暴露宽高、fps、bitrate 配置；H264/H265 的实际输出宽高、stride、format 由码流和 MPP info_change 决定。
+
+底层解码输出处增加 10s 限流日志，打印输出尺寸、stride、format、fd、buffer size、pts，并尝试用 `MPP_DEC_QUERY` 输出 runtime fps/bps 统计。
+
+#### 3. MppEncoder 基础封装
+
+新增 `MppEncoder`：
+
+```cpp
+bool init(const MppEncoderConfig& config);
+bool sendFrame(const VideoFrame& frame, bool eos = false);
+bool requestKeyFrame();
+void setPacketCallback(PacketCallback callback);
+```
+
+第一版只支持：
+
+```text
+NV12 dma-buf -> H264/H265 packet
+```
+
+也就是说，YUYV/RGBA/MJPEG 都不直接送 encoder。后续录像/推流链路应该先通过 RGA/MPP 解码统一成 NV12，再送 MPP encoder，避免让 encoder 内部隐式做颜色转换，便于控制带宽和性能。
+
+`writeHeader()` 没有暴露给上层，编码器在第一次 `sendFrame()` 前内部自动写 header。底层仍设置：
+
+```text
+MPP_ENC_HEADER_MODE_EACH_IDR
+```
+
+因此每个 IDR 前会携带 VPS/SPS/PPS 或 SPS/PPS，适合 RTSP/NVR 场景里客户端中途恢复解码。
+
+#### 4. 强制关键帧
+
+`MppEncoder::requestKeyFrame()` 底层调用：
+
+```text
+MPP_ENC_SET_IDR_FRAME
+```
+
+RK MPP 注释语义为“下一帧编码成 intra frame”。`EncodedPacket` 增加 `isKeyFrame` 字段，来自 MPP packet meta：
+
+```text
+KEY_OUTPUT_INTRA
+```
+
+这方便后续 RTSP/录像层确认关键帧边界。
+
+#### 5. 编码 demo
+
+新增：
+
+```text
+demo/mpp_encoder_demo.cpp
+```
+
+用法示例：
+
+```bash
+./build/mpp_encoder_demo h264 input.nv12 out.h264 640 480 640 480 30 1000000 20 10
+./build/mpp_encoder_demo h265 input.nv12 out.h265 640 480 640 480 30 1000000 20 10
+```
+
+含义：
+
+```text
+编码 20 帧
+GOP 固定为 100
+在第 10 帧前调用 requestKeyFrame()
+```
+
+#### 6. 板端验证
+
+RK3568 板端已验证：
+
+```text
+MJPEG -> NV12
+NV12 -> H264 -> NV12
+NV12 -> H265 -> NV12
+```
+
+关键帧请求验证：
+
+```text
+H264:
+  第 0 帧 keyFrame=1
+  第 1-9 帧 keyFrame=0
+  第 10 帧前 requestKeyFrame()
+  第 10 帧 keyFrame=1
+  后续继续 keyFrame=0
+
+H265:
+  同样生效
+```
+
+额外使用 `ffprobe` 验证，GOP=100 时码流开头为 I 帧，中途 request 后再次出现 I 帧，后续继续 P 帧。
+
+#### 7. 注意点
+
+`MppEncoderConfig::heightStride` 保留。它对应 MPP encoder 的 `prep:ver_stride`，不是码控参数，但它描述输入 NV12 dma-buf 的真实内存布局。调用方不填时按 `height` 处理。
+
+H265 解码输出时 MPP 可能返回比 width 更大的 stride，例如 640x480 输入，输出 stride 可能为 768x480。后续所有 RGA/编码链路都必须按 `stride/heightStride` 访问内存，按 `width/height` 表示真实画面。
