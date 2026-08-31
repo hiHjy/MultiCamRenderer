@@ -54,6 +54,47 @@ const char* codecName(MppCodec codec)
     return "Unknown";
 }
 
+const char* bitratePresetName(MppBitratePreset preset)
+{
+    switch (preset) {
+    case MppBitratePreset::Low:
+        return "Low";
+    case MppBitratePreset::Medium:
+        return "Medium";
+    case MppBitratePreset::High:
+        return "High";
+    case MppBitratePreset::VeryHigh:
+        return "VeryHigh";
+    }
+    return "Unknown";
+}
+
+int presetBitrate(const MppEncoderConfig& cfg, int fps)
+{
+    const int base = cfg.width * cfg.height * fps / 8;
+    int bitrate = base;
+
+    switch (cfg.bitratePreset) {
+    case MppBitratePreset::Low:
+        bitrate = base * 2 / 3;
+        break;
+    case MppBitratePreset::Medium:
+        bitrate = base;
+        break;
+    case MppBitratePreset::High:
+        bitrate = base * 3 / 2;
+        break;
+    case MppBitratePreset::VeryHigh:
+        bitrate = base * 2;
+        break;
+    }
+
+    if (cfg.codec == MppCodec::H265)
+        bitrate = bitrate * 65 / 100;
+
+    return bitrate > 0 ? bitrate : base;
+}
+
 int effectiveStride(const VideoFrame& frame)
 {
     return frame.stride > 0 ? frame.stride : frame.width;
@@ -89,13 +130,15 @@ struct MppEncoder::Impl {
         const int stride = cfg.stride > 0 ? cfg.stride : cfg.width;
         const int heightStride = cfg.heightStride > 0 ? cfg.heightStride : cfg.height;
         const int fps = cfg.fps > 0 ? cfg.fps : 30;
-        const int bitrate = cfg.bitrate > 0 ? cfg.bitrate : cfg.width * cfg.height * fps / 8;
+        const int bitrate = cfg.bitrate > 0 ? cfg.bitrate : presetBitrate(cfg, fps);
         const int gop = cfg.gop > 0 ? cfg.gop : fps;
 
         LOG_INFO("MppEncoder", "初始化 MPP 编码器 codec=" << codecName(cfg.codec)
                                  << " input=NV12 " << cfg.width << "x" << cfg.height
                                  << " stride=" << stride << "x" << heightStride
-                                 << " fps=" << fps << " bitrate=" << bitrate
+                                 << " fps=" << fps
+                                 << " bitratePreset=" << bitratePresetName(cfg.bitratePreset)
+                                 << " bitrate=" << bitrate
                                  << " gop=" << gop);
 
         const int ret = rk_mpp_encoder_init(&encoder,

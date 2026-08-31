@@ -1494,3 +1494,176 @@ H265:
 `MppEncoderConfig::heightStride` 保留。它对应 MPP encoder 的 `prep:ver_stride`，不是码控参数，但它描述输入 NV12 dma-buf 的真实内存布局。调用方不填时按 `height` 处理。
 
 H265 解码输出时 MPP 可能返回比 width 更大的 stride，例如 640x480 输入，输出 stride 可能为 768x480。后续所有 RGA/编码链路都必须按 `stride/heightStride` 访问内存，按 `width/height` 表示真实画面。
+
+### 追加：编码器码率档位与 demo 修正
+
+本次继续打磨 MPP 编码器封装，重点是让编码参数更适合后续 IPC / RTSP / NVR 场景，同时修正编码 demo 的测试问题。
+
+#### 1. 修正 mpp_encoder_demo 只编码单帧的问题
+
+之前 `demo/mpp_encoder_demo.cpp` 有两个测试坑：
+
+```text
+1. 默认 frameCount=1，不传帧数时只编码一帧。
+2. 输入 DMA buffer 只在循环前 memcpy 一次，即使传多帧，也会重复编码第一帧。
+```
+
+本次改为：
+
+```text
+1. 按 NV12 文件大小自动计算可用帧数。
+2. 如果外部传 frameCount，则取外部帧数和文件实际帧数的较小值。
+3. 每次 sendFrame() 前将对应帧拷贝到输入 dma-buf。
+4. memcpy 前后增加 DMA_BUF_IOCTL_SYNC，保证 CPU 写入和设备读取之间的同步语义更明确。
+```
+
+修正后板端用 `ffprobe -count_frames` 验证：
+
+```text
+H264: 640x480 30fps 150 frames
+H265: 640x480 30fps 150 frames
+```
+
+确认不再是只编码单帧。
+
+#### 2. 增加 RK3568 WSL 构建脚本
+
+新增：
+
+```text
+wsl-build.sh
+```
+
+用于直接使用：
+
+```text
+/opt/rk3568_kernel_pack/toolchain
+/opt/rk3568_kernel_pack/sysroot
+```
+
+构建当前几个板端 demo：
+
+```text
+mpp_decoder_demo
+mpp_encoder_demo
+v4l2_probe_demo
+camera_capture_demo
+```
+
+这避免继续误用旧的 RV1126 `build.sh`。
+
+#### 3. 增加编码码率档位
+
+`MppEncoderConfig` 新增：
+
+```cpp
+enum class MppBitratePreset {
+    Low,
+    Medium,
+    High,
+    VeryHigh,
+};
+```
+
+规则：
+
+```text
+bitrate > 0:
+  使用外部传入的精确码率，单位 bit/s。
+
+bitrate <= 0:
+  按 bitratePreset 自动计算。
+```
+
+自动码率公式：
+
+```text
+base = width * height * fps / 8
+
+H264 Low      = base * 2 / 3
+H264 Medium   = base
+H264 High     = base * 3 / 2
+H264 VeryHigh = base * 2
+
+H265 Low      = H264 Low * 65%
+H265 Medium   = H264 Medium * 65%
+H265 High     = H264 High * 65%
+H265 VeryHigh = H264 VeryHigh * 65%
+```
+
+以 `640x480@30fps` 为例：
+
+```text
+H264 Medium = 1,152,000 bit/s
+H265 Medium =   748,800 bit/s
+```
+
+这样上层后续可以传 `Low / Medium / High / VeryHigh` 这种语义档位，不必每次手填裸码率。专业配置仍然可以直接填精确 `bitrate`。
+
+#### 4. demo 支持码率档位参数
+
+`mpp_encoder_demo` 第 9 个参数现在既可以传精确码率，也可以传档位：
+
+```bash
+./build/mpp_encoder_demo h264 input.nv12 out.h264 640 480 640 480 30 medium
+./build/mpp_encoder_demo h265 input.nv12 out.h265 640 480 640 480 30 high
+./build/mpp_encoder_demo h264 input.nv12 out.h264 640 480 640 480 30 1500000
+```
+
+板端验证 `640x480@30fps medium`：
+
+```text
+H264 bitrate = 1,152,000 bit/s
+H265 bitrate =   748,800 bit/s
+```
+
+短测 10 帧输出：
+
+```text
+H264 输出约 83KB
+H265 输出约 43KB
+```
+
+#### 5. 编码参数笔记
+
+新增：
+
+```text
+docs/mpp_encoder_params_notes.md
+```
+
+记录当前对 MPP 编码参数的理解：
+
+```text
+CBR / bps_target / bps_min / bps_max
+H264 与 H265 码率差异
+GOP 取舍
+QP 当前先不主动调整
+Header Mode
+stride / heightStride 注意点
+后续测试方向
+```
+
+当前策略仍保持克制：先区分 H264/H265 默认码率，不动 QP，不引入 VBR/AVBR，等 RTSP / IPC 场景跑起来后再结合真实码流继续调参。
+
+#### 6. 测试素材
+
+下载了两段公开测试素材到 `build/testdata` 用于本地验证：
+
+```text
+sample_city_1080p.mp4
+big_buck_bunny_1080p_10s_10mb.mp4
+sintel_720p_10s_5mb.mp4
+```
+
+其中 `sintel_720p_10s_5mb.mp4` 更适合作为当前动画测试片：
+
+```text
+1280x720
+24fps
+10s
+240 frames
+约 4.19 Mbps
+```
+
+这些文件位于 build 目录下，不纳入 git。

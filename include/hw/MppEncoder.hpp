@@ -18,6 +18,13 @@ struct EncodedPacket {
     bool eos = false;
 };
 
+enum class MppBitratePreset {
+    Low,
+    Medium,
+    High,
+    VeryHigh,
+};
+
 struct MppEncoderConfig {
     MppCodec codec = MppCodec::H264;
     int width = 0;
@@ -26,6 +33,15 @@ struct MppEncoderConfig {
     int heightStride = 0;
     PixelFormat inputFormat = PixelFormat::NV12;
     int fps = 30;
+    // 当 bitrate <= 0 时按档位自动计算：
+    //   base = width * height * fps / 8
+    //   Low      = base * 2 / 3
+    //   Medium   = base
+    //   High     = base * 3 / 2
+    //   VeryHigh = base * 2
+    // H265 会在上述结果上再乘以 65%，用于体现同等主观画质下的码率优势。
+    MppBitratePreset bitratePreset = MppBitratePreset::Medium;
+    // 精确码率，单位 bit/s。大于 0 时优先使用该值，忽略 bitratePreset。
     int bitrate = 0;
     int gop = 0;
 };

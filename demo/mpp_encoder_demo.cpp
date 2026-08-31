@@ -2,11 +2,14 @@
 #include "VideoFrame.hpp"
 #include "hw/MppEncoder.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <linux/dma-buf.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <vector>
 
 namespace {
@@ -15,8 +18,8 @@ void printUsage(const char* argv0)
 {
     std::cout
         << "用法:\n"
-        << "  " << argv0 << " h264 input.nv12 output.h264 width height [stride] [heightStride] [fps] [bitrate] [frameCount] [requestKeyFrameIndex]\n"
-        << "  " << argv0 << " h265 input.nv12 output.h265 width height [stride] [heightStride] [fps] [bitrate] [frameCount] [requestKeyFrameIndex]\n";
+        << "  " << argv0 << " h264 input.nv12 output.h264 width height [stride] [heightStride] [fps] [bitrate|low|medium|high|veryhigh] [frameCount] [requestKeyFrameIndex]\n"
+        << "  " << argv0 << " h265 input.nv12 output.h265 width height [stride] [heightStride] [fps] [bitrate|low|medium|high|veryhigh] [frameCount] [requestKeyFrameIndex]\n";
 }
 
 int parseInt(const char* text, int fallback)
@@ -36,6 +39,42 @@ MppCodec parseCodec(const std::string& text)
     if (text == "h265")
         return MppCodec::H265;
     return MppCodec::H264;
+}
+
+MppBitratePreset parseBitratePreset(const std::string& text, MppBitratePreset fallback)
+{
+    if (text == "low")
+        return MppBitratePreset::Low;
+    if (text == "medium" || text == "normal")
+        return MppBitratePreset::Medium;
+    if (text == "high")
+        return MppBitratePreset::High;
+    if (text == "veryhigh" || text == "ultra")
+        return MppBitratePreset::VeryHigh;
+    return fallback;
+}
+
+bool parseBitrateArg(const char* text, int& bitrate, MppBitratePreset& preset)
+{
+    bitrate = 0;
+    preset = MppBitratePreset::Medium;
+    if (text == nullptr)
+        return true;
+
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    if (end != text && *end == '\0') {
+        bitrate = static_cast<int>(value);
+        return bitrate > 0;
+    }
+
+    const std::string presetText(text);
+    const MppBitratePreset parsedPreset = parseBitratePreset(presetText, preset);
+    if (parsedPreset == preset && presetText != "medium" && presetText != "normal")
+        return false;
+
+    preset = parsedPreset;
+    return true;
 }
 
 bool readFile(const std::string& path, std::vector<unsigned char>& data)
@@ -68,6 +107,16 @@ size_t nv12PayloadSize(int stride, int heightStride)
     return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 3 / 2;
 }
 
+void dmabufSync(int fd, unsigned long flags)
+{
+    if (fd < 0)
+        return;
+
+    dma_buf_sync sync {};
+    sync.flags = flags;
+    (void)ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -90,12 +139,17 @@ int main(int argc, char** argv)
     const int stride = argc > 6 ? parseInt(argv[6], width) : width;
     const int heightStride = argc > 7 ? parseInt(argv[7], height) : height;
     const int fps = argc > 8 ? parseInt(argv[8], 30) : 30;
-    const int bitrate = argc > 9 ? parseInt(argv[9], width * height * fps / 8) : width * height * fps / 8;
-    const int frameCount = argc > 10 ? parseInt(argv[10], 1) : 1;
+    const int requestedFrameCount = argc > 10 ? parseInt(argv[10], -1) : -1;
     const int requestKeyFrameIndex = argc > 11 ? parseInt(argv[11], -1) : -1;
+    int bitrate = 0;
+    MppBitratePreset bitratePreset = MppBitratePreset::Medium;
 
-    if (width <= 0 || height <= 0 || stride < width || heightStride < height || frameCount <= 0) {
+    if (width <= 0 || height <= 0 || stride < width || heightStride < height) {
         std::cerr << "宽高/stride 参数无效\n";
+        return 1;
+    }
+    if (!parseBitrateArg(argc > 9 ? argv[9] : nullptr, bitrate, bitratePreset)) {
+        std::cerr << "码率参数无效，请传正整数或 low/medium/high/veryhigh\n";
         return 1;
     }
 
@@ -109,6 +163,14 @@ int main(int argc, char** argv)
                   << " required=" << frameSize << "\n";
         return 1;
     }
+    const size_t availableFrames = fileData.size() / frameSize;
+    const int frameCount = requestedFrameCount > 0
+        ? std::min<int>(requestedFrameCount, static_cast<int>(availableFrames))
+        : static_cast<int>(availableFrames);
+    if (frameCount <= 0) {
+        std::cerr << "没有可编码的完整 NV12 帧\n";
+        return 1;
+    }
 
     DmaAllocator allocator;
     DmaMemory inputMemory;
@@ -116,7 +178,6 @@ int main(int argc, char** argv)
         std::cerr << "分配输入 DMA 失败: " << allocator.lastError() << "\n";
         return 1;
     }
-    std::memcpy(inputMemory.va(), fileData.data(), frameSize);
 
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -144,8 +205,9 @@ int main(int argc, char** argv)
     config.heightStride = heightStride;
     config.inputFormat = PixelFormat::NV12;
     config.fps = fps;
+    config.bitratePreset = bitratePreset;
     config.bitrate = bitrate;
-    config.gop = 100;
+    config.gop = 15;
 
     if (!encoder.init(config)) {
         std::cerr << "初始化编码器失败: " << encoder.lastError() << "\n";
@@ -171,6 +233,11 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+
+        const size_t offset = static_cast<size_t>(i) * frameSize;
+        dmabufSync(inputMemory.fd(), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        std::memcpy(inputMemory.va(), fileData.data() + offset, frameSize);
+        dmabufSync(inputMemory.fd(), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 
         frame.sequence = static_cast<uint64_t>(i);
         frame.timestampUs = static_cast<uint64_t>(i) * 1000000ULL / static_cast<uint64_t>(fps);
