@@ -1789,3 +1789,92 @@ MJPEG -> JPEGD 解码为 NV12
 ```
 
 下一步需要回到 MPP 接入前的版本，用单路 `/dev/video12`、YUV、`640x480`、QML 只保留一个裸 `MyItem` 的同工况做对照，拆清楚到底是 Qt 渲染、RGA、UVC copy 还是最近改动带来的额外开销。
+
+### Qt 显示链路性能对照
+
+为了拆清楚 CPU 占用来源，今天回到 MPP 接入前的历史提交做了两组板端对照。
+
+#### 1. 老版裸 `MyItem`
+
+测试点：
+
+```text
+commit: fda77b7
+QML: 单个裸 MyItem
+camera: /dev/video12
+format: YUYV
+size: 640x480
+fps: 30
+```
+
+结果：
+
+```text
+DisplaySink fps: 约 30.5
+appqt-demo CPU: 约 21%
+RSS: 约 82MB
+```
+
+线程拆分大概为：
+
+```text
+QSGRenderThread: 5%~6%
+DisplaySink/RGA worker: 4%~5%
+Mali backend: 3%~4%
+CamManager / Qt 主线程 / 其他线程: 剩余部分
+```
+
+中断观察：
+
+```text
+USB: 10s 约 2500 次
+RGA: 10s 约 300 次
+JPEGD: 不动
+VOP/GPU: active
+```
+
+这个结果说明即使没有 MPP，单路 USB YUYV 预览也已经包含：
+
+```text
+UVC 收帧 / 内核拷贝
+CamManager DQBUF/QBUF
+DisplaySink RGA: YUYV -> RGBA
+Qt SceneGraph: RGBA dma-buf -> texture -> 合成显示
+```
+
+#### 2. MPP 前的 NVR QML 布局
+
+测试点：
+
+```text
+commit: f53f88b
+QML: NVR 布局
+camera: /dev/video12
+format: YUYV
+size: 640x480
+fps: 30
+```
+
+结果：
+
+```text
+DisplaySink fps: 约 30.5
+appqt-demo CPU: 约 23%~25%
+RSS: 约 94MB
+```
+
+线程拆分大概为：
+
+```text
+QSGRenderThread: 7%~8%
+DisplaySink/RGA worker: 4%~5%
+Mali backend: 3%~4%
+CamManager / Qt 主线程 / 其他线程: 剩余部分
+```
+
+结论：
+
+- NVR QML 布局本身相比裸 `MyItem` 大约增加 `3%~4%` CPU。
+- 主要增量在 `QSGRenderThread` 和额外 QML/Mali 线程。
+- 这组数据没有 MPP 参与，因此不能把单路 YUYV 的 `20%+` 基础占用归因于 MPP。
+- 后续如果最新版本单路 YUYV 达到约 `30%`，还需要继续拆当前版本相对 `f53f88b` 的新增开销，例如窗口尺寸、等比例 viewport、MouseArea、日志、事件队列和线程调度。
