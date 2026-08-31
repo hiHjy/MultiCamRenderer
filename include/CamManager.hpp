@@ -1,16 +1,21 @@
 #pragma once
 
+#include "DmaBufferPool.hpp"
 #include "FrameHub.hpp"
+#include "MppDecoder.hpp"
 #include "V4L2CameraSource.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
-#include <atomic>
-#include <condition_variable>
+#include "VideoFrame.hpp"
 // 1. CamManager 对外只发布裸帧
 // 2. MJPEG 是 camera 内部输入格式，不暴露给 DisplaySink
 // 3. poll 线程不做 MPP/RGA 重活，只投递 FramePacket
@@ -18,8 +23,54 @@
 // 5. MPP 原始输出不 publish
 // 6. RGA copy 后的稳定 output pool 才 publish
 // 7. output lease 负责归还 decode worker 的稳定 pool
+
+
+
 class CamManager {
 public:
+    // 每路 MJPEG camera 独占一个 DecodeWorker。
+    // 输入侧只保留最新一帧，避免解码排队造成延迟堆积；
+    // 输出侧使用 DmaBufferPool，publish 后由 output lease 归还池子。
+    class DecodeWorker {
+    public:
+        DecodeWorker(int cameraId,
+                     int outputBufferCount,
+                     size_t outputBufferSize,
+                     const std::string& dmaHeapPath,
+                     std::weak_ptr<FrameHub> hub);
+        ~DecodeWorker();
+
+        DecodeWorker(const DecodeWorker&) = delete;
+        DecodeWorker& operator=(const DecodeWorker&) = delete;
+
+        DecodeWorker(DecodeWorker&&) = delete;
+        DecodeWorker& operator=(DecodeWorker&&) = delete;
+
+        bool initialized() const;
+        bool postFrame(FramePacket packet);
+        void shutdown();
+        const std::string& lastError() const;
+
+    private:
+        void workerLoop();
+        void processFrame(FramePacket packet);
+        void setError(const std::string& message);
+
+    private:
+        int m_cameraId = -1;
+        std::weak_ptr<FrameHub> m_hub;
+        std::shared_ptr<DmaBufferPool> m_outputPool;
+        MppDecoder m_decoder {};
+        bool m_initialized = false;
+        bool m_stopping = false;
+        uint64_t m_droppedFrames = 0;
+        std::mutex m_mutex;
+        std::condition_variable m_cv;
+        std::optional<FramePacket> m_pendingPacket;
+        std::thread m_workerThread;
+        std::string m_lastError;
+    };
+
     CamManager();
     ~CamManager();
 
@@ -40,6 +91,9 @@ public:
         PixelFormat format = PixelFormat::Auto;
         int bufferCount = 4;
         std::string dmaHeapPath = "/dev/dma_heap/system";
+        // addCamera() 成功后回填为 V4L2 实际单个输入 buffer 容量。
+        // 外部传入配置时不用填写。
+        size_t bufferCapacity = 0;
     };
 
 	
@@ -48,6 +102,7 @@ public:
         std::shared_ptr<V4L2CameraSource> source;
         CameraState state = CameraState::Created;
         std::string lastError;
+		std::unique_ptr<DecodeWorker> decodeWorker = nullptr;
     };
 
     // 当前内部用 shared_ptr 持有摄像头，pollOnce() 会复制 shared_ptr 快照，

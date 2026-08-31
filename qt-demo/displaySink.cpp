@@ -8,6 +8,27 @@
 
 namespace {
 
+const char* pixelFormatName(PixelFormat format)
+{
+    switch (format) {
+    case PixelFormat::Unknown:
+        return "Unknown";
+    case PixelFormat::Auto:
+        return "Auto";
+    case PixelFormat::NV12:
+        return "NV12";
+    case PixelFormat::YUYV:
+        return "YUYV";
+    case PixelFormat::YUV420P:
+        return "YUV420P";
+    case PixelFormat::RGBA8888:
+        return "RGBA8888";
+    case PixelFormat::MJPEG:
+        return "MJPEG";
+    }
+    return "Unknown";
+}
+
 void dmabufSync(int fd, __u64 flags)
 {
     if (fd < 0)
@@ -97,7 +118,7 @@ void DisplaySink::processFrame(FramePacket packet)
 {
     const VideoFrame &frame = packet.frame;
     // DisplaySink worker 线程调用。
-    // 通过 RgaEngine::rga() 把摄像头 YUYV 转成 RGBA，存进我们私有 buffer。
+    // 通过 RgaEngine::rga() 把上游裸帧转成 RGBA，存进我们私有 buffer。
     if (!ensureRgbaPoolInitialized(frame))
         return;
 
@@ -162,8 +183,12 @@ void DisplaySink::processFrame(FramePacket packet)
         const std::chrono::duration<double> elapsed = now - m_fpsLogStart;
         if (elapsed.count() > 0.0) {
             LOG_INFO("DisplaySink", "fps=" << (m_fpsLogFrames / elapsed.count())
+					<< " cameraId=" 	<< frame.streamId
+					<< " inputFormat=" << pixelFormatName(frame.format)
+                    << " width= " << df.width
+					<< " height= " << df.height
                      << " sequence=" << df.sequence
-                     << " buffer=" << df.bufferIndex);
+                     << " dropped=" << m_droppedFrames);
         }
         m_fpsLogFrames = 0;
         m_fpsLogStart = now;

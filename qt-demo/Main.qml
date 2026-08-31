@@ -12,7 +12,7 @@ Window {
 	visible: true
 	title: "MultiCam Renderer"
 	color: "#1b1f25"
-	property var demoCameraPaths: ["/dev/video10", "/dev/video12"]
+	property var demoCameraPaths: ["/dev/video12"]
 	property int nextDemoCameraIndex: 0
 
 	function addDemoCameraToNextTile() {
@@ -247,7 +247,6 @@ Window {
 						easing.type: Easing.InOutQuad
 					}
 				}
-
 
 				// tile 是布局分配到的格子；videoViewport 才是实际视频显示范围。
 				// 无论格子是宽是窄，videoViewport 都保持 16:9 并居中，空余处为黑边。

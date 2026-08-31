@@ -2,6 +2,7 @@
 #include "FrameHub.hpp"
 #include "Log.hpp"
 #include "VideoFrame.hpp"
+#include "VideoTypes.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -17,6 +18,26 @@
 #include <vector>
 
 namespace {
+
+const char* pixelFormatName(PixelFormat format) {
+	switch (format) {
+	case PixelFormat::Unknown:
+		return "Unknown";
+	case PixelFormat::Auto:
+		return "Auto";
+	case PixelFormat::NV12:
+		return "NV12";
+	case PixelFormat::YUYV:
+		return "YUYV";
+	case PixelFormat::YUV420P:
+		return "YUV420P";
+	case PixelFormat::RGBA8888:
+		return "RGBA8888";
+	case PixelFormat::MJPEG:
+		return "MJPEG";
+	}
+	return "Unknown";
+}
 
 PixelFormat toV4L2PixelFormat(PixelFormat format) {
 	switch (format) {
@@ -47,7 +68,181 @@ V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig &c
 	return v4l2Config;
 }
 
+int alignUp(int value, int alignment) {
+	if (alignment <= 1) {
+		return value;
+	}
+	return ((value + alignment - 1) / alignment) * alignment;
+}
+
+size_t mppDecodedNv12BufferSize(int width, int height) {
+	if (width <= 0 || height <= 0) {
+		return 0;
+	}
+
+	const int stride = alignUp(width, 16);
+	const int heightStride = alignUp(height, 16);
+	return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 2;
+}
+
 } // namespace
+
+CamManager::DecodeWorker::DecodeWorker(int cameraId,
+									   int outputBufferCount,
+									   size_t outputBufferSize,
+									   const std::string& dmaHeapPath,
+									   std::weak_ptr<FrameHub> hub)
+	: m_cameraId(cameraId),
+	  m_hub(std::move(hub)),
+	  m_outputPool(std::make_shared<DmaBufferPool>()) {
+	if (outputBufferCount <= 0) {
+		setError("DecodeWorker outputBufferCount 必须大于 0");
+		return;
+	}
+
+	if (outputBufferSize == 0) {
+		setError("DecodeWorker outputBufferSize 不能为 0");
+		return;
+	}
+
+	if (!m_decoder.init(MppCodec::MJPEG)) {
+		setError("初始化 MJPEG 解码器失败: " + m_decoder.lastError());
+		return;
+	}
+
+	if (!m_outputPool->init(outputBufferCount, outputBufferSize, dmaHeapPath)) {
+		setError("初始化 MJPEG 解码输出池失败: " + m_outputPool->lastError());
+		return;
+	}
+
+	m_initialized = true;
+	m_lastError.clear();
+	m_workerThread = std::thread(&DecodeWorker::workerLoop, this);
+	LOG_INFO("CamManager", "cameraId=" << m_cameraId
+						   << " MJPEG DecodeWorker 初始化完成"
+						   << " outputBuffers=" << outputBufferCount
+						   << " outputBufferSize=" << outputBufferSize);
+}
+
+CamManager::DecodeWorker::~DecodeWorker() {
+	shutdown();
+}
+
+bool CamManager::DecodeWorker::initialized() const {
+	return m_initialized;
+}
+
+bool CamManager::DecodeWorker::postFrame(FramePacket packet) {
+	if (!m_initialized) {
+		setError("DecodeWorker 尚未初始化");
+		return false;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_stopping) {
+			setError("DecodeWorker 正在停止");
+			return false;
+		}
+
+		if (m_pendingPacket.has_value()) {
+			++m_droppedFrames;
+			LOG_WARN("CamManager", "cameraId=" << m_cameraId
+								   << " MJPEG decode pending frame dropped count="
+								   << m_droppedFrames);
+		}
+		m_pendingPacket = std::move(packet);
+	}
+
+	m_cv.notify_one();
+	return true;
+}
+
+void CamManager::DecodeWorker::shutdown() {
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_stopping = true;
+		m_pendingPacket.reset();
+	}
+
+	m_cv.notify_one();
+	if (m_workerThread.joinable()) {
+		m_workerThread.join();
+	}
+}
+
+const std::string& CamManager::DecodeWorker::lastError() const {
+	return m_lastError;
+}
+
+void CamManager::DecodeWorker::workerLoop() {
+	while (true) {
+		FramePacket packet;
+		{
+			std::unique_lock<std::mutex> lock(m_mutex);
+			m_cv.wait(lock, [this] {
+				return m_stopping || m_pendingPacket.has_value();
+			});
+
+			if (m_stopping && !m_pendingPacket) {
+				break;
+			}
+
+			packet = std::move(*m_pendingPacket);
+			m_pendingPacket.reset();
+		}
+
+		processFrame(std::move(packet));
+	}
+}
+
+void CamManager::DecodeWorker::processFrame(FramePacket packet) {
+	if (!m_outputPool) {
+		setError("DecodeWorker 输出池不存在");
+		return;
+	}
+
+	VideoFrame* outputFrame = m_outputPool->acquireFrame();
+	if (outputFrame == nullptr) {
+		LOG_WARN("CamManager", "cameraId=" << m_cameraId
+							   << " MJPEG decode output pool busy，丢弃本帧: "
+							   << m_outputPool->lastError());
+		return;
+	}
+
+	if (!m_decoder.decodeMjpeg(packet.frame, *outputFrame)) {
+		const std::string error = "MJPEG 解码失败: " + m_decoder.lastError();
+		(void)m_outputPool->releaseFrame(outputFrame);
+		setError(error);
+		LOG_ERROR("CamManager", "cameraId=" << m_cameraId << ' ' << error);
+		return;
+	}
+
+	packet.lease.reset();
+
+	outputFrame->streamId = m_cameraId;
+	FramePacket decodedPacket {
+		.frame = *outputFrame,
+		.lease = std::make_shared<FrameLease>(
+			[pool = m_outputPool, outputFrame]() {
+				(void)pool->releaseFrame(outputFrame);
+			}),
+	};
+
+	std::shared_ptr<FrameHub> hub = m_hub.lock();
+	if (!hub) {
+		return;
+	}
+
+	if (!hub->publishFrame(decodedPacket)) {
+		setError("发布 MJPEG 解码帧失败: " + hub->lastError());
+		LOG_ERROR("CamManager", "cameraId=" << m_cameraId << ' ' << m_lastError);
+	}
+}
+
+void CamManager::DecodeWorker::setError(const std::string& message) {
+	m_lastError = message;
+}
 
 CamManager::CamManager() {
 	m_returnEventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -92,6 +287,15 @@ int CamManager::addCamera(const CameraConfig &config) {
 	slot.source = std::make_shared<V4L2CameraSource>(cameraId);
 	slot.state = CameraState::Created;
 
+	LOG_INFO("CamManager", "cameraId=" << cameraId
+						   << " request config"
+						   << " device=" << config.devicePath
+						   << " size=" << config.width << "x" << config.height
+						   << " fps=" << config.fps
+						   << " format=" << pixelFormatName(config.format)
+						   << " buffers=" << config.bufferCount
+						   << " dmaHeap=" << config.dmaHeapPath);
+
 	V4L2CameraSource &camera = *slot.source;
 	if (!camera.openDevice(config.devicePath)) {
 		slot.state = CameraState::Error;
@@ -115,8 +319,52 @@ int CamManager::addCamera(const CameraConfig &config) {
 		return -1;
 	}
 
+
 	slot.state = CameraState::Ready;
 	auto hub = std::make_shared<FrameHub>(cameraId);
+	V4L2CameraSource::CamConfig actualConfig{};
+	if (!camera.getCurrentConfig(actualConfig)) {
+		slot.state = CameraState::Error;
+		slot.lastError = "获取摄像头实际配置失败: " + camera.lastError();
+		setError(slot.lastError);
+		return -1;
+	}
+
+	slot.config.width = actualConfig.width;
+	slot.config.height = actualConfig.height;
+	slot.config.fps = actualConfig.fps;
+	slot.config.format = actualConfig.format;
+	slot.config.bufferCapacity = actualConfig.bufferCapacity;
+
+	LOG_INFO("CamManager", "cameraId=" << cameraId
+						   << " accepted config"
+						   << " device=" << config.devicePath
+						   << " size=" << actualConfig.width << "x" << actualConfig.height
+						   << " fps=" << actualConfig.fps
+						   << " format=" << pixelFormatName(actualConfig.format)
+						   << " inputBufferCapacity=" << actualConfig.bufferCapacity
+						   << " buffers=" << config.bufferCount);
+
+	if (actualConfig.format == PixelFormat::MJPEG) {
+		const size_t outputBufferSize = mppDecodedNv12BufferSize(actualConfig.width, actualConfig.height);
+		LOG_INFO("CamManager", "cameraId=" << cameraId
+							   << " MJPEG decode output config"
+							   << " format=NV12"
+							   << " size=" << actualConfig.width << "x" << actualConfig.height
+							   << " outputBufferSize=" << outputBufferSize
+							   << " outputBuffers=" << config.bufferCount);
+		slot.decodeWorker = std::make_unique<DecodeWorker>(cameraId,
+															config.bufferCount,
+															outputBufferSize,
+															config.dmaHeapPath,
+															hub);
+		if (!slot.decodeWorker->initialized()) {
+			slot.state = CameraState::Error;
+			slot.lastError = slot.decodeWorker->lastError();
+			setError(slot.lastError);
+			return -1;
+		}
+	}
 
 	m_cameraMap.emplace(cameraId, std::move(slot));
 	m_frameHubMap.emplace(cameraId, std::move(hub));
@@ -268,6 +516,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 	std::vector<pollfd> fds;
 	std::vector<std::shared_ptr<V4L2CameraSource>> cameras;
 	std::vector<std::shared_ptr<FrameHub>> hubs;
+	std::vector<DecodeWorker*> decodeWorkers;
 	bool hasCameraFd = false;
 
 	{
@@ -275,6 +524,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 		fds.reserve(m_cameraMap.size() + 1);
 		cameras.reserve(m_cameraMap.size() + 1);
 		hubs.reserve(m_cameraMap.size() + 1);
+		decodeWorkers.reserve(m_cameraMap.size() + 1);
 
 		// 这里复制 fd 和 shared_ptr 快照后立刻释放锁，避免 poll 阻塞期间卡住
 		// addCamera/stopAllCameras 等管理操作，也避免 delCamera() 后快照对象悬空。
@@ -294,6 +544,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 			cameras.push_back(camera);
 			auto hubIt = m_frameHubMap.find(camera->cameraId());
 			hubs.push_back(hubIt == m_frameHubMap.end() ? nullptr : hubIt->second);
+			decodeWorkers.push_back(slot.decodeWorker.get());
 			hasCameraFd = true;
 		}
 	}
@@ -324,6 +575,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 		fds.push_back(pfd);
 		cameras.push_back(nullptr);
 		hubs.push_back(nullptr);
+		decodeWorkers.push_back(nullptr);
 	}
 
 	const int ret = ::poll(fds.data(), fds.size(), timeoutMs);
@@ -347,6 +599,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 
 		std::shared_ptr<V4L2CameraSource> camera = cameras[i];
 		std::shared_ptr<FrameHub> hub = hubs[i];
+		DecodeWorker* decodeWorker = decodeWorkers[i];
 
 		if (camera == nullptr) {
 			if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
@@ -434,7 +687,17 @@ bool CamManager::pollOnce(int timeoutMs) {
 			continue;
 		}
 
-		if (!hub) {
+		if (packet.frame.format == PixelFormat::MJPEG) {
+			if (!decodeWorker) {
+				publishOk = false;
+				publishError = "MJPEG 摄像头缺少 DecodeWorker";
+			} else if (!decodeWorker->postFrame(std::move(packet))) {
+				publishOk = false;
+				publishError = decodeWorker->lastError();
+			} else {
+				continue;
+			}
+		} else if (!hub) {
 			publishOk = false;
 			publishError = "cameraId 对应的 FrameHub 不存在";
 		} else {

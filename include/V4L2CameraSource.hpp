@@ -42,6 +42,9 @@ public:
         int height = 0;
         int fps = 0;
         PixelFormat format = PixelFormat::Auto;
+        // V4L2 当前格式对应的单个 buffer 容量，来自 sizeimage / 实际 DMA 分配。
+        // 对 MJPEG 来说这是压缩输入 buffer 的容量，不是解码后 NV12 的容量。
+        size_t bufferCapacity = 0;
     };
 
     // dequeue 出来的 V4L2 buffer 借用视图。

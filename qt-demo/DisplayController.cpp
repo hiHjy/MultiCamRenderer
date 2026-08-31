@@ -17,8 +17,8 @@ int DisplayController::addLocalCam(const QString& path)
 	config.devicePath = path.toStdString();
 	config.width = 640;
 	config.height = 360;
-	config.fps = 5;
-	config.format = PixelFormat::YUYV;
+	config.fps = 30;
+	config.format = PixelFormat::MJPEG;
 
 	const int cameraId = camMgr->addCamera(config);
 	if (cameraId < 0) {

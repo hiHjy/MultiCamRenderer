@@ -7,7 +7,6 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <thread>
 
 // 编译期日志等级控制：
 // - 默认 LOG_ACTIVE_LEVEL = LOG_LEVEL_INFO，输出 INFO/WARN/ERROR。
@@ -104,14 +103,14 @@ inline void write(Level level,
                   const char* function,
                   const std::string& message)
 {
+    (void)file;
     std::lock_guard<std::mutex> lock(logMutex());
     std::ostream& os = (level == Level::Error || level == Level::Warn) ? std::cerr : std::cout;
     os << nowText()
        << " [" << levelName(level) << "]"
-       << " [" << (module ? module : "") << "]"
-       << " [" << std::this_thread::get_id() << "] "
-       << shortFile(file) << ":" << line << " " << (function ? function : "")
-       << " ==> " << message << std::endl;
+       << " [" << (module ? module : "") << ":" << line << "]"
+       << " " << (function ? function : "")
+       << " => " << message << std::endl;
 }
 
 } // namespace logx

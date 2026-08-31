@@ -271,6 +271,7 @@ bool V4L2CameraSource::configure(const CamConfig& cfg)
         m_currentConfig.height = m_currentMode.height;
         m_currentConfig.fps = m_currentMode.fps;
         m_currentConfig.format = m_currentMode.format;
+        m_currentConfig.bufferCapacity = static_cast<size_t>(m_currentMode.sizeimg);
 
         m_state = State::Configured;
         m_lastError.clear();
@@ -344,6 +345,10 @@ bool V4L2CameraSource::setupDmaImportBuffers(
         buffer.memory = std::move(memory);
         buffer.queued = false;
         m_buffers.push_back(std::move(buffer));
+    }
+
+    if (!m_buffers.empty()) {
+        m_currentConfig.bufferCapacity = m_buffers.front().memory.size();
     }
 
     for (DmaBuffer& buffer : m_buffers) {

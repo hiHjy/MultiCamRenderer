@@ -1667,3 +1667,125 @@ sintel_720p_10s_5mb.mp4
 ```
 
 这些文件位于 build 目录下，不纳入 git。
+
+## 2026-08-31
+
+### 摄像头 MJPEG 解码链路接入
+
+今天把 USB 摄像头 MJPEG 采集接入到了现有摄像头基座里，保持对外仍然发布裸帧：
+
+```text
+V4L2 DQBUF MJPEG
+  -> CamManager 投递到每路 DecodeWorker
+  -> MPP JPEGD 解码
+  -> 解码输出写入 DecodeWorker 私有 DmaBufferPool
+  -> 发布 NV12 FramePacket 到 FrameHub
+  -> DisplaySink / 其他 Sink 继续按裸帧处理
+```
+
+关键设计：
+
+- `CameraSlot` 持有 `std::unique_ptr<DecodeWorker>`，每路 MJPEG 摄像头一个解码 worker。
+- `DecodeWorker` 输入侧只保留最新一帧，避免解码排队造成延迟堆积。
+- 被覆盖的 pending MJPEG packet 会自动释放 input lease，原始 V4L2 buffer 回到 return queue。
+- 解码输出侧使用 `DmaBufferPool`，不是单帧 buffer，因为下游 sink 可能异步持有输出帧。
+- output `FrameLease` 捕获 `std::shared_ptr<DmaBufferPool>` 和输出 `VideoFrame*`，最后一个 sink 释放后归还解码输出池。
+- MJPEG 解码输出池按 MPP 外部 buffer 习惯预留：
+
+```text
+align16(width) * align16(height) * 2
+```
+
+这里没有按 NV12 理论 payload 的 `* 3 / 2` 申请，避免后续 MPP 对额外信息空间有要求时踩内存。
+
+### 编解码公共类型整理
+
+新增：
+
+```text
+include/hw/MppTypes.hpp
+```
+
+把 `MppCodec` 从 `MppDecoder.hpp` 中抽出来，供编码器和解码器共同使用：
+
+```cpp
+enum class MppCodec {
+    MJPEG,
+    H264,
+    H265,
+};
+```
+
+### 配置和显示日志增强
+
+`CamManager::addCamera()` 现在会打印两段关键日志：
+
+- 上层请求配置：设备、宽高、fps、像素格式、buffer 数量、dma heap。
+- V4L2 驱动最终接受配置：实际宽高、实际 fps、实际像素格式、输入 buffer capacity。
+
+如果是 MJPEG，还会额外打印解码输出池配置：
+
+```text
+format=NV12
+outputBufferSize
+outputBuffers
+```
+
+`DisplaySink` 的限流 fps 日志也补充了更多信息：
+
+- 输入格式、输入宽高、输入 stride。
+- 输入 `bytesUsed / capacity`。
+- 输出 RGBA 宽高、输出 stride、输出 buffer index。
+- 当前 sequence 和累计 dropped。
+
+通用日志格式也收短为：
+
+```text
+HH:MM:SS.mmm [LEVEL] [Module:Line] function => message
+```
+
+去掉了线程 id，避免板端日志前缀过长。
+
+### 板端 MJPEG Smoke Test
+
+在 RK3568 板端使用临时 smoke 程序验证核心链路，不经过 Qt 显示：
+
+```text
+/dev/video10 MJPEG 640x480@30
+  -> DecodeWorker
+  -> NV12 640x480
+  -> minimal Sink
+```
+
+结果：
+
+```text
+单路 /dev/video10：5s 收到 72 帧
+单路 /dev/video12：5s 收到 142 帧
+双路 /dev/video10 + /dev/video12：5s 分别收到约 85 / 89 帧
+```
+
+这说明：
+
+- `CamManager -> DecodeWorker -> MPP MJPEG decode -> FrameHub -> Sink` 闭环已跑通。
+- sink 收到的是解码后的 `NV12`，不是压缩 MJPEG。
+- `/dev/video10` 和 `/dev/video12` 的实际输出节奏不同，后续做性能对比需要固定同一设备和同一配置。
+
+### 当前待确认问题
+
+板端 Qt demo 两路 MJPEG 显示时进程 CPU 约 `68%~72%`，但线程拆分后发现大头不完全在 MJPEG 解码：
+
+- `QSGRenderThread` 经常 `20%~30%`。
+- Mali 后台线程约 `8%~11%`。
+- `mpp_dec_parser` 线程合计约几个到十来个点。
+- `jpegd / rga / vop` 中断都按帧增长。
+
+初步判断当前高 CPU 主要是完整显示链路成本：
+
+```text
+MJPEG -> JPEGD 解码为 NV12
+      -> DisplaySink RGA 转 RGBA
+      -> Qt SceneGraph 导入纹理并合成显示
+```
+
+下一步需要回到 MPP 接入前的版本，用单路 `/dev/video12`、YUV、`640x480`、QML 只保留一个裸 `MyItem` 的同工况做对照，拆清楚到底是 Qt 渲染、RGA、UVC copy 还是最近改动带来的额外开销。
