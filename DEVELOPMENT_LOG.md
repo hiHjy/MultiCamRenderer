@@ -1878,3 +1878,112 @@ CamManager / Qt 主线程 / 其他线程: 剩余部分
 - 主要增量在 `QSGRenderThread` 和额外 QML/Mali 线程。
 - 这组数据没有 MPP 参与，因此不能把单路 YUYV 的 `20%+` 基础占用归因于 MPP。
 - 后续如果最新版本单路 YUYV 达到约 `30%`，还需要继续拆当前版本相对 `f53f88b` 的新增开销，例如窗口尺寸、等比例 viewport、MouseArea、日志、事件队列和线程调度。
+
+### DRM 直显链路验证
+
+为了判断 Qt Quick 显示链路本身的消耗，今天把之前的 `drm_test` 整理进项目 `drm/` 目录，并新增一个最小摄像头直显 demo：
+
+```text
+drm/cam_drm_sink_demo.cpp
+drm/wsl-build-cam-demo.sh
+```
+
+这个 demo 复用当前摄像头基座：
+
+```text
+CamManager
+  -> FrameHub
+  -> DrmSink
+```
+
+`DrmSink` 支持两条测试路径：
+
+```text
+YUYV 摄像头帧
+  -> RGA 转 NV12
+  -> DRM plane 直显
+
+MJPEG 摄像头帧
+  -> DecodeWorker / MPP JPEGD 解码成 NV12
+  -> DRM plane 直显
+```
+
+板端测试命令示例：
+
+```bash
+cd /root/nfs/MultiCamRenderer/drm/build-wsl-aarch64
+./cam_drm_sink_demo /dev/video12 20 yuyv
+./cam_drm_sink_demo /dev/video12 20 mjpeg
+```
+
+#### 1. YUYV -> RGA NV12 -> DRM
+
+测试配置：
+
+```text
+camera: /dev/video12
+format: YUYV
+size: 640x480
+fps: 30
+```
+
+结果：
+
+```text
+DrmSink fps: 约 30.5
+cam_drm_sink_demo CPU: 约 5%~6%
+RSS: 约 3.5MB
+```
+
+线程观察：
+
+```text
+主线程基本空闲
+DrmSink worker 约 5%~6%
+```
+
+#### 2. MJPEG -> MPP JPEGD NV12 -> DRM
+
+测试配置：
+
+```text
+camera: /dev/video12
+format: MJPEG
+size: 640x480
+fps: 30
+```
+
+结果：
+
+```text
+DrmSink fps: 约 30.5
+cam_drm_sink_demo CPU: 约 13%~14%
+RSS: 约 4.5MB
+```
+
+线程观察：
+
+```text
+mpp_dec_parser 约几个点
+DecodeWorker / DrmSink 约 8% 左右
+CamManager poll 线程约 2% 左右
+```
+
+中断观察：
+
+```text
+MJPEG 直显路径：JPEGD / VOP active，RGA 中断基本不增长
+YUYV 直显路径：RGA / VOP active，JPEGD 不动
+```
+
+结论：
+
+- 直接 DRM 预览明显比 Qt Quick 预览省 CPU 和内存。
+- 当前 `CamManager + FrameHub + Sink + FrameLease` 基座没有暴露出明显性能瓶颈。
+- Qt Quick 路径适合 UI、交互、布局和开发效率；DRM 路径适合后续高密度 NVR 预览。
+- 后续可以保留两种显示后端：
+
+```text
+Qt Quick Sink: UI 友好，适合配置页、调试页、轻量预览。
+DRM Sink: 性能优先，适合多路实时预览主画面。
+```

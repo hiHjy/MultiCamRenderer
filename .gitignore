@@ -23,5 +23,7 @@ compile_flags.txt
 build-wsl-aarch64/
 deploy-wsl-aarch64/
 compile_commands.json.bak-mixed-paths
-.gitignore
 compile_commands.json.bak-old-path
+
+# DRM test local build output
+drm/build-wsl-aarch64/
