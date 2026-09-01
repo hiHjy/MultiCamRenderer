@@ -6,70 +6,6 @@
 #include <cstring>
 #include <sstream>
 
-namespace {
-
-int alignUp(int value, int alignment)
-{
-    if (alignment <= 1)
-        return value;
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-int bytesPerPixelForFormat(PixelFormat format)
-{
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-        return 1;
-    case PixelFormat::YUYV:
-        return 2;
-    case PixelFormat::RGBA8888:
-        return 4;
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 0;
-    }
-    return 0;
-}
-
-int minDimensionAlignmentForFormat(PixelFormat format)
-{
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-    case PixelFormat::YUYV:
-        return 2;
-    case PixelFormat::RGBA8888:
-        return 1;
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 1;
-    }
-    return 1;
-}
-
-int alignedStridePixelsForFormat(PixelFormat format,
-                                 int visibleWidth,
-                                 int byteAlignment)
-{
-    const int bpp = bytesPerPixelForFormat(format);
-    const int dimensionAlignment = minDimensionAlignmentForFormat(format);
-    if (bpp <= 0)
-        return visibleWidth;
-
-    int stride = alignUp(visibleWidth, dimensionAlignment);
-    if (byteAlignment > 0) {
-        const int alignedBytes = alignUp(stride * bpp, byteAlignment);
-        stride = alignUp((alignedBytes + bpp - 1) / bpp, dimensionAlignment);
-    }
-
-    return stride;
-}
-
-} // namespace
-
 bool RgaEngine::rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& op)
 {
     if (!validateFrame(src, "src") || !validateDmaFrame(dst, "dst")) {
@@ -217,27 +153,11 @@ size_t RgaEngine::bufferSizeFor(PixelFormat format,
                                 int height,
                                 int strideByteAlignment)
 {
-    if (width <= 0 || height <= 0)
-        return 0;
-
-    const int dimensionAlignment = minDimensionAlignmentForFormat(format);
-    const int stride = alignedStridePixelsForFormat(format, width, strideByteAlignment);
-    const int heightStride = alignUp(height, dimensionAlignment);
-
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-        return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 3 / 2;
-    case PixelFormat::YUYV:
-        return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 2;
-    case PixelFormat::RGBA8888:
-        return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 4;
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 0;
-    }
-    return 0;
+    return videoFrameBufferSizeFor(format,
+                                   width,
+                                   height,
+                                   strideByteAlignment,
+                                   VideoBufferSizeMode::Payload);
 }
 
 int RgaEngine::toRgaFormat(PixelFormat format)
@@ -411,7 +331,7 @@ bool RgaEngine::normalizeDstLayout(VideoFrame& dst, const RgaOperation& op)
     }
 
     if (dst.heightStride <= 0 || dst.heightStride < dst.height) {
-        dst.heightStride = alignUp(dst.height, minDimensionAlignment(dst.format));
+        dst.heightStride = videoFrameAlignedHeightStride(dst.format, dst.height);
     }
 
     return true;
@@ -473,19 +393,19 @@ bool RgaEngine::validateStrideAlignment(const VideoFrame& frame,
 
 int RgaEngine::bytesPerPixel(PixelFormat format) const
 {
-    return bytesPerPixelForFormat(format);
+    return videoFrameBytesPerPixelForStride(format);
 }
 
 int RgaEngine::minDimensionAlignment(PixelFormat format) const
 {
-    return minDimensionAlignmentForFormat(format);
+    return videoFrameMinDimensionAlignment(format);
 }
 
 int RgaEngine::alignedStridePixels(PixelFormat format,
                                    int visibleWidth,
                                    int byteAlignment) const
 {
-    return alignedStridePixelsForFormat(format, visibleWidth, byteAlignment);
+    return videoFrameAlignedStride(format, visibleWidth, byteAlignment);
 }
 
 bool RgaEngine::validateSameFormat(const VideoFrame& src, const VideoFrame& dst)
@@ -537,20 +457,20 @@ int RgaEngine::effectiveStride(const VideoFrame& frame) const
 {
     // 上层没有显式指定 stride 时，按紧密排布处理。
     // 如果要 64 字节等硬件对齐，调用 RGA 前手动填 frame.stride。
-    return frame.stride > 0 ? frame.stride : frame.width;
+    return videoFrameEffectiveStride(frame);
 }
 
 int RgaEngine::effectiveHeightStride(const VideoFrame& frame) const
 {
     // V4L2 当前没有可靠的纵向 stride 就保持 0。
     // RGA 包装时把 0 当作 visible height；MPP 解码输出有 ver_stride 时再填真实值。
-    return frame.heightStride > 0 ? frame.heightStride : frame.height;
+    return videoFrameEffectiveHeightStride(frame);
 }
 
 size_t RgaEngine::requiredSize(const VideoFrame& frame)
 {
-    const int widthStride = effectiveStride(frame);
-    const int heightStride = effectiveHeightStride(frame);
+    const int widthStride = videoFrameEffectiveStride(frame);
+    const int heightStride = videoFrameEffectiveHeightStride(frame);
     if (widthStride <= 0 || heightStride <= 0) {
         setError("RGA stride 无效");
         return 0;
@@ -559,13 +479,9 @@ size_t RgaEngine::requiredSize(const VideoFrame& frame)
     switch (frame.format) {
     case PixelFormat::NV12:
     case PixelFormat::YUV420P:
-        // NV12/YUV420P 都按 1.5 bytes/pixel 估算底层容量，
-        // 这里使用 stride 后的布局尺寸，不使用 visible width/height。
-        return static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride) * 3 / 2;
     case PixelFormat::YUYV:
-        return static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride) * 2;
     case PixelFormat::RGBA8888:
-        return static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride) * 4;
+        return videoFrameBufferSizeFor(frame.format, widthStride, heightStride);
     case PixelFormat::MJPEG:
         setError("RGA 不能计算 MJPEG 压缩格式的裸帧 buffer size，需要先解码");
         return 0;

@@ -16,23 +16,28 @@
 extern "C" {
 #endif
 
-typedef struct FrameInfo {
-    RK_U32 width;
-    RK_U32 height;
-    RK_U32 hor_stride;
-    RK_U32 ver_stride;
-    size_t packet_size;
-    size_t buffer_size;
-} FrameInfo;
-
 typedef void (*mpp_decoded_frame_callback_t)(int fd,
-                                             int index,
                                              RK_U32 width,
                                              RK_U32 height,
                                              RK_U32 hor_stride,
                                              RK_U32 ver_stride,
                                              size_t size,
                                              void *userdata);
+
+typedef struct RkMppInputPacket {
+    int fd;
+    size_t capacity;
+    size_t packet_size;
+} RkMppInputPacket;
+
+typedef struct RkMppOutputFrame {
+    int fd;
+    size_t capacity;
+    int width;
+    int height;
+    int stride;
+    int height_stride;
+} RkMppOutputFrame;
 
 typedef struct MppDecoderAdvance {
     MppCtx dec_ctx;
@@ -51,7 +56,6 @@ typedef struct MppDecoderAdvance {
     void *frame_callback_userdata;
 } MppDecoderAdvance;
 
-int mjpeg_get_frame_info_from_dmafd(int fd, size_t packet_size, FrameInfo *info);
 int dump_nv12_frame_from_dmafd(const char *path,
                                int fd,
                                RK_U32 width,
@@ -65,14 +69,8 @@ void rk_mpp_decoder_advance_set_frame_callback(
 int rk_mpp_decoder_advance_init(MppDecoderAdvance *ctx, MppCodingType coding);
 void rk_mpp_decoder_advance_deinit(MppDecoderAdvance *ctx);
 int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx,
-                                   int fd,
-                                   int dstfd,
-                                   size_t dst_capacity,
-                                   int index,
-                                   int w,
-                                   int h,
-                                   int stride,
-                                   int size);
+                                   const RkMppInputPacket *input,
+                                   const RkMppOutputFrame *output);
 
 #ifdef __cplusplus
 }

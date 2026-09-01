@@ -68,35 +68,32 @@ V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig &c
 	return v4l2Config;
 }
 
-int alignUp(int value, int alignment) {
-	if (alignment <= 1) {
-		return value;
-	}
-	return ((value + alignment - 1) / alignment) * alignment;
-}
-
-size_t mppDecodedNv12BufferSize(int width, int height) {
-	if (width <= 0 || height <= 0) {
-		return 0;
-	}
-
-	const int stride = alignUp(width, 16);
-	const int heightStride = alignUp(height, 16);
-	return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 2;
-}
-
 } // namespace
 
 CamManager::DecodeWorker::DecodeWorker(int cameraId,
 									   int outputBufferCount,
 									   size_t outputBufferSize,
+									   int outputWidth,
+									   int outputHeight,
+									   int outputStride,
+									   int outputHeightStride,
 									   const std::string& dmaHeapPath,
 									   std::weak_ptr<FrameHub> hub)
 	: m_cameraId(cameraId),
+	  m_outputWidth(outputWidth),
+	  m_outputHeight(outputHeight),
+	  m_outputStride(outputStride),
+	  m_outputHeightStride(outputHeightStride),
 	  m_hub(std::move(hub)),
 	  m_outputPool(std::make_shared<DmaBufferPool>()) {
 	if (outputBufferCount <= 0) {
 		setError("DecodeWorker outputBufferCount 必须大于 0");
+		return;
+	}
+
+	if (m_outputWidth <= 0 || m_outputHeight <= 0 ||
+		m_outputStride <= 0 || m_outputHeightStride <= 0) {
+		setError("DecodeWorker 输出 layout 无效");
 		return;
 	}
 
@@ -120,6 +117,9 @@ CamManager::DecodeWorker::DecodeWorker(int cameraId,
 	m_workerThread = std::thread(&DecodeWorker::workerLoop, this);
 	LOG_INFO("CamManager", "cameraId=" << m_cameraId
 						   << " MJPEG DecodeWorker 初始化完成"
+						   << " outputSize=" << m_outputWidth << "x" << m_outputHeight
+						   << " outputStride=" << m_outputStride
+						   << " outputHeightStride=" << m_outputHeightStride
 						   << " outputBuffers=" << outputBufferCount
 						   << " outputBufferSize=" << outputBufferSize);
 }
@@ -209,6 +209,12 @@ void CamManager::DecodeWorker::processFrame(FramePacket packet) {
 							   << m_outputPool->lastError());
 		return;
 	}
+
+	outputFrame->width = m_outputWidth;
+	outputFrame->height = m_outputHeight;
+	outputFrame->stride = m_outputStride;
+	outputFrame->heightStride = m_outputHeightStride;
+	outputFrame->format = PixelFormat::NV12;
 
 	if (!m_decoder.decodeMjpeg(packet.frame, *outputFrame)) {
 		const std::string error = "MJPEG 解码失败: " + m_decoder.lastError();
@@ -346,16 +352,29 @@ int CamManager::addCamera(const CameraConfig &config) {
 						   << " buffers=" << config.bufferCount);
 
 	if (actualConfig.format == PixelFormat::MJPEG) {
-		const size_t outputBufferSize = mppDecodedNv12BufferSize(actualConfig.width, actualConfig.height);
+		const int outputStride = videoFrameAlignedStride(PixelFormat::NV12, actualConfig.width, 16);
+		const int outputHeightStride =
+			videoFrameAlignedHeightStride(PixelFormat::NV12, actualConfig.height, 16);
+		const size_t outputBufferSize =
+			videoFrameBufferSizeFor(PixelFormat::NV12,
+									outputStride,
+									outputHeightStride,
+									VideoBufferSizeMode::MppDecoderOutput);
 		LOG_INFO("CamManager", "cameraId=" << cameraId
 							   << " MJPEG decode output config"
 							   << " format=NV12"
 							   << " size=" << actualConfig.width << "x" << actualConfig.height
+							   << " stride=" << outputStride
+							   << " heightStride=" << outputHeightStride
 							   << " outputBufferSize=" << outputBufferSize
 							   << " outputBuffers=" << config.bufferCount);
 		slot.decodeWorker = std::make_unique<DecodeWorker>(cameraId,
 															config.bufferCount,
 															outputBufferSize,
+															actualConfig.width,
+															actualConfig.height,
+															outputStride,
+															outputHeightStride,
 															config.dmaHeapPath,
 															hub);
 		if (!slot.decodeWorker->initialized()) {

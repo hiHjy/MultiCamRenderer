@@ -78,16 +78,20 @@ static RK_U32 align_to(RK_U32 value, RK_U32 alignment)
 	return (value + alignment - 1) & ~(alignment - 1);
 }
 
+typedef struct FrameInfo {
+	RK_U32 width;
+	RK_U32 height;
+	RK_U32 hor_stride;
+	RK_U32 ver_stride;
+	size_t packet_size;
+	size_t buffer_size;
+} FrameInfo;
+
 /*
- * 这里补一套和 RGA 那边同风格的 dma-buf 显式同步。
+ * 这里的 dma-buf sync 只用于 CPU 访问 dma-buf 的 cache 同步。
  *
- * 目的不是说“MPP 一定要求这样才能工作”，而是把链路做成统一模型：
- * - 读输入前显式声明 READ
- * - 写输出前显式声明 WRITE
- * - 用完后再 END
- *
- * 这样我们就能把“MPP 这一层是否存在 buffer 可见性问题”也排查掉，
- * 不必只靠 usleep 去掩盖时序。
+ * 注意：它不是硬件设备之间的完成/可见性同步。MPP 写 output、DRM/RGA 读
+ * output 这种 device-to-device 路径不要在这里加 DMA_BUF_IOCTL_SYNC。
  */
 static void dmabuf_sync_start(int fd, unsigned long rw)
 {
@@ -579,30 +583,30 @@ void rk_mpp_decoder_advance_deinit(MppDecoderAdvance *ctx)
 	ctx->buf_is_init = 0;
 }
 
-int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
-								   size_t dst_capacity, int index, int w, int h,
-								   int stride, int size)
+int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx,
+								   const RkMppInputPacket *input,
+								   const RkMppOutputFrame *output)
 {
 	/*
 	 * 这是整条 MPP 解码链路的核心函数。
 	 *
 	 * 输入：
-	 * - fd    : 一帧 MJPEG 压缩数据所在的 dma-buf
-	 * - index : 这帧对应的 v4l2 buffer 槽位号
-	 * - size  : 当前这帧 JPEG 的真实长度
+	 * - input->fd          : 一帧 MJPEG 压缩数据所在的 dma-buf
+	 * - input->capacity    : input fd 对应的整块 buffer 容量
+	 * - input->packet_size : 当前这帧 JPEG 的真实长度，也就是 V4L2 bytesused
 	 *
 	 * 输出：
-	 * - dstfd 里得到一帧 NV12
+	 * - output->fd 里得到一帧 NV12
+	 * - output->capacity 同时作为 MppBufferInfo.size 和 MppFrame buf_size
 	 *
-	 * 你读这个函数时，建议严格按下面 7 个阶段看：
+	 * 你读这个函数时，建议严格按下面 6 个阶段看：
 	 *
 	 * 1. 校验输入
-	 * 2. 从 JPEG 头解析 width / height
-	 * 3. 绑定调用方传入的输出 dma-buf
-	 * 4. 输入 fd -> MppBuffer -> MppPacket
-	 * 5. 输出 fd -> MppBuffer -> MppFrame
-	 * 6. task 模式提交给硬件并取回结果
-	 * 7. 回收 task / packet / frame / buffer 引用
+	 * 2. 绑定调用方传入的输出 dma-buf
+	 * 3. 输入 fd -> MppBuffer -> MppPacket
+	 * 4. 输出 fd -> MppBuffer -> MppFrame
+	 * 5. task 模式提交给硬件并取回结果
+	 * 6. 回收 task / packet / frame / buffer 引用
 	 */
 	MppPacket packet = NULL;
 	MppPacket packet_out = NULL;
@@ -613,31 +617,36 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 	MppBuffer out_buf = NULL;
 	MppBufferInfo in_buf_info = {0};
 	MppBufferInfo out_buf_info = {0};
-	FrameInfo info = {0};
 	void *packet_data;
 	MPP_RET ret = MPP_OK;
 	int input_submitted = 0;
 	int input_sync_started = 0;
-	int output_sync_started = 0;
-	int output_fd = dstfd;
-	size_t output_size = 0;
-
-	/*
-	 * 对 MJPEG 输入来说，stride 没什么意义。
-	 * 真正可靠的图像宽高来自 JPEG 头，而不是摄像头回调里传进来的 stride。
-	 */
-	(void)stride;
-
 	if (ctx == NULL || !ctx->dec_initialized || ctx->dec_api == NULL) {
 		fprintf(stderr, "[MPP] decoder is not initialized\n");
 		return -1;
 	}
-	if (fd < 0 || size <= 0) {
-		fprintf(stderr, "[MPP] invalid input fd=%d size=%d\n", fd, size);
+	if (input == NULL || output == NULL) {
+		fprintf(stderr, "[MPP] input/output descriptor is null\n");
 		return -1;
 	}
-	if (output_fd < 0) {
-		fprintf(stderr, "[MPP] invalid output fd=%d\n", output_fd);
+	if (input->fd < 0 || input->capacity == 0 || input->packet_size == 0 ||
+		input->packet_size > input->capacity) {
+		fprintf(stderr,
+				"[MPP] invalid input fd=%d capacity=%zu packet_size=%zu\n",
+				input->fd, input->capacity, input->packet_size);
+		return -1;
+	}
+	if (output->fd < 0 || output->capacity == 0) {
+		fprintf(stderr, "[MPP] invalid output fd=%d capacity=%zu\n",
+				output->fd, output->capacity);
+		return -1;
+	}
+	if (output->width <= 0 || output->height <= 0 ||
+		output->stride <= 0 || output->height_stride <= 0) {
+		fprintf(stderr,
+				"[MPP] invalid output layout w=%d h=%d hs=%d vs=%d\n",
+				output->width, output->height, output->stride,
+				output->height_stride);
 		return -1;
 	}
 	if (ctx->coding != MPP_VIDEO_CodingMJPEG) {
@@ -646,67 +655,16 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 		return -1;
 	}
 
-	if (mjpeg_get_frame_info_from_dmafd(fd, (size_t)size, &info) != 0) {
-
-		/*
-		 * 理想情况：从 JPEG 头解析到真实宽高。
-		 * 兜底情况：如果解析失败，再退回到 V4L2 已知的 w / h。
-		 */
-		if (w <= 0 || h <= 0) {
-			fprintf(stderr, "[MPP] failed to parse mjpeg header and no "
-							"fallback size is available\n");
-			return -1;
-		}
-
-		info.width = (RK_U32)w;
-		info.height = (RK_U32)h;
-		info.hor_stride = align_to((RK_U32)w, 16);
-		info.ver_stride = align_to((RK_U32)h, 16);
-		info.packet_size = (size_t)size;
-		info.buffer_size = (size_t)info.hor_stride * info.ver_stride * 2;
-
-		printf("[MPP] fallback to v4l2 size w=%u h=%u hs=%u vs=%u "
-			   "packet=%zu\n",
-			   info.width, info.height, info.hor_stride, info.ver_stride,
-			   info.packet_size);
-	} else if (info.width != (RK_U32)w || info.height != (RK_U32)h) {
-
-		printf("[MPP] jpeg header size %ux%u differs from v4l2 %dx%d, "
-			   "trust jpeg header\n",
-			   info.width, info.height, w, h);
-	} else {
-		printf("[MPP]从码流获取到头部信息成功:size w=%u h=%u hs=%u vs=%u "
-			   "packet=%zu\n",
-			   info.width, info.height, info.hor_stride, info.ver_stride,
-			   info.packet_size);
-	}
-
-	output_size = info.buffer_size;
-	if (dst_capacity > 0 && dst_capacity < output_size) {
-		fprintf(stderr,
-				"[MPP] output fd capacity too small: capacity=%zu required=%zu "
-				"w=%u h=%u hs=%u vs=%u codec=%d\n",
-				dst_capacity, output_size, info.width, info.height,
-				info.hor_stride, info.ver_stride, ctx->coding);
-		return -1;
-	}
-
 	/*
-	 * 显式声明：
-	 * - 输入码流 fd 交给 MPP 读
-	 * - 输出 NV12 fd 交给 MPP 写
-	 *
-	 * 这样能把 MPP 这段和 RGA 那段的 dma-buf 可见性模型统一起来。
+	 * input 是压缩码流，MPP 只读。这个 sync 只覆盖 CPU cache 语义；
+	 * 如果输入 buffer 完全由设备生产，后续也可以按路径继续裁掉。
 	 */
-	dmabuf_sync_start(fd, DMA_BUF_SYNC_READ);
+	dmabuf_sync_start(input->fd, DMA_BUF_SYNC_READ);
 	input_sync_started = 1;
 
-	dmabuf_sync_start(output_fd, DMA_BUF_SYNC_WRITE);
-	output_sync_started = 1;
-
 	in_buf_info.type = MPP_BUFFER_TYPE_EXT_DMA;
-	in_buf_info.fd = fd;
-	in_buf_info.size = info.packet_size;
+	in_buf_info.fd = input->fd;
+	in_buf_info.size = input->capacity;
 
 	/*
 	 * 这里把“输入 dmafd”导入为 MppBuffer。
@@ -731,14 +689,14 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 	packet_data = mpp_packet_get_data(packet);
 	mpp_packet_set_data(packet, packet_data);
 	mpp_packet_set_pos(packet, packet_data);
-	mpp_packet_set_size(packet, info.packet_size);
-	mpp_packet_set_length(packet, info.packet_size);
+	mpp_packet_set_size(packet, input->capacity);
+	mpp_packet_set_length(packet, input->packet_size);
 	mpp_packet_clr_eos(packet);
 
 
 	out_buf_info.type = MPP_BUFFER_TYPE_EXT_DMA;
-	out_buf_info.fd = output_fd;
-	out_buf_info.size = output_size;
+	out_buf_info.fd = output->fd;
+	out_buf_info.size = output->capacity;
 
 	/*
 	 * 输出侧同理：把“解码目标 dmafd”导入成 MppBuffer，
@@ -757,12 +715,12 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 	}
 
 	mpp_frame_set_buffer(frame, out_buf);
-	mpp_frame_set_width(frame, info.width);
-	mpp_frame_set_height(frame, info.height);
-	mpp_frame_set_hor_stride(frame, info.hor_stride);
-	mpp_frame_set_ver_stride(frame, info.ver_stride);
+	mpp_frame_set_width(frame, (RK_U32)output->width);
+	mpp_frame_set_height(frame, (RK_U32)output->height);
+	mpp_frame_set_hor_stride(frame, (RK_U32)output->stride);
+	mpp_frame_set_ver_stride(frame, (RK_U32)output->height_stride);
 	mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
-	mpp_frame_set_buf_size(frame, output_size);
+	mpp_frame_set_buf_size(frame, output->capacity);
 	printf("packet 和 frame 准备完成了\n");
 	/*
 	 * 到这里，输入和输出都准备好了：
@@ -838,28 +796,18 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 		goto out;
 	}
 
-	printf("[MPP] decoded frame index=%d w=%u h=%u hs=%u vs=%u fmt=%u buf=%zu "
+	printf("[MPP] decoded frame w=%u h=%u hs=%u vs=%u fmt=%u buf=%zu "
 		   "err=%u discard=%u dst_fd=%d\n",
-		   index, mpp_frame_get_width(frame_out),
+		   mpp_frame_get_width(frame_out),
 		   mpp_frame_get_height(frame_out), mpp_frame_get_hor_stride(frame_out),
 		   mpp_frame_get_ver_stride(frame_out), mpp_frame_get_fmt(frame_out),
 		   mpp_frame_get_buf_size(frame_out), mpp_frame_get_errinfo(frame_out),
-		   mpp_frame_get_discard(frame_out), output_fd);
-
-	/*
-	 * 到这里解码结果已经由 MPP 写完。
-	 * 在把输出 fd 交给后面的 RGA 之前，先结束 WRITE 同步，
-	 * 让结果对后续消费者可见。
-	 */
-	if (output_sync_started) {
-		dmabuf_sync_end(output_fd, DMA_BUF_SYNC_WRITE);
-		output_sync_started = 0;
-	}
+		   mpp_frame_get_discard(frame_out), output->fd);
 
 	if (mpp_frame_get_errinfo(frame_out) == 0 &&
 		mpp_frame_get_discard(frame_out) == 0) {
 		if (ctx->frame_callback != NULL) {
-			ctx->frame_callback(output_fd, index,
+			ctx->frame_callback(output->fd,
 								mpp_frame_get_width(frame_out),
 								mpp_frame_get_height(frame_out),
 								mpp_frame_get_hor_stride(frame_out),
@@ -906,7 +854,7 @@ int rk_mpp_decoder_advance_do_task(MppDecoderAdvance *ctx, int fd, int dstfd,
 	 * 可以结束这轮 READ 同步。
 	 */
 	if (input_sync_started) {
-		dmabuf_sync_end(fd, DMA_BUF_SYNC_READ);
+		dmabuf_sync_end(input->fd, DMA_BUF_SYNC_READ);
 		input_sync_started = 0;
 	}
 
@@ -940,12 +888,8 @@ out:
 		mpp_buffer_put(in_buf);
 	}
 
-	if (output_sync_started) {
-		dmabuf_sync_end(output_fd, DMA_BUF_SYNC_WRITE);
-	}
-
 	if (input_sync_started) {
-		dmabuf_sync_end(fd, DMA_BUF_SYNC_READ);
+		dmabuf_sync_end(input->fd, DMA_BUF_SYNC_READ);
 	}
 
 	return (ret == MPP_OK) ? 0 : -1;
@@ -956,7 +900,7 @@ int rk_mpp_decoder_advance_init(MppDecoderAdvance *ctx, MppCodingType coding)
 	MPP_RET ret;
 	MppDecCfg dec_cfg = NULL;
 	RK_U32 output_fmt = MPP_FMT_YUV420SP;
-	
+
 	if (ctx == NULL) {
 		return -1;
 	}

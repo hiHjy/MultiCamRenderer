@@ -36,6 +36,10 @@ public:
         DecodeWorker(int cameraId,
                      int outputBufferCount,
                      size_t outputBufferSize,
+                     int outputWidth,
+                     int outputHeight,
+                     int outputStride,
+                     int outputHeightStride,
                      const std::string& dmaHeapPath,
                      std::weak_ptr<FrameHub> hub);
         ~DecodeWorker();
@@ -58,6 +62,10 @@ public:
 
     private:
         int m_cameraId = -1;
+        int m_outputWidth = 0;
+        int m_outputHeight = 0;
+        int m_outputStride = 0;
+        int m_outputHeightStride = 0;
         std::weak_ptr<FrameHub> m_hub;
         std::shared_ptr<DmaBufferPool> m_outputPool;
         MppDecoder m_decoder {};

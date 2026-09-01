@@ -95,16 +95,6 @@ int presetBitrate(const MppEncoderConfig& cfg, int fps)
     return bitrate > 0 ? bitrate : base;
 }
 
-int effectiveStride(const VideoFrame& frame)
-{
-    return frame.stride > 0 ? frame.stride : frame.width;
-}
-
-int effectiveHeightStride(const VideoFrame& frame)
-{
-    return frame.heightStride > 0 ? frame.heightStride : frame.height;
-}
-
 } // namespace
 
 struct MppEncoder::Impl {
@@ -279,12 +269,13 @@ private:
             return false;
         }
         if (frame.width != config.width || frame.height != config.height ||
-            effectiveStride(frame) != (config.stride > 0 ? config.stride : config.width) ||
-            effectiveHeightStride(frame) != (config.heightStride > 0 ? config.heightStride : config.height)) {
+            videoFrameEffectiveStride(frame) != (config.stride > 0 ? config.stride : config.width) ||
+            videoFrameEffectiveHeightStride(frame) != (config.heightStride > 0 ? config.heightStride : config.height)) {
             std::ostringstream oss;
             oss << "MppEncoder 输入帧几何和初始化配置不一致: frame="
                 << frame.width << "x" << frame.height
-                << " stride=" << effectiveStride(frame) << "x" << effectiveHeightStride(frame)
+                << " stride=" << videoFrameEffectiveStride(frame) << "x"
+                << videoFrameEffectiveHeightStride(frame)
                 << " config=" << config.width << "x" << config.height
                 << " stride=" << (config.stride > 0 ? config.stride : config.width)
                 << "x" << (config.heightStride > 0 ? config.heightStride : config.height);

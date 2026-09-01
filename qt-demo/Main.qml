@@ -12,7 +12,7 @@ Window {
 	visible: true
 	title: "MultiCam Renderer"
 	color: "#1b1f25"
-	property var demoCameraPaths: ["/dev/video12"]
+	property var demoCameraPaths: ["/dev/video10"]
 	property int nextDemoCameraIndex: 0
 
 	function addDemoCameraToNextTile() {

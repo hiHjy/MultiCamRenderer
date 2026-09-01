@@ -134,7 +134,7 @@ void DisplaySink::processFrame(FramePacket packet)
     dstFrame->heightStride = frame.height;
     dstFrame->format = PixelFormat::RGBA8888;
     dstFrame->nativeFormat = frame.nativeFormat;
-    dstFrame->bytesUsed = static_cast<size_t>(frame.width) * frame.height * 4;
+    dstFrame->bytesUsed = videoFrameBufferSize(*dstFrame);
     dstFrame->timestampUs = frame.timestampUs;
     dstFrame->sequence = frame.sequence;
 

@@ -56,8 +56,7 @@ public:
         }
 
         const VideoFrame& frame = displayPacket.frame;
-        const int stride = frame.stride > 0 ? frame.stride : frame.width;
-        const int heightStride = frame.heightStride > 0 ? frame.heightStride : frame.height;
+        const int stride = videoFrameEffectiveStride(frame);
 
         DRM_Buf buf {};
         buf.dma_fd = frame.dmaFd;
@@ -68,7 +67,7 @@ public:
         buf.pitches[0] = static_cast<uint32_t>(stride);
         buf.pitches[1] = static_cast<uint32_t>(stride);
         buf.offsets[0] = 0;
-        buf.offsets[1] = static_cast<uint32_t>(stride * heightStride);
+        buf.offsets[1] = static_cast<uint32_t>(videoFramePlaneOffset(frame, 1));
         buf.modifier = DRM_FORMAT_MOD_INVALID;
 
         if (drmDisplaySubmit(&m_ctx, &buf) != 0) {
@@ -145,7 +144,7 @@ private:
         outputFrame->stride = frame.width;
         outputFrame->heightStride = frame.height;
         outputFrame->format = PixelFormat::NV12;
-        outputFrame->bytesUsed = static_cast<size_t>(frame.width) * frame.height * 3 / 2;
+        outputFrame->bytesUsed = videoFrameBufferSize(*outputFrame);
         outputFrame->timestampUs = frame.timestampUs;
         outputFrame->sequence = frame.sequence;
 

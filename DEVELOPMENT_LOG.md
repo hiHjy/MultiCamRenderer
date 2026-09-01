@@ -1987,3 +1987,155 @@ YUYV 直显路径：RGA / VOP active，JPEGD 不动
 Qt Quick Sink: UI 友好，适合配置页、调试页、轻量预览。
 DRM Sink: 性能优先，适合多路实时预览主画面。
 ```
+
+## 2026-09-01
+
+### MJPEG 解码参数语义收口
+
+今天继续打磨 MJPEG 解码链路，重点把几个容易混淆的概念拆清楚：
+
+```text
+input capacity     : 输入 dma-buf 的总容量
+input packet_size  : 当前 MJPEG 压缩帧的真实长度，也就是 V4L2 bytesused
+output capacity    : 输出 dma-buf 的总容量
+output layout      : 输出 NV12 的 width / height / stride / heightStride
+```
+
+底层 C 接口从一长串参数改成两个描述结构：
+
+```c
+RkMppInputPacket {
+    fd,
+    capacity,
+    packet_size,
+}
+
+RkMppOutputFrame {
+    fd,
+    capacity,
+    width,
+    height,
+    stride,
+    height_stride,
+}
+```
+
+这样 `mpp_buffer_import(input)` 使用 `input.capacity`，`mpp_packet_set_length()` 使用 `input.packet_size`，读代码时不会再把 buffer 容量和压缩包长度混在一起。
+
+### MJPEG 输出 layout 由外层决定
+
+由于当前 MJPEG 解码采用“调用方提供 output dma-buf”的模型，输出池和输出 layout 都由外层 `DecodeWorker` 决定：
+
+```text
+CamManager / DecodeWorker
+  -> 根据 V4L2 最终接受的摄像头配置计算 NV12 output layout
+  -> 按 MPP 外部解码输出规则申请 output DmaBufferPool
+  -> 每帧 decode 前填写 output VideoFrame 的 layout
+  -> MppDecoder 只负责把 input packet 解码到 output frame
+```
+
+因此 `MppDecoder::decodeMjpeg()` 不再解析 MJPEG 头，也不再自己猜输出宽高和 stride。底层 C 中的 JPEG 头解析工具也从 public header 中收回，只保留为内部工具，避免上层误用。
+
+### VideoFrame 工具函数统一 buffer 计算
+
+`include/VideoFrame.hpp` 新增一组工具函数，后续所有模块都优先使用这里，不再各自手算：
+
+```cpp
+videoFrameAlignUp()
+videoFrameBytesPerPixelForStride()
+videoFrameMinDimensionAlignment()
+videoFrameAlignedStride()
+videoFrameAlignedHeightStride()
+videoFrameEffectiveStride()
+videoFrameEffectiveHeightStride()
+videoFrameBufferSizeFor()
+videoFrameBufferSize()
+videoFramePlaneOffset()
+```
+
+并明确区分两种 buffer size 模式：
+
+```text
+Payload:
+  普通图像真实 payload，例如 NV12 = stride * heightStride * 3 / 2
+
+MppDecoderOutput:
+  RK MPP 外部解码输出预留，例如 NV12 = stride * heightStride * 2
+```
+
+已替换的调用点：
+
+- `RgaEngine::bufferSizeFor()` / `requiredSize()`
+- `MppDecoder::decodeMjpeg()`
+- `CamManager::DecodeWorker` MJPEG 输出池大小
+- Qt `DisplaySink` RGBA `bytesUsed`
+- DRM sink NV12 `bytesUsed` 和 UV plane offset
+- `MppEncoder` stride 判断
+- `RgaCopySink` 测试池大小
+
+### dma-buf sync 结论
+
+这次重新确认了 `DMA_BUF_IOCTL_SYNC` 的语义：它主要用于 CPU mmap 访问 dma-buf 前后的 cache 同步，不是硬件设备之间的完成/可见性同步。
+
+因此 MJPEG advanced 解码里：
+
+```text
+output fd:
+  MPP 硬件写，后续 DRM/RGA 硬件读。
+  不做 DMA_BUF_SYNC_WRITE。
+
+input fd:
+  当前 USB UVC MJPEG 多半是内核 CPU memcpy 写入 vb2 buffer。
+  先暂时保留 READ sync，后续可以通过开关和 perf 数据判断是否继续裁掉。
+```
+
+### 当前优化思路
+
+短期继续保持“简单但稳”的每帧导入模型：
+
+```text
+每帧 mpp_buffer_import(input)
+每帧 mpp_packet_init_with_buffer()
+每帧 task 完成后释放 packet / buffer 引用
+```
+
+理论上可以按 fd 或 bufferIndex 缓存 `MppBuffer/MppPacket`，减少每帧 import/init 开销，但这会引入更多生命周期问题：
+
+- MPP task recycle 完成前不能复用 packet。
+- 摄像头删除、重建、fd 复用时需要非常小心。
+- 当前性能账里这块还不是主要瓶颈。
+
+所以先把语义和边界打稳，等后续 perf 明确显示 `mpp_buffer_import()` / `mpp_packet_init_with_buffer()` 成为热点，再做缓存优化。
+
+### 验证
+
+本地交叉编译：
+
+```bash
+./wsl-build.sh
+cd drm && ./wsl-build-cam-demo.sh
+git diff --check
+```
+
+板端短测：
+
+```bash
+cd /root/nfs/MultiCamRenderer/drm/build-wsl-aarch64
+./cam_drm_sink_demo /dev/video10 5 mjpeg
+```
+
+结果：
+
+```text
+MJPEG 640x480@30 -> DecodeWorker -> NV12 -> DRM
+DrmSink fps 约 30
+```
+
+当前观察到 Qt Quick 单路 MJPEG 大约稳定在 `37%` CPU。按之前对照粗拆：
+
+```text
+Qt Quick 显示附加成本约 20% 左右
+MJPEG 解码 + CamManager + RGA 等非 Qt 部分约 17% 左右
+```
+
+这个结果比早期两路 MJPEG Qt Quick `68%~72%` 的状态更健康，说明这轮 MJPEG 参数语义和同步路径收口是有价值的。

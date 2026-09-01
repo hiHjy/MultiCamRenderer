@@ -40,21 +40,6 @@ PixelFormat fromMppFrameFormat(RK_U32 format)
     }
 }
 
-int alignUp(int value, int alignment)
-{
-    if (alignment <= 1)
-        return value;
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-size_t mppOutputBufferSize(int stride, int heightStride)
-{
-    if (stride <= 0 || heightStride <= 0)
-        return 0;
-    // MPP external decoder output buffers need YUV payload plus metadata space.
-    return static_cast<size_t>(stride) * static_cast<size_t>(heightStride) * 2;
-}
-
 std::string codecName(MppCodec codec)
 {
     switch (codec) {
@@ -144,33 +129,31 @@ struct MppDecoder::Impl {
             setError("MJPEG 输入 dmaFd/bytesUsed 无效");
             return false;
         }
+        if (input.capacity < input.bytesUsed) {
+            std::ostringstream oss;
+            oss << "MJPEG 输入 capacity 小于 bytesUsed: capacity=" << input.capacity
+                << " bytesUsed=" << input.bytesUsed;
+            setError(oss.str());
+            return false;
+        }
 
         if (!initialized || currentCodec != MppCodec::MJPEG) {
             if (!init(MppCodec::MJPEG))
                 return false;
         }
 
-        FrameInfo info {};
-        int width = input.width;
-        int height = input.height;
-        int stride = input.stride;
-        int heightStride = input.heightStride;
-        size_t requiredSize = 0;
+        const int width = output.width;
+        const int height = output.height;
+        const int stride = output.stride;
+        const int heightStride = output.heightStride;
+        const size_t requiredSize = videoFrameBufferSizeFor(PixelFormat::NV12,
+                                                            stride,
+                                                            heightStride,
+                                                            VideoBufferSizeMode::MppDecoderOutput);
 
-        if (mjpeg_get_frame_info_from_dmafd(input.dmaFd, input.bytesUsed, &info) == 0) {
-            width = static_cast<int>(info.width);
-            height = static_cast<int>(info.height);
-            stride = static_cast<int>(info.hor_stride);
-            heightStride = static_cast<int>(info.ver_stride);
-            requiredSize = info.buffer_size;
-        } else {
-            if (width <= 0 || height <= 0) {
-                setError("MJPEG 无法解析 JPEG 头，并且 input 没有宽高兜底");
-                return false;
-            }
-            stride = stride > 0 ? stride : alignUp(width, 16);
-            heightStride = heightStride > 0 ? heightStride : alignUp(height, 16);
-            requiredSize = mppOutputBufferSize(stride, heightStride);
+        if (width <= 0 || height <= 0 || stride <= 0 || heightStride <= 0 || requiredSize == 0) {
+            setError("MJPEG 输出 VideoFrame layout 无效，调用方需要先填写宽高和 stride");
+            return false;
         }
 
         if (output.dmaFd < 0 || output.capacity < requiredSize) {
@@ -182,16 +165,20 @@ struct MppDecoder::Impl {
             return false;
         }
 
-        const int index = output.bufferIndex >= 0 ? output.bufferIndex : input.bufferIndex;
-        const int ret = rk_mpp_decoder_advance_do_task(&mjpegDecoder,
-                                                       input.dmaFd,
-                                                       output.dmaFd,
-                                                       output.capacity,
-                                                       index,
-                                                       width,
-                                                       height,
-                                                       stride,
-                                                       static_cast<int>(input.bytesUsed));
+        const RkMppInputPacket inputPacket {
+            input.dmaFd,
+            input.capacity,
+            input.bytesUsed,
+        };
+        const RkMppOutputFrame outputFrame {
+            output.dmaFd,
+            output.capacity,
+            width,
+            height,
+            stride,
+            heightStride,
+        };
+        const int ret = rk_mpp_decoder_advance_do_task(&mjpegDecoder, &inputPacket, &outputFrame);
         if (ret != 0) {
             setError("rk_mpp_decoder_advance_do_task 失败");
             return false;

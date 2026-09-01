@@ -11,10 +11,14 @@
 
 class RgaCopySink : public Sink {
 public:
-    RgaCopySink()
+	RgaCopySink()
 	{
-		m_pool.init(4, 1280 * 720 * 2);
-		
+		m_pool.init(4,
+		            videoFrameBufferSizeFor(PixelFormat::YUYV,
+		                                    1280,
+		                                    720,
+		                                    0,
+		                                    VideoBufferSizeMode::Payload));
 	}
     ~RgaCopySink() override = default;
 
