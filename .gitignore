@@ -27,3 +27,4 @@ compile_commands.json.bak-old-path
 
 # DRM test local build output
 drm/build-wsl-aarch64/
+count_code.py
