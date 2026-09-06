@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Cross-compile build script for qt-demo (RK3568 aarch64)
+# Cross-compile build script for qt (RK3568 aarch64)
 #
 # Usage:
 #   ./build.sh              # 增量编译 + 部署
@@ -38,7 +38,7 @@ cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
 echo "=== 开始编译 ==="
 cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
 
-echo "=== 编译完成：${BUILD_DIR}/appqt-demo ==="
+echo "=== 编译完成：${BUILD_DIR}/app ==="
 
 if [ -x "${SCRIPT_DIR}/../tools/update_compile_commands.sh" ]; then
     "${SCRIPT_DIR}/../tools/update_compile_commands.sh" || true
@@ -57,7 +57,7 @@ rm -rf "${DEPLOY_DIR}"
 mkdir -p "${DEPLOY_DIR}/bin"
 
 # --- 只拷贝可执行文件（QML 已作为 Qt 资源编译进二进制）---
-cp "${BUILD_DIR}/appqt-demo" "${DEPLOY_DIR}/bin/"
+cp "${BUILD_DIR}/app" "${DEPLOY_DIR}/bin/"
 
 echo "=== 部署完成 ==="
 echo ""
@@ -65,4 +65,4 @@ echo "部署内容（单二进制，QML 嵌入在可执行文件中）："
 find "${DEPLOY_DIR}" -type f | sed "s|${DEPLOY_DIR}/|  |g"
 echo ""
 echo "板端运行："
-echo "  cd qt-demo && ./run.sh"
+echo "  cd qt && ./run.sh"

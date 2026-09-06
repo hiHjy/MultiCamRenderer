@@ -6,12 +6,13 @@ build-aarch64
 *json
 
 # Qt/CMake 本地构建产物
-qt-demo/build/
-qt-demo/build-aarch64/
-qt-demo/build-wsl-aarch64/
-qt-demo/deploy/
-qt-demo/deploy-wsl-aarch64/
-qt-demo/CMakeLists.txt.user*
+qt/build/
+qt/build-aarch64/
+qt/build-wsl-aarch64/
+qt/deploy/
+qt/deploy-wsl-aarch64/
+qt/CMakeLists.txt.user*
+build/
 
 # demo 运行生成物
 demo/rga/rga_ops_demo

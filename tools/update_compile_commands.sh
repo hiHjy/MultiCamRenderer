@@ -6,20 +6,20 @@ OUT_FILE="$ROOT_DIR/compile_commands.json"
 
 inputs=()
 
-qt_build_dirs=()
+cmake_build_dirs=()
 if grep -qi microsoft /proc/version 2>/dev/null; then
-    qt_build_dirs=(
-        "$ROOT_DIR/qt-demo/build-wsl-aarch64"
-        "$ROOT_DIR/qt-demo/build"
+    cmake_build_dirs=(
+        "$ROOT_DIR/build/wsl-aarch64-qt"
+        "$ROOT_DIR/build/wsl-aarch64"
     )
 else
-    qt_build_dirs=(
-        "$ROOT_DIR/qt-demo/build"
-        "$ROOT_DIR/qt-demo/build-wsl-aarch64"
+    cmake_build_dirs=(
+        "$ROOT_DIR/build/wsl-aarch64"
+        "$ROOT_DIR/build/wsl-aarch64-qt"
     )
 fi
 
-for dir in "${qt_build_dirs[@]}"; do
+for dir in "${cmake_build_dirs[@]}"; do
     if [ -f "$dir/compile_commands.json" ]; then
         inputs+=("$dir/compile_commands.json")
     fi

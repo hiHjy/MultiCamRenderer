@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qt-demo LANGUAGES C CXX)
+project(qt LANGUAGES C CXX)
 
 
 set(CMAKE_CXX_STANDARD 17)
@@ -9,11 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2)
 
+qt_policy(SET QTP0001 NEW)
 
 qt_standard_project_setup()
 
 
-qt_add_executable(appqt-demo
+qt_add_executable(app
     main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/FrameHub.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CamManager.cpp
@@ -29,14 +30,14 @@ qt_add_executable(appqt-demo
 
 )
 
-target_include_directories(appqt-demo PRIVATE
+target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_SYSROOT}/usr/include/rga
     ${CMAKE_SYSROOT}/usr/include/rockchip
     ${CMAKE_SYSROOT}/usr/include/libdrm
 )
 
-qt_add_qml_module(appqt-demo
+qt_add_qml_module(app
     URI QtDemo
     VERSION 1.0
     QML_FILES
@@ -46,7 +47,7 @@ qt_add_qml_module(appqt-demo
                 DisplayController.hpp DisplayController.cpp
 )
 
-target_link_libraries(appqt-demo
+target_link_libraries(app
     PRIVATE
     Qt6::Quick
     Qt6::QuickControls2

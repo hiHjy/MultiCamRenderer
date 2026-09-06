@@ -49,8 +49,8 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- 检查部署目录 ------------------------------------------------------------
-if [ ! -f "${DEPLOY_DIR}/bin/appqt-demo" ]; then
-    echo "错误: 未找到可执行文件: ${DEPLOY_DIR}/bin/appqt-demo"
+if [ ! -f "${DEPLOY_DIR}/bin/app" ]; then
+    echo "错误: 未找到可执行文件: ${DEPLOY_DIR}/bin/app"
     echo "请先在 PC 上运行 ./build.sh 进行交叉编译和部署"
     exit 1
 fi
@@ -87,13 +87,13 @@ fi
 
 # ---- 运行应用 ----------------------------------------------------------------
 echo "================================================"
-echo "  qt-demo - RK3568 Qt6 Quick Demo"
+echo "  qt - RK3568 Qt6 Quick Demo"
 echo "================================================"
 echo "  平台:       ${PLATFORM} (QT_QPA_PLATFORM)"
 echo "  EGLFS 后端: ${QT_QPA_EGLFS_INTEGRATION:-未设置}"
-echo "  应用路径:   ${DEPLOY_DIR}/bin/appqt-demo"
+echo "  应用路径:   ${DEPLOY_DIR}/bin/app"
 echo "================================================"
 echo ""
 
 cd "${DEPLOY_DIR}/bin"
-exec ./appqt-demo "${APP_ARGS[@]}"
+exec ./app "${APP_ARGS[@]}"

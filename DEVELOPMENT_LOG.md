@@ -2256,3 +2256,32 @@ git diff --check
 ```
 
 全部 aarch64 demo 目标和 `rga_ops_demo` 均交叉编译通过。
+
+## 2026-09-06
+
+### 统一 CMake 构建与 Qt 目录收口
+
+工程改为由根目录 `CMakeLists.txt` 统一描述 RK3568 aarch64 构建目标。MPP、V4L2、RTSP、DRM 等非 Qt demo 和 Qt 目标不再各自维护一份手写编译命令。
+
+WSL 下保留两个入口，且使用互不共享的 CMake build 目录：
+
+```bash
+./wsl-build.sh       # build/wsl-aarch64：全部非 Qt demo
+./wsl-build-qt.sh    # build/wsl-aarch64-qt：Qt 应用与 rga_ops_demo
+```
+
+`wsl-build-qt.sh` 会先加载 Qt aarch64 环境，并将 `qt/app` 部署到 `qt/deploy-wsl-aarch64/bin/app`。非 Qt 脚本不加载 Qt 环境；两个配置缓存因此不会互相污染。
+
+原 `qt-demo/` 目录重命名为 `qt/`，Qt 可执行 target 和部署文件从 `appqt-demo` 收口为 `app`。QML URI `QtDemo` 保持不变，它是模块标识，不是可执行程序名。
+
+原 `demo/rga/build.sh`、`qt/wsl-build.sh` 和各自的 WSL CMake 入口已移除，避免出现第三套构建路径。非 WSL 的历史 toolchain 与构建脚本不在本次范围内。
+
+验证：
+
+```bash
+./wsl-build.sh clean
+./wsl-build-qt.sh clean
+git diff --check
+```
+
+非 Qt 的 11 个 aarch64 目标、Qt `app` 与 `rga_ops_demo` 均交叉编译通过。
