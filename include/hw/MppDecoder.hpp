@@ -27,10 +27,11 @@ class MppDecoder {
 
 	bool decodeMjpeg(const VideoFrame &input, VideoFrame &output);
 
-	// H264/H265 流式入口只接收上层已经切好的压缩包。
-	// 对 Annex-B 来说，packet 应该是一帧 access unit，而不是随便按字节数切出来的一段。
-	// 解码器不负责从 RTSP/RTP/文件流里拆包、组帧，也不配置宽高/fps/stride；
-	// 这些信息由码流和 MPP info_change 决定。
+	// H264/H265 流式入口接收顺序正确、带 Annex-B 起始码的压缩数据。
+	// 当前底层为 H264/H265 开启了 MPP split_parse，因此 RTSP/live555 可以一整个
+	// NALU 一次调用；也可以传上层已经组好的 access unit。不能按任意字节位置切断。
+	// 解码器不负责 RTP 重组、网络重连，也不配置宽高/fps/stride；这些信息由码流和
+	// MPP info_change 决定。
 	bool sendPacket(const VideoFrame &packet, bool eos = false);
 	void setFrameCallback(FrameCallback callback);
 

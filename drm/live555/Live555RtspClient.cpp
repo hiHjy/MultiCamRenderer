@@ -1,0 +1,405 @@
+#include "Live555RtspClient.hh"
+
+#include "AnnexBSink.hh"
+
+#include <BasicUsageEnvironment.hh>
+#include <liveMedia.hh>
+
+#include <atomic>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <utility>
+
+namespace {
+
+constexpr unsigned kMaxReceivedNaluBytes = 2U * 1024U * 1024U;
+
+bool codecFromSubsession(const MediaSubsession& subsession, VideoCodec& codec)
+{
+    if (std::strcmp(subsession.mediumName(), "video") != 0) {
+        return false;
+    }
+    if (std::strcmp(subsession.codecName(), "H264") == 0) {
+        codec = VideoCodec::H264;
+        return true;
+    }
+    if (std::strcmp(subsession.codecName(), "H265") == 0) {
+        codec = VideoCodec::H265;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+struct Live555RtspClient::Impl {
+    struct PullClientState {
+        ~PullClientState()
+        {
+            delete iterator;
+            if (session != nullptr) {
+                Medium::close(session);
+            }
+        }
+
+        MediaSubsessionIterator* iterator = nullptr;
+        MediaSession* session = nullptr;
+        MediaSubsession* subsession = nullptr;
+        VideoCodec selectedCodec = VideoCodec::H264;
+        bool hasSelectedVideo = false;
+    };
+
+    class Client final : public RTSPClient {
+    public:
+        static Client* createNew(UsageEnvironment& env, const char* url, Impl& owner)
+        {
+            return new Client(env, url, owner);
+        }
+
+        PullClientState state;
+        Impl& owner;
+
+    private:
+        Client(UsageEnvironment& env, const char* url, Impl& owner)
+            : RTSPClient(env, url, 1, "Live555RtspClient", 0, -1), owner(owner)
+        {
+        }
+        ~Client() override = default;
+    };
+
+    bool start(const std::string& url, AnnexBNaluCallback naluCallback, bool requestRtpOverTcp)
+    {
+        if (url.empty() || !naluCallback) {
+            setError("RTSP URL 或 NALU 回调为空");
+            return false;
+        }
+
+        stop();
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            url_ = url;
+            naluCallback_ = std::move(naluCallback);
+            requestRtpOverTcp_ = requestRtpOverTcp;
+            codec_.store(VideoCodec::H264);
+            setEventLoopWatchValue(0);
+            running.store(true);
+        }
+        clearError();
+        eventThread = std::thread(&Impl::eventThreadMain, this);
+        return true;
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            setEventLoopWatchValue(1);
+            if (scheduler != nullptr && stopTrigger != 0) {
+                scheduler->triggerEvent(stopTrigger, this);
+            }
+        }
+
+        // 回调中调用 stop() 时不能 join 自己；回调返回后事件循环会自然退出。
+        if (eventThread.joinable() && eventThread.get_id() != std::this_thread::get_id()) {
+            eventThread.join();
+        }
+    }
+
+    bool isRunning() const
+    {
+        return running.load();
+    }
+
+    VideoCodec codec() const
+    {
+        return codec_.load();
+    }
+
+    std::string lastError() const
+    {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        return lastError_;
+    }
+
+    void eventThreadMain()
+    {
+        if (setupLive555()) {
+            env->taskScheduler().doEventLoop(&eventLoopWatchVariable);
+        }
+        cleanupLive555();
+        running.store(false);
+    }
+
+    bool setupLive555()
+    {
+        std::lock_guard<std::mutex> lock(lifecycleMutex);
+        scheduler = BasicTaskScheduler::createNew();
+        if (scheduler == nullptr) {
+            setError("创建 TaskScheduler 失败");
+            return false;
+        }
+
+        env = BasicUsageEnvironment::createNew(*scheduler);
+        if (env == nullptr) {
+            setError("创建 UsageEnvironment 失败");
+            return false;
+        }
+
+        stopTrigger = scheduler->createEventTrigger(stopEventCallback);
+        client = Client::createNew(*env, url_.c_str(), *this);
+        if (client == nullptr) {
+            setError(std::string("创建 RTSPClient 失败：") + env->getResultMsg());
+            return false;
+        }
+
+        client->sendDescribeCommand(continueAfterDESCRIBE);
+        return true;
+    }
+
+    void cleanupLive555()
+    {
+        std::lock_guard<std::mutex> lock(lifecycleMutex);
+        if (client != nullptr) {
+            const bool sessionWasActive = closeSinks(*client);
+            if (sessionWasActive && client->state.session != nullptr) {
+                // 主动停止时通知服务端，服务端可立即回收该播放会话。
+                client->sendTeardownCommand(*client->state.session, nullptr);
+            }
+            Medium::close(client);
+            client = nullptr;
+        }
+        if (scheduler != nullptr && stopTrigger != 0) {
+            scheduler->deleteEventTrigger(stopTrigger);
+            stopTrigger = 0;
+        }
+        if (env != nullptr) {
+            env->reclaim();
+            env = nullptr;
+        }
+        delete scheduler;
+        scheduler = nullptr;
+    }
+
+    static void stopEventCallback(void* clientData)
+    {
+        (void)clientData;
+    }
+
+    static void continueAfterDESCRIBE(RTSPClient* rtspClient, int resultCode, char* resultString)
+    {
+        auto* client = static_cast<Client*>(rtspClient);
+        client->owner.continueAfterDESCRIBE(*client, resultCode, resultString);
+    }
+
+    static void continueAfterSETUP(RTSPClient* rtspClient, int resultCode, char* resultString)
+    {
+        auto* client = static_cast<Client*>(rtspClient);
+        client->owner.continueAfterSETUP(*client, resultCode, resultString);
+    }
+
+    static void continueAfterPLAY(RTSPClient* rtspClient, int resultCode, char* resultString)
+    {
+        auto* client = static_cast<Client*>(rtspClient);
+        client->owner.continueAfterPLAY(*client, resultCode, resultString);
+    }
+
+    static void afterSubsessionPlaying(void* clientData)
+    {
+        auto* client = static_cast<Client*>(clientData);
+        client->owner.setError("RTP 视频源已关闭");
+        client->owner.requestEventLoopExit();
+    }
+
+    void continueAfterDESCRIBE(Client& clientRef, int resultCode, char* resultString)
+    {
+        std::unique_ptr<char[]> response(resultString);
+        if (resultCode != 0) {
+            setError(std::string("DESCRIBE 失败：") + (resultString == nullptr ? "" : resultString));
+            requestEventLoopExit();
+            return;
+        }
+
+        clientRef.state.session = MediaSession::createNew(clientRef.envir(), resultString);
+        if (clientRef.state.session == nullptr || !clientRef.state.session->hasSubsessions()) {
+            setError(std::string("SDP 没有可用媒体轨道：") + clientRef.envir().getResultMsg());
+            requestEventLoopExit();
+            return;
+        }
+
+        clientRef.state.iterator = new MediaSubsessionIterator(*clientRef.state.session);
+        setupNextSubsession(clientRef);
+    }
+
+    void continueAfterSETUP(Client& clientRef, int resultCode, char* resultString)
+    {
+        std::unique_ptr<char[]> response(resultString);
+        if (resultCode != 0) {
+            setError(std::string("SETUP 失败：") + (resultString == nullptr ? "" : resultString));
+            requestEventLoopExit();
+            return;
+        }
+
+        MediaSubsession& subsession = *clientRef.state.subsession;
+        subsession.sink = AnnexBSink::createNew(
+            clientRef.envir(),
+            clientRef.state.selectedCodec,
+            naluCallback_,
+            [this](const std::string& message) { setError(message); },
+            kMaxReceivedNaluBytes);
+        if (subsession.sink == nullptr) {
+            setError("创建 AnnexBSink 失败");
+            requestEventLoopExit();
+            return;
+        }
+
+        // 先让 Sink 登记 getNextFrame() 回调，再发送 PLAY，避免首个 RTP 包没有接收者。
+        subsession.sink->startPlaying(*subsession.readSource(), afterSubsessionPlaying, &clientRef);
+        setupNextSubsession(clientRef);
+    }
+
+    void continueAfterPLAY(Client& /*clientRef*/, int resultCode, char* resultString)
+    {
+        std::unique_ptr<char[]> response(resultString);
+        if (resultCode != 0) {
+            setError(std::string("PLAY 失败：") + (resultString == nullptr ? "" : resultString));
+            requestEventLoopExit();
+        }
+    }
+
+    void setupNextSubsession(Client& clientRef)
+    {
+        while ((clientRef.state.subsession = clientRef.state.iterator->next()) != nullptr) {
+            MediaSubsession& subsession = *clientRef.state.subsession;
+            VideoCodec codec;
+            if (!codecFromSubsession(subsession, codec)) {
+                continue;
+            }
+            if (clientRef.state.hasSelectedVideo) {
+                // 一个 RtspStream 对应一路视频；多视频 track 应创建多个客户端实例。
+                continue;
+            }
+            if (!subsession.initiate()) {
+                setError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
+                requestEventLoopExit();
+                return;
+            }
+
+            clientRef.state.selectedCodec = codec;
+            clientRef.state.hasSelectedVideo = true;
+            codec_.store(codec);
+            clientRef.sendSetupCommand(subsession, continueAfterSETUP, False, requestRtpOverTcp_ ? True : False);
+            return;
+        }
+
+        if (!clientRef.state.hasSelectedVideo) {
+            setError("RTSP 流中没有 H264/H265 视频轨道");
+            requestEventLoopExit();
+            return;
+        }
+        clientRef.sendPlayCommand(*clientRef.state.session, continueAfterPLAY);
+    }
+
+    static bool closeSinks(Client& clientRef)
+    {
+        if (clientRef.state.session == nullptr) {
+            return false;
+        }
+        bool sessionWasActive = false;
+        MediaSubsessionIterator iterator(*clientRef.state.session);
+        MediaSubsession* subsession = nullptr;
+        while ((subsession = iterator.next()) != nullptr) {
+            if (subsession->sink != nullptr) {
+                Medium::close(subsession->sink);
+                subsession->sink = nullptr;
+                sessionWasActive = true;
+            }
+        }
+        return sessionWasActive;
+    }
+
+    void requestEventLoopExit()
+    {
+        setEventLoopWatchValue(1);
+    }
+
+    void setEventLoopWatchValue(char value)
+    {
+#if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
+        eventLoopWatchVariable.store(value);
+#else
+        eventLoopWatchVariable = value;
+#endif
+    }
+
+    void setError(const std::string& message)
+    {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        lastError_ = message;
+    }
+
+    void clearError()
+    {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        lastError_.clear();
+    }
+
+    mutable std::mutex lifecycleMutex;
+    mutable std::mutex errorMutex;
+    std::thread eventThread;
+    std::atomic_bool running {false};
+    std::atomic<VideoCodec> codec_ {VideoCodec::H264};
+#if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
+    EventLoopWatchVariable eventLoopWatchVariable {0};
+#else
+    char volatile eventLoopWatchVariable = 0;
+#endif
+
+    TaskScheduler* scheduler = nullptr;
+    UsageEnvironment* env = nullptr;
+    Client* client = nullptr;
+    EventTriggerId stopTrigger = 0;
+
+    std::string url_;
+    AnnexBNaluCallback naluCallback_;
+    bool requestRtpOverTcp_ = false;
+    std::string lastError_;
+};
+
+Live555RtspClient::Live555RtspClient()
+    : impl_(std::make_unique<Impl>())
+{
+}
+
+Live555RtspClient::~Live555RtspClient()
+{
+    stop();
+}
+
+bool Live555RtspClient::start(const std::string& url,
+                              AnnexBNaluCallback naluCallback,
+                              bool requestRtpOverTcp)
+{
+    return impl_->start(url, std::move(naluCallback), requestRtpOverTcp);
+}
+
+void Live555RtspClient::stop()
+{
+    impl_->stop();
+}
+
+bool Live555RtspClient::isRunning() const
+{
+    return impl_->isRunning();
+}
+
+VideoCodec Live555RtspClient::codec() const
+{
+    return impl_->codec();
+}
+
+std::string Live555RtspClient::lastError() const
+{
+    return impl_->lastError();
+}
