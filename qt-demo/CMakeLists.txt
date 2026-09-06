@@ -20,19 +20,17 @@ qt_add_executable(appqt-demo
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/V4L2CameraSource.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaAllocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaBufferPool.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/RgaEngine.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/MppDecoder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/MppEncoder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/rkmpp_c/mpp_simple.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hw/rkmpp_c/mpp_advance.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/RgaEngine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppDecoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppEncoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mpp_simple.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mpp_advance.c
 	${CMAKE_CURRENT_SOURCE_DIR}/../src/AppRuntime.cpp
 
 )
 
 target_include_directories(appqt-demo PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include/hw
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include/hw/rkmpp_c
     ${CMAKE_SYSROOT}/usr/include/rga
     ${CMAKE_SYSROOT}/usr/include/rockchip
     ${CMAKE_SYSROOT}/usr/include/libdrm

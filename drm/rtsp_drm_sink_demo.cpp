@@ -2,8 +2,8 @@
 #include "Log.hpp"
 #include "VideoFrame.hpp"
 #include "drm_display.h"
-#include "hw/MppDecoder.hpp"
-#include "hw/RgaEngine.hpp"
+#include "MppDecoder.hpp"
+#include "RgaEngine.hpp"
 
 #include "Live555RtspClient.hh"
 

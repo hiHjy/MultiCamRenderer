@@ -1,7 +1,7 @@
 #pragma once
 
 #include "VideoFrame.hpp"
-#include "hw/MppTypes.hpp"
+#include "MppTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>

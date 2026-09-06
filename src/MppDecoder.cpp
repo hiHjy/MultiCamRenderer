@@ -1,8 +1,8 @@
-#include "hw/MppDecoder.hpp"
+#include "MppDecoder.hpp"
 
 #include "Log.hpp"
-#include "hw/rkmpp_c/mpp_advance.h"
-#include "hw/rkmpp_c/mpp_simple.h"
+#include "mpp_advance.h"
+#include "mpp_simple.h"
 
 #include <algorithm>
 #include <cstring>

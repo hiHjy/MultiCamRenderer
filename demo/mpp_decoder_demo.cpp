@@ -1,6 +1,6 @@
 #include "DmaAllocator.hpp"
 #include "VideoFrame.hpp"
-#include "hw/MppDecoder.hpp"
+#include "MppDecoder.hpp"
 
 #include <algorithm>
 #include <cstdint>

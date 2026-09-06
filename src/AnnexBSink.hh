@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "VideoCodec.hh"
+#include "VideoCodec.hpp"
 
 // live555 的 RTP 解包器把一个完整 NALU 交给 MediaSink。这个类补上 Annex-B
 // 起始码后同步调用上层回调；data 的有效期只到回调返回为止。

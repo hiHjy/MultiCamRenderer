@@ -1,7 +1,7 @@
-#include "hw/MppEncoder.hpp"
+#include "MppEncoder.hpp"
 
 #include "Log.hpp"
-#include "hw/rkmpp_c/mpp_simple.h"
+#include "mpp_simple.h"
 
 #include <cstring>
 #include <sstream>

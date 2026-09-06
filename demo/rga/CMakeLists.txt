@@ -10,13 +10,12 @@ find_package(Qt6 REQUIRED COMPONENTS Gui)
 add_executable(rga_ops_demo
     main.cpp
     ../../src/DmaAllocator.cpp
-    ../../src/hw/RgaEngine.cpp
+    ../../src/RgaEngine.cpp
 )
 
 target_include_directories(rga_ops_demo PRIVATE
     ../../include
-    ../../include/hw
-    /home/alientek/rk3568_linux5.10_sdk/buildroot/output/rockchip_atk_dlrk3568/host/aarch64-buildroot-linux-gnu/sysroot/usr/include/rga
+    ${CMAKE_SYSROOT}/usr/include/rga
 )
 
 target_link_libraries(rga_ops_demo PRIVATE

@@ -5,7 +5,7 @@
 #include "Sink.hpp"
 #include "VideoFrame.hpp"
 #include "DmaBufferPool.hpp"
-#include "hw/RgaEngine.hpp"
+#include "RgaEngine.hpp"
 
 #include <array>
 #include <chrono>

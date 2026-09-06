@@ -7,7 +7,7 @@
 #include <memory>
 #include <string>
 
-#include "VideoCodec.hh"
+#include "VideoCodec.hpp"
 
 // 单路 RTSP 拉流封装。它只完成 RTSP/RTP 和 NALU 重组，不做 access unit 组帧，
 // 也不做解码。MPP 已打开 split_parse 时，可直接连续接收每个 Annex-B NALU。

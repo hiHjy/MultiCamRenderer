@@ -31,7 +31,7 @@ DecodeWorker 线程
 
 ## 1. 程序入口
 
-示例入口是 `drm/RtspStreamDemo.cpp`：
+示例入口是 `demo/RtspStreamDemo.cpp`：
 
 ```cpp
 RtspStream stream("rtsp://192.168.1.5:8554/live", 2);
@@ -70,11 +70,11 @@ m_client->start(m_url,
 
 这里先启动 DecodeWorker，再启动 live555。这样服务端在 `PLAY` 后立即发送 RTP 时，压缩 NALU 已有消费者。
 
-`VideoCodec` 是传输层通用编码类型，`toMppCodec()` 位于 `include/hw/MppTypes.hpp`，负责统一转换成硬件 MPP 的 `MppCodec`。业务代码不能各自再写一份 H264/H265 的转换 switch。
+`VideoCodec` 是传输层通用编码类型，`toMppCodec()` 位于 `include/MppTypes.hpp`，负责统一转换成硬件 MPP 的 `MppCodec`。业务代码不能各自再写一份 H264/H265 的转换 switch。
 
 ## 3. live555 的异步 RTSP 状态机
 
-`Live555RtspClient::start()` 会新建事件线程。线程入口为 `drm/live555/Live555RtspClient.cpp` 的 `eventThreadMain()`：
+`Live555RtspClient::start()` 会新建事件线程。线程入口为 `src/Live555RtspClient.cpp` 的 `eventThreadMain()`：
 
 ```cpp
 setupLive555();

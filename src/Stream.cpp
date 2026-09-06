@@ -1,8 +1,8 @@
 #include "Stream.hpp"
 
 #include "Log.hpp"
-#include "hw/MppDecoder.hpp"
-#include "hw/RgaEngine.hpp"
+#include "MppDecoder.hpp"
+#include "RgaEngine.hpp"
 
 #include <condition_variable>
 #include <deque>

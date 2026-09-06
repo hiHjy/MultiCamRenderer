@@ -2,7 +2,7 @@
 
 #include "DmaBufferPool.hpp"
 #include "VideoFrame.hpp"
-#include "hw/MppTypes.hpp"
+#include "MppTypes.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -42,7 +42,7 @@ protected:
     // 传入 2，以吸收轻微调度抖动，同时保持显示追赶最新画面；录像不经过此队列。
     explicit Stream(size_t readyQueueCapacity);
 
-    // 派生类从网络回调进入这里。data 只需要在本函数返回前有效；DecodeWorker 会复制。
+    // 派生类从网络回调进入这里。data 只需要在本函数返回前有效；DecodeWorker 会复制。后续如果加录像应该从这里入手
     void onPacket(MppCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs);
 
     bool startDecodeWorker();

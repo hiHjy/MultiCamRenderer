@@ -1,6 +1,6 @@
 #include "DmaAllocator.hpp"
 #include "VideoFrame.hpp"
-#include "hw/RgaEngine.hpp"
+#include "RgaEngine.hpp"
 
 #include <QImage>
 

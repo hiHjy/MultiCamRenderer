@@ -2232,3 +2232,27 @@ git diff --check
 ```
 
 两个 aarch64 RTSP 目标均交叉编译通过；仅保留已有 MPP C 源文件的 unused-function 编译警告。
+
+## 2026-09-06
+
+### 源码布局与 WSL 统一构建整理
+
+为让模块职责和目录名一致，本次将实现源码收口为扁平的 `src/`，不再保留与具体实现无关的 `hw/`、`sink/` 和 `drm/live555/` 中间目录：
+
+- MPP、RGA 与 rkmpp C 适配层移至 `src/`，对应公开头文件移至扁平的 `include/`。
+- live555 拉流客户端 `Live555RtspClient`、`AnnexBSink` 直接置于 `src/`；third_party 的 live555 库仍只作为外部依赖保留在 `third_party/live555/`。
+- `RgaCopySink` 和只依赖它的旧 `rga_test` 已移除；旧 `cam_manager_demo`、`test` 也已移除。
+- 不依赖 DRM 的 RTSP 学习 demo 移至 `demo/`；`drm/` 只保留 DRM 显示相关 demo 与代码。
+
+根目录 `wsl-build.sh` 现在是 RK3568 WSL 的唯一 demo 构建入口，统一生成：MPP、V4L2、DMA、FrameLease、RTSP、DRM，以及 Qt/RGA 的 `rga_ops_demo`。Qt 应用本身仍通过 `qt-demo/wsl-build.sh` 单独构建。
+
+`demo/rga/build.sh` 改用 `qt-demo/wsl-toolchain.cmake` 和 `/opt/rk3568_kernel_pack` 的 WSL 交叉工具链；不再触碰非 WSL 的旧 toolchain 配置。
+
+验证：
+
+```bash
+./wsl-build.sh
+git diff --check
+```
+
+全部 aarch64 demo 目标和 `rga_ops_demo` 均交叉编译通过。

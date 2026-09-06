@@ -4,7 +4,7 @@
 #include "Sink.hpp"
 #include "VideoTypes.hpp"
 #include "drm_display.h"
-#include "hw/RgaEngine.hpp"
+#include "RgaEngine.hpp"
 
 #include <cerrno>
 #include <chrono>
