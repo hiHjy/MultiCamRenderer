@@ -2139,3 +2139,59 @@ MJPEG 解码 + CamManager + RGA 等非 Qt 部分约 17% 左右
 ```
 
 这个结果比早期两路 MJPEG Qt Quick `68%~72%` 的状态更健康，说明这轮 MJPEG 参数语义和同步路径收口是有价值的。
+
+## 2026-09-06
+
+### RTSP 拉流、解码与稳定裸帧输出
+
+本日将已验证的 live555 RTSP 客户端接入 `Stream` 基座，形成一路网络视频的完整异步链路：
+
+```text
+live555 事件线程
+  -> Annex-B 压缩 NALU 回调
+  -> DecodeWorker 有界压缩队列（复制压缩数据）
+  -> MPP H.264/H.265 解码
+  -> RGA copy 到 Stream 自己的 DmaBufferPool
+  -> readyQueue（稳定 FramePacket）
+  -> StreamManager / FrameHub / Sink
+```
+
+新增模块：
+
+- `RtspStream`：继承 `Stream`。不要求调用方传 codec，live555 从 SDP 识别 H.264/H.265 后，按实际 codec 初始化 MPP decoder。
+- `Stream::DecodeWorker`：每路 `Stream` 独占一条 worker 线程，live555 回调只复制并投递压缩包，不在事件线程做 MPP/RGA 工作。
+- `RtspStreamDemo`：最小拉流、MPP 解码、RGA 稳定化和 readyQueue 验证程序。
+
+### 稳定输出与分辨率变化
+
+MPP 解码输出是临时资源，不能直接交给外部。因此每帧都通过 RGA copy 到 `Stream` 自己的输出 `DmaBufferPool`，再以带 `FrameLease` 的 `FramePacket` 发布。当前每路输出池为 4 块 DMA buffer。
+
+当码流中的输出 layout（宽、高、stride、heightStride、格式）发生变化时，创建新 pool 并切换到新 pool。旧 `FramePacket` 的 lease 会继续持有旧 pool，所以 Sink 尚未释放旧 dma-buf 时不会被提前回收。
+
+### readyQueue 与丢帧策略
+
+`RtspStream` 的 `readyQueueCapacity` 默认定为 `2`：它只缓存已经解码完成、但尚未被上游 Manager 取走的稳定裸帧。队列满时淘汰最旧帧，以控制实时显示延迟。录像不应依赖这条裸帧队列，后续应从压缩码流独立分支写文件。
+
+同时增加基座 `LOG_WARN` 丢帧统计，按累计值、最多每秒输出一次，并在 stop 时输出最终累计值：
+
+- `readyQueue淘汰`：新裸帧到来时淘汰尚未消费的最旧帧。
+- `pool被下游lease占满`：所有 pool buffer 均被 Hub/Sink 持有，当前新裸帧无法落池。
+
+当 pool 暂时没有空闲 buffer 时，先只淘汰一条最旧 ready 帧并重试 acquire；不会因为容量大于 1 而清空整个 readyQueue。
+
+### 板端验证
+
+在 RK3568 上拉取 RV1126B 的 `H.264 1280x720` RTSP 流，MPP/RGA 链路稳定约 `24 fps`。约 3370 帧解码输出中，readyQueue 容量为 2 时累计淘汰约 31 帧（约 0.9%），`pool被下游lease占满=0`。这是 demo 轮询与调度抖动造成的低延迟旧裸帧淘汰，不是 RTP/NALU 丢包，也不会破坏解码参考链。
+
+`RtspStreamDemo` 直接调用 `stream.start()`，未经过 `StreamManager` 分配 id，因此日志中的 `streamId=-1` 属于预期现象。
+
+### 构建
+
+`drm/wsl-build-rtsp-mpp-demo.sh` 默认构建目标调整为：
+
+```text
+RtspStreamDemo.cpp
+  -> build-wsl-aarch64/rtsp_stream_demo
+```
+
+仍可通过 `DEMO_SOURCE` 和 `DEMO_OUTPUT` 环境变量切换回旧的直接 MPP demo。

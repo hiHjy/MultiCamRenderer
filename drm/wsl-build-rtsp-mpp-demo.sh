@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build-wsl-aarch64"
+# 默认编译基于 Stream/RtspStream 的完整拉流、解码、稳定输出 demo。
+# 需要旧的直接 MPP demo 时，可显式传入 DEMO_SOURCE/DEMO_OUTPUT 覆盖。
+DEMO_SOURCE="${DEMO_SOURCE:-${SCRIPT_DIR}/RtspStreamDemo.cpp}"
+DEMO_OUTPUT="${DEMO_OUTPUT:-${BUILD_DIR}/rtsp_stream_demo}"
 TOOLCHAIN_DIR="/opt/rk3568_kernel_pack/toolchain/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin"
 SYSROOT="/opt/rk3568_kernel_pack/sysroot"
 LIVE555_DIR="${ROOT_DIR}/third_party/live555"
@@ -12,7 +16,7 @@ CC="${TOOLCHAIN_DIR}/aarch64-none-linux-gnu-gcc"
 CXX="${TOOLCHAIN_DIR}/aarch64-none-linux-gnu-g++"
 
 for required in \
-    "${SCRIPT_DIR}/RtspMppDecoderDemo.cpp" \
+    "${DEMO_SOURCE}" \
     "${LIVE555_CLIENT_DIR}/Live555RtspClient.cpp" \
     "${LIVE555_CLIENT_DIR}/AnnexBSink.cpp" \
     "${LIVE555_DIR}/lib/aarch64/libliveMedia.a" \
@@ -32,6 +36,7 @@ COMMON_CFLAGS=(
     -I"${ROOT_DIR}/include/hw/rkmpp_c"
     -I"${SYSROOT}/usr/include/rockchip"
     -I"${SYSROOT}/usr/include/libdrm"
+    -I"${SYSROOT}/usr/include/rga"
 )
 
 CXXFLAGS=(
@@ -47,6 +52,7 @@ CXXFLAGS=(
     -I"${LIVE555_DIR}/include/UsageEnvironment"
     -I"${SYSROOT}/usr/include/rockchip"
     -I"${SYSROOT}/usr/include/libdrm"
+    -I"${SYSROOT}/usr/include/rga"
 )
 
 "${CC}" "${COMMON_CFLAGS[@]}" -c "${ROOT_DIR}/src/hw/rkmpp_c/mpp_simple.c" \
@@ -55,10 +61,15 @@ CXXFLAGS=(
     -o "${BUILD_DIR}/mpp_advance.o"
 
 "${CXX}" "${CXXFLAGS[@]}" \
-    "${SCRIPT_DIR}/RtspMppDecoderDemo.cpp" \
+    "${DEMO_SOURCE}" \
     "${LIVE555_CLIENT_DIR}/Live555RtspClient.cpp" \
     "${LIVE555_CLIENT_DIR}/AnnexBSink.cpp" \
+    "${ROOT_DIR}/src/Stream.cpp" \
+    "${ROOT_DIR}/src/RtspStream.cpp" \
+    "${ROOT_DIR}/src/DmaAllocator.cpp" \
+    "${ROOT_DIR}/src/DmaBufferPool.cpp" \
     "${ROOT_DIR}/src/hw/MppDecoder.cpp" \
+    "${ROOT_DIR}/src/hw/RgaEngine.cpp" \
     "${BUILD_DIR}/mpp_simple.o" \
     "${BUILD_DIR}/mpp_advance.o" \
     -L"${LIVE555_DIR}/lib/aarch64" \
@@ -66,7 +77,7 @@ CXXFLAGS=(
     -lliveMedia -lgroupsock -lBasicUsageEnvironment -lUsageEnvironment \
     -Wl,--end-group \
     -L"${SYSROOT}/usr/lib" \
-    -lrockchip_mpp -ldrm -lpthread \
-    -o "${BUILD_DIR}/rtsp_mpp_decoder_demo"
+    -lrockchip_mpp -lrga -ldrm -lpthread \
+    -o "${DEMO_OUTPUT}"
 
-echo "built: ${BUILD_DIR}/rtsp_mpp_decoder_demo"
+echo "built: ${DEMO_OUTPUT}"
