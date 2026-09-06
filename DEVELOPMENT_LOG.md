@@ -2195,3 +2195,40 @@ RtspStreamDemo.cpp
 ```
 
 仍可通过 `DEMO_SOURCE` 和 `DEMO_OUTPUT` 环境变量切换回旧的直接 MPP demo。
+
+### Codec 类型收口、热路径异常规则与学习文档
+
+为避免 RTSP、DRM demo 和后续其他输入源各自维护一份 `VideoCodec -> MppCodec` 的转换逻辑，新增通用 `include/VideoCodec.hpp`，并在 `include/hw/MppTypes.hpp` 集中提供：
+
+```cpp
+constexpr MppCodec toMppCodec(VideoCodec codec);
+```
+
+`RtspStream` 和 `rtsp_drm_sink_demo` 已删除本地重复的转换 `switch`，统一使用该函数。原 live555 目录中的 `VideoCodec.hh` 仅保留兼容 include，不再重复定义类型。
+
+同时明确实时音视频模块的错误处理规则：
+
+```text
+禁止使用 throw / try / catch 作为错误控制流。
+```
+
+`AnnexBSink::afterGettingFrame()` 是每条 NALU 都会进入的热回调，现已移除 callback 外层 `try/catch`。正常路径下异常机制通常不会逐次栈展开，但异常不是实时链路合适的错误传递方式，且不应跨越 live555/C++ 回调边界。模块内部应使用 `bool`、空指针、`lastError()` 和项目 `LOG_WARN/LOG_ERROR` 就地报告错误。
+
+新增文档：
+
+```text
+docs/rtsp_pull_flow.md
+```
+
+文档完整记录 `RtspStream::start()` 到 DESCRIBE / SETUP / PLAY、RTP 重组、Annex-B NALU、压缩队列、MPP、RGA、DMA pool、readyQueue 和停止清理顺序，并记录上述异常处理规则。
+
+验证：
+
+```bash
+cd drm
+./wsl-build-rtsp-mpp-demo.sh
+./wsl-build-rtsp-demo.sh
+git diff --check
+```
+
+两个 aarch64 RTSP 目标均交叉编译通过；仅保留已有 MPP C 源文件的 unused-function 编译警告。

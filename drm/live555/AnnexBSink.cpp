@@ -61,22 +61,9 @@ void AnnexBSink::afterGettingFrame(unsigned frameSize,
             ? 0
             : static_cast<uint64_t>(presentationTime.tv_sec) * 1000000ULL
                 + static_cast<uint64_t>(presentationTime.tv_usec);
-        try {
-            // receiveBuffer_ 的前四字节在构造时已写入 Annex-B 起始码。
-            naluCallback_(codec_, receiveBuffer_.data(), kAnnexBStartCodeSize + frameSize, timestampUs);
-        } catch (const std::exception& exception) {
-            const std::string message = std::string("上层 NALU 回调抛出异常：") + exception.what();
-            envir() << message.c_str() << "\n";
-            if (errorCallback_) {
-                errorCallback_(message);
-            }
-        } catch (...) {
-            const std::string message = "上层 NALU 回调抛出未知异常";
-            envir() << message.c_str() << "\n";
-            if (errorCallback_) {
-                errorCallback_(message);
-            }
-        }
+        // receiveBuffer_ 的前四字节在构造时已写入 Annex-B 起始码。
+        // 项目禁止用 C++ 异常传递错误；回调内部自行记录错误并正常返回。
+        naluCallback_(codec_, receiveBuffer_.data(), kAnnexBStartCodeSize + frameSize, timestampUs);
     }
 
     // MediaSink 不是主动轮询；处理完本次 NALU 后必须继续请求下一次。

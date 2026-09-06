@@ -4,21 +4,6 @@
 
 #include <utility>
 
-namespace {
-
-MppCodec toMppCodec(VideoCodec codec)
-{
-    switch (codec) {
-    case VideoCodec::H264:
-        return MppCodec::H264;
-    case VideoCodec::H265:
-        return MppCodec::H265;
-    }
-    return MppCodec::H264;
-}
-
-} // namespace
-
 RtspStream::RtspStream(std::string url, size_t readyQueueCapacity)
     : Stream(readyQueueCapacity),
       m_url(std::move(url)),
@@ -40,6 +25,7 @@ bool RtspStream::start()
         setError("RTSP URL 为空");
         return false;
     }
+	//启动解码线程
     if (!startDecodeWorker()) {
         setError("启动 RTSP 解码 worker 失败");
         return false;

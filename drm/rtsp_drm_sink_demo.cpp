@@ -31,17 +31,6 @@ constexpr size_t kMaxQueuedNalus = 512;
 constexpr const char* kMppLumaDumpPath = "mpp_before_rga.pgm";
 constexpr const char* kRgaLumaDumpPath = "rga_before_drm.pgm";
 
-MppCodec toMppCodec(VideoCodec codec)
-{
-    switch (codec) {
-    case VideoCodec::H264:
-        return MppCodec::H264;
-    case VideoCodec::H265:
-        return MppCodec::H265;
-    }
-    return MppCodec::H264;
-}
-
 const char* codecName(VideoCodec codec)
 {
     switch (codec) {

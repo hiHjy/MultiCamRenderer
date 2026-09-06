@@ -280,7 +280,7 @@ struct Live555RtspClient::Impl {
                 // 一个 RtspStream 对应一路视频；多视频 track 应创建多个客户端实例。
                 continue;
             }
-            if (!subsession.initiate()) {
+            if (!subsession.initiate()) {//创建RTP 接收链路和 UDP socket。
                 setError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
                 requestEventLoopExit();
                 return;
@@ -289,6 +289,10 @@ struct Live555RtspClient::Impl {
             clientRef.state.selectedCodec = codec;
             clientRef.state.hasSelectedVideo = true;
             codec_.store(codec);
+
+			//我要拉 track1；
+			//我的 RTP/RTCP 接收端口是什么；
+			//请为我建立这个媒体会话。
             clientRef.sendSetupCommand(subsession, continueAfterSETUP, False, requestRtpOverTcp_ ? True : False);
             return;
         }
