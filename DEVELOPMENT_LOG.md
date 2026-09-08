@@ -2285,3 +2285,36 @@ git diff --check
 ```
 
 非 Qt 的 11 个 aarch64 目标、Qt `app` 与 `rga_ops_demo` 均交叉编译通过。
+
+## 2026-09-08
+
+### 完善 live555 客户端与 Annex-B Sink 学习文档
+
+新增 `docs/live555_client_workflow.md`，将当前 RTSP 客户端的异步状态机按真实代码顺序整理为：
+
+```text
+start
+→ DESCRIBE / SDP / MediaSession
+→ MediaSubsessionIterator
+→ initiate 本地 RTP 接收链
+→ SETUP 传输协商
+→ AnnexBSink::startPlaying
+→ PLAY
+→ RTP 重组后的 Annex-B NALU 回调
+→ stop / EventTrigger / cleanup
+```
+
+文档额外说明了 `MediaSession` 与 `MediaSubsession` 的关系、未来音频 track 的接入方式、UDP/TCP 协商，以及配套 IPC 服务端 `reuseFirstSource=true` 时多客户端共享实时 source 的含义。
+
+`AnnexBSink` 章节记录了可复用 `receiveBuffer_` 的 `00 00 00 01 + NALU payload` 内存布局、截断处理、静态 live555 回调转成员函数的原因，以及每次处理完成后必须调用 `continuePlaying()` 重新登记下一条 NALU 的原因。
+
+同时将 `AnnexBSink.hh`、`Live555RtspClient.hh` 作为公开接口放入 `include/`，实现仍在 `src/`；相关回调和 SETUP 注释改为中文且补充准确的协议语义。
+
+验证：
+
+```bash
+./wsl-build.sh build
+git diff --check
+```
+
+三个 RTSP aarch64 demo 均重新编译、链接通过。

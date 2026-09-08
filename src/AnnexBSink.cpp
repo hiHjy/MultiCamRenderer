@@ -44,6 +44,7 @@ void AnnexBSink::afterGettingFrame(void* clientData,
         frameSize, numTruncatedBytes, presentationTime, durationInMicroseconds);
 }
 
+// 关键数据回调：向上层交付带 Annex-B 起始码的完整 NALU。
 void AnnexBSink::afterGettingFrame(unsigned frameSize,
                                    unsigned numTruncatedBytes,
                                    timeval presentationTime,
@@ -63,11 +64,12 @@ void AnnexBSink::afterGettingFrame(unsigned frameSize,
                 + static_cast<uint64_t>(presentationTime.tv_usec);
         // receiveBuffer_ 的前四字节在构造时已写入 Annex-B 起始码。
         // 项目禁止用 C++ 异常传递错误；回调内部自行记录错误并正常返回。
+        // 这是 Live555RtspClient::start() 传入的上层回调；buffer 仅在本次回调期间有效。
         naluCallback_(codec_, receiveBuffer_.data(), kAnnexBStartCodeSize + frameSize, timestampUs);
     }
 
     // MediaSink 不是主动轮询；处理完本次 NALU 后必须继续请求下一次。
-    continuePlaying();
+    continuePlaying(); // 向 live555 登记下一条 NALU 的接收请求。
 }
 
 Boolean AnnexBSink::continuePlaying()

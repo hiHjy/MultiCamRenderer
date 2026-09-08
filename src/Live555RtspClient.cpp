@@ -58,11 +58,14 @@ struct Live555RtspClient::Impl {
             return new Client(env, url, owner);
         }
 
+        // RTSPClient 的异步回调只给出 RTSPClient*；通过 owner 回到本 Impl。
         PullClientState state;
         Impl& owner;
 
     private:
         Client(UsageEnvironment& env, const char* url, Impl& owner)
+            // env：live555 的事件/日志环境；url：待连接的 RTSP 地址。
+            // 1：日志详细度；0：不走 HTTP tunnel；-1：由 live555 创建 RTSP TCP socket。
             : RTSPClient(env, url, 1, "Live555RtspClient", 0, -1), owner(owner)
         {
         }
@@ -126,6 +129,8 @@ struct Live555RtspClient::Impl {
     void eventThreadMain()
     {
         if (setupLive555()) {
+            // 阻塞处理 RTSP 控制响应、RTP/RTCP socket 事件和 live555 定时任务。
+            // watch 变量变为非 0 时退出循环，随后统一释放 live555 对象。
             env->taskScheduler().doEventLoop(&eventLoopWatchVariable);
         }
         cleanupLive555();
@@ -147,13 +152,17 @@ struct Live555RtspClient::Impl {
             return false;
         }
 
+        // stop() 可从其他线程调用；triggerEvent() 用它唤醒阻塞的 doEventLoop()。
         stopTrigger = scheduler->createEventTrigger(stopEventCallback);
+
+        // *env 是 live555 环境；url_.c_str() 是 RTSP URL；*this 用于异步回调回到 Impl。
         client = Client::createNew(*env, url_.c_str(), *this);
         if (client == nullptr) {
             setError(std::string("创建 RTSPClient 失败：") + env->getResultMsg());
             return false;
         }
 
+        // 异步请求 SDP；响应到达后由 continueAfterDESCRIBE() 接续处理。
         client->sendDescribeCommand(continueAfterDESCRIBE);
         return true;
     }
@@ -184,11 +193,14 @@ struct Live555RtspClient::Impl {
 
     static void stopEventCallback(void* clientData)
     {
+        // 此回调不做业务：它的唯一职责是把 TaskScheduler 从阻塞等待中唤醒。
+        // 真正的退出条件是 eventLoopWatchVariable 已被 stop() 置为 1。
         (void)clientData;
     }
 
     static void continueAfterDESCRIBE(RTSPClient* rtspClient, int resultCode, char* resultString)
     {
+        // live555 使用静态 C 风格回调；Client 保存 owner，因此可转回 Impl 成员函数。
         auto* client = static_cast<Client*>(rtspClient);
         client->owner.continueAfterDESCRIBE(*client, resultCode, resultString);
     }
@@ -221,6 +233,7 @@ struct Live555RtspClient::Impl {
             return;
         }
 
+        // resultString 是 SDP；MediaSession 解析出其中的 MediaSubsession（各个 track）。
         clientRef.state.session = MediaSession::createNew(clientRef.envir(), resultString);
         if (clientRef.state.session == nullptr || !clientRef.state.session->hasSubsessions()) {
             setError(std::string("SDP 没有可用媒体轨道：") + clientRef.envir().getResultMsg());
@@ -242,6 +255,7 @@ struct Live555RtspClient::Impl {
         }
 
         MediaSubsession& subsession = *clientRef.state.subsession;
+        // readSource() 产生已完成 RTP 解包/分片重组的帧；AnnexBSink 负责补 Annex-B 起始码。
         subsession.sink = AnnexBSink::createNew(
             clientRef.envir(),
             clientRef.state.selectedCodec,
@@ -280,7 +294,9 @@ struct Live555RtspClient::Impl {
                 // 一个 RtspStream 对应一路视频；多视频 track 应创建多个客户端实例。
                 continue;
             }
-            if (!subsession.initiate()) {//创建RTP 接收链路和 UDP socket。
+            // 按 SDP 在本地创建 RTP/RTCP 接收链路；UDP 模式下也会在此申请本地接收端口。
+            // 这一步尚未通知服务端，服务端侧传输会话由后面的 SETUP 建立。
+            if (!subsession.initiate()) {
                 setError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
                 requestEventLoopExit();
                 return;
@@ -290,9 +306,8 @@ struct Live555RtspClient::Impl {
             clientRef.state.hasSelectedVideo = true;
             codec_.store(codec);
 
-			//我要拉 track1；
-			//我的 RTP/RTCP 接收端口是什么；
-			//请为我建立这个媒体会话。
+            // 请求服务端为该 track 建立传输会话：
+            // UDP 时携带本地 RTP/RTCP 端口；TCP 时请求 RTP over RTSP interleaved。
             clientRef.sendSetupCommand(subsession, continueAfterSETUP, False, requestRtpOverTcp_ ? True : False);
             return;
         }
@@ -302,6 +317,7 @@ struct Live555RtspClient::Impl {
             requestEventLoopExit();
             return;
         }
+        // Sink 已先登记 getNextFrame()；现在通知服务端正式开始发送 RTP。
         clientRef.sendPlayCommand(*clientRef.state.session, continueAfterPLAY);
     }
 
@@ -325,6 +341,7 @@ struct Live555RtspClient::Impl {
 
     void requestEventLoopExit()
     {
+        // 在事件线程内设置退出条件即可；外部线程 stop() 还会额外 triggerEvent() 唤醒循环。
         setEventLoopWatchValue(1);
     }
 
