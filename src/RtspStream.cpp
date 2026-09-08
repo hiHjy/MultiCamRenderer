@@ -18,31 +18,37 @@ RtspStream::~RtspStream()
 
 bool RtspStream::start()
 {
-    if (m_started) {
+    if (m_started.load()) {
         return true;
     }
     if (m_url.empty()) {
         setError("RTSP URL 为空");
         return false;
     }
-	//启动解码线程
+    // 异步 RTSP 失败后 DecodeWorker 会保留到下一次 start；重连前先确保旧 MPP 状态已释放。
+    stopDecodeWorker();
     if (!startDecodeWorker()) {
         setError("启动 RTSP 解码 worker 失败");
         return false;
     }
 
     clearError();
+    m_started.store(true);
     if (!m_client->start(
             m_url,
             [this](VideoCodec codec, uint8_t* data, size_t size, uint64_t timestampUs) {
                 onPacket(toMppCodec(codec), data, size, timestampUs);
+            },
+            false,
+            [this](Live555RtspClient::State state, const std::string& message) {
+                onRtspClientState(state, message);
             })) {
         setError("启动 live555 RTSP 客户端失败: " + m_client->lastError());
+        m_started.store(false);
         stopDecodeWorker();
         return false;
     }
 
-    m_started = true;
     return true;
 }
 
@@ -52,6 +58,29 @@ bool RtspStream::stop()
         m_client->stop();
     }
     stopDecodeWorker();
-    m_started = false;
+    m_started.store(false);
+    reportRuntimeState(RuntimeState::Stopped);
     return true;
+}
+
+void RtspStream::onRtspClientState(Live555RtspClient::State state, const std::string& message)
+{
+    switch (state) {
+    case Live555RtspClient::State::Connecting:
+        reportRuntimeState(RuntimeState::Connecting);
+        return;
+    case Live555RtspClient::State::Playing:
+        reportRuntimeState(RuntimeState::Streaming);
+        return;
+    case Live555RtspClient::State::Stopped:
+        m_started.store(false);
+        reportRuntimeState(RuntimeState::Stopped);
+        return;
+    case Live555RtspClient::State::Error:
+        m_started.store(false);
+        clearDecodePackets();
+        setError(message);
+        reportRuntimeState(RuntimeState::Error, message);
+        return;
+    }
 }

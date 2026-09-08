@@ -72,10 +72,17 @@ struct Live555RtspClient::Impl {
         ~Client() override = default;
     };
 
-    bool start(const std::string& url, AnnexBNaluCallback naluCallback, bool requestRtpOverTcp)
+    bool start(const std::string& url,
+               AnnexBNaluCallback naluCallback,
+               bool requestRtpOverTcp,
+               StateCallback stateCallback)
     {
         if (url.empty() || !naluCallback) {
-            setError("RTSP URL 或 NALU 回调为空");
+            const std::string message = "RTSP URL 或 NALU 回调为空";
+            setError(message);
+            if (stateCallback) {
+                stateCallback(State::Error, message);
+            }
             return false;
         }
 
@@ -84,12 +91,16 @@ struct Live555RtspClient::Impl {
             std::lock_guard<std::mutex> lock(lifecycleMutex);
             url_ = url;
             naluCallback_ = std::move(naluCallback);
+            stateCallback_ = std::move(stateCallback);
             requestRtpOverTcp_ = requestRtpOverTcp;
             codec_.store(VideoCodec::H264);
             setEventLoopWatchValue(0);
+            stopRequestedByCaller.store(false);
+            terminalStateReported.store(false);
             running.store(true);
         }
         clearError();
+        notifyState(State::Connecting, {});
         eventThread = std::thread(&Impl::eventThreadMain, this);
         return true;
     }
@@ -98,6 +109,7 @@ struct Live555RtspClient::Impl {
     {
         {
             std::lock_guard<std::mutex> lock(lifecycleMutex);
+            stopRequestedByCaller.store(true);
             setEventLoopWatchValue(1);
             if (scheduler != nullptr && stopTrigger != 0) {
                 scheduler->triggerEvent(stopTrigger, this);
@@ -135,33 +147,53 @@ struct Live555RtspClient::Impl {
         }
         cleanupLive555();
         running.store(false);
+
+        if (stopRequestedByCaller.load()) {
+            notifyState(State::Stopped, {});
+            return;
+        }
+
+        // 异步失败路径通常已通过 reportError() 上报；这里覆盖没有明确错误信息的异常退出。
+        if (!terminalStateReported.exchange(true)) {
+            std::string message = lastError();
+            if (message.empty()) {
+                message = "RTSP 事件循环异常退出";
+                setError(message);
+            }
+            notifyState(State::Error, message);
+        }
     }
 
     bool setupLive555()
     {
-        std::lock_guard<std::mutex> lock(lifecycleMutex);
-        scheduler = BasicTaskScheduler::createNew();
-        if (scheduler == nullptr) {
-            setError("创建 TaskScheduler 失败");
-            return false;
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            scheduler = BasicTaskScheduler::createNew();
+            if (scheduler == nullptr) {
+                error = "创建 TaskScheduler 失败";
+            } else {
+                env = BasicUsageEnvironment::createNew(*scheduler);
+                if (env == nullptr) {
+                    error = "创建 UsageEnvironment 失败";
+                } else {
+                    // stop() 可从其他线程调用；triggerEvent() 用它唤醒阻塞的 doEventLoop()。
+                    stopTrigger = scheduler->createEventTrigger(stopEventCallback);
+
+                    // *env 是 live555 环境；url_.c_str() 是 RTSP URL；*this 用于异步回调回到 Impl。
+                    client = Client::createNew(*env, url_.c_str(), *this);
+                    if (client == nullptr) {
+                        error = std::string("创建 RTSPClient 失败：") + env->getResultMsg();
+                    }
+                }
+            }
         }
 
-        env = BasicUsageEnvironment::createNew(*scheduler);
-        if (env == nullptr) {
-            setError("创建 UsageEnvironment 失败");
+        // 状态回调可能回到 Manager，不能在 lifecycleMutex 持有期间触发。
+        if (!error.empty()) {
+            reportError(error);
             return false;
         }
-
-        // stop() 可从其他线程调用；triggerEvent() 用它唤醒阻塞的 doEventLoop()。
-        stopTrigger = scheduler->createEventTrigger(stopEventCallback);
-
-        // *env 是 live555 环境；url_.c_str() 是 RTSP URL；*this 用于异步回调回到 Impl。
-        client = Client::createNew(*env, url_.c_str(), *this);
-        if (client == nullptr) {
-            setError(std::string("创建 RTSPClient 失败：") + env->getResultMsg());
-            return false;
-        }
-
         // 异步请求 SDP；响应到达后由 continueAfterDESCRIBE() 接续处理。
         client->sendDescribeCommand(continueAfterDESCRIBE);
         return true;
@@ -220,7 +252,7 @@ struct Live555RtspClient::Impl {
     static void afterSubsessionPlaying(void* clientData)
     {
         auto* client = static_cast<Client*>(clientData);
-        client->owner.setError("RTP 视频源已关闭");
+        client->owner.reportError("RTP 视频源已关闭");
         client->owner.requestEventLoopExit();
     }
 
@@ -228,7 +260,7 @@ struct Live555RtspClient::Impl {
     {
         std::unique_ptr<char[]> response(resultString);
         if (resultCode != 0) {
-            setError(std::string("DESCRIBE 失败：") + (resultString == nullptr ? "" : resultString));
+            reportError(std::string("DESCRIBE 失败：") + (resultString == nullptr ? "" : resultString));
             requestEventLoopExit();
             return;
         }
@@ -236,7 +268,7 @@ struct Live555RtspClient::Impl {
         // resultString 是 SDP；MediaSession 解析出其中的 MediaSubsession（各个 track）。
         clientRef.state.session = MediaSession::createNew(clientRef.envir(), resultString);
         if (clientRef.state.session == nullptr || !clientRef.state.session->hasSubsessions()) {
-            setError(std::string("SDP 没有可用媒体轨道：") + clientRef.envir().getResultMsg());
+            reportError(std::string("SDP 没有可用媒体轨道：") + clientRef.envir().getResultMsg());
             requestEventLoopExit();
             return;
         }
@@ -249,7 +281,7 @@ struct Live555RtspClient::Impl {
     {
         std::unique_ptr<char[]> response(resultString);
         if (resultCode != 0) {
-            setError(std::string("SETUP 失败：") + (resultString == nullptr ? "" : resultString));
+            reportError(std::string("SETUP 失败：") + (resultString == nullptr ? "" : resultString));
             requestEventLoopExit();
             return;
         }
@@ -260,10 +292,13 @@ struct Live555RtspClient::Impl {
             clientRef.envir(),
             clientRef.state.selectedCodec,
             naluCallback_,
-            [this](const std::string& message) { setError(message); },
+            [this](const std::string& message) {
+                reportError(message);
+                requestEventLoopExit();
+            },
             kMaxReceivedNaluBytes);
         if (subsession.sink == nullptr) {
-            setError("创建 AnnexBSink 失败");
+            reportError("创建 AnnexBSink 失败");
             requestEventLoopExit();
             return;
         }
@@ -277,9 +312,11 @@ struct Live555RtspClient::Impl {
     {
         std::unique_ptr<char[]> response(resultString);
         if (resultCode != 0) {
-            setError(std::string("PLAY 失败：") + (resultString == nullptr ? "" : resultString));
+            reportError(std::string("PLAY 失败：") + (resultString == nullptr ? "" : resultString));
             requestEventLoopExit();
+            return;
         }
+        notifyState(State::Playing, {});
     }
 
     void setupNextSubsession(Client& clientRef)
@@ -297,7 +334,7 @@ struct Live555RtspClient::Impl {
             // 按 SDP 在本地创建 RTP/RTCP 接收链路；UDP 模式下也会在此申请本地接收端口。
             // 这一步尚未通知服务端，服务端侧传输会话由后面的 SETUP 建立。
             if (!subsession.initiate()) {
-                setError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
+                reportError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
                 requestEventLoopExit();
                 return;
             }
@@ -313,7 +350,7 @@ struct Live555RtspClient::Impl {
         }
 
         if (!clientRef.state.hasSelectedVideo) {
-            setError("RTSP 流中没有 H264/H265 视频轨道");
+            reportError("RTSP 流中没有 H264/H265 视频轨道");
             requestEventLoopExit();
             return;
         }
@@ -345,6 +382,25 @@ struct Live555RtspClient::Impl {
         setEventLoopWatchValue(1);
     }
 
+    void notifyState(State state, const std::string& message)
+    {
+        StateCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            callback = stateCallback_;
+        }
+        if (callback) {
+            callback(state, message);
+        }
+    }
+
+    void reportError(const std::string& message)
+    {
+        setError(message);
+        terminalStateReported.store(true);
+        notifyState(State::Error, message);
+    }
+
     void setEventLoopWatchValue(char value)
     {
 #if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
@@ -370,6 +426,8 @@ struct Live555RtspClient::Impl {
     mutable std::mutex errorMutex;
     std::thread eventThread;
     std::atomic_bool running {false};
+    std::atomic_bool stopRequestedByCaller {false};
+    std::atomic_bool terminalStateReported {false};
     std::atomic<VideoCodec> codec_ {VideoCodec::H264};
 #if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
     EventLoopWatchVariable eventLoopWatchVariable {0};
@@ -384,6 +442,7 @@ struct Live555RtspClient::Impl {
 
     std::string url_;
     AnnexBNaluCallback naluCallback_;
+    StateCallback stateCallback_;
     bool requestRtpOverTcp_ = false;
     std::string lastError_;
 };
@@ -400,9 +459,13 @@ Live555RtspClient::~Live555RtspClient()
 
 bool Live555RtspClient::start(const std::string& url,
                               AnnexBNaluCallback naluCallback,
-                              bool requestRtpOverTcp)
+                              bool requestRtpOverTcp,
+                              StateCallback stateCallback)
 {
-    return impl_->start(url, std::move(naluCallback), requestRtpOverTcp);
+    return impl_->start(url,
+                        std::move(naluCallback),
+                        requestRtpOverTcp,
+                        std::move(stateCallback));
 }
 
 void Live555RtspClient::stop()

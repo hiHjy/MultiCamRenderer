@@ -21,6 +21,19 @@ class StreamManager;
 // StreamManager。外部永远不会接触 live555/MPP 的临时内存。
 class Stream {
 public:
+    // 这是 source 的运行状态，不等同于 StreamManager 的生命周期状态。派生类在底层
+    // 协议真正进入播放或发生异步错误时上报，Manager 再据此更新自己的状态机。
+    enum class RuntimeState {
+        Connecting,
+        Streaming,
+        Stopped,
+        Error,
+    };
+
+    using RuntimeStateCallback = std::function<void(uint64_t generation,
+                                                    RuntimeState state,
+                                                    const std::string& message)>;
+
     virtual ~Stream();
 
     Stream(const Stream&) = delete;
@@ -47,9 +60,11 @@ protected:
 
     bool startDecodeWorker();
     void stopDecodeWorker();
+    void clearDecodePackets();
 
     void setError(const std::string& message);
     void clearError();
+    void reportRuntimeState(RuntimeState state, const std::string& message = {});
 
 private:
     friend class StreamManager;
@@ -81,6 +96,8 @@ private:
 
     void setStreamId(int streamId);
     void setFrameReadyCallback(std::function<void()> callback);
+    void setRuntimeStateCallback(RuntimeStateCallback callback);
+    void setRunGeneration(uint64_t generation);
 
 private:
     std::unique_ptr<DecodeWorker> m_decodeWorker;
@@ -95,6 +112,10 @@ private:
     mutable std::mutex m_readyMutex;
     std::deque<FramePacket> m_readyQueue;
     std::function<void()> m_frameReadyCallback;
+
+    mutable std::mutex m_runtimeStateMutex;
+    RuntimeStateCallback m_runtimeStateCallback;
+    uint64_t m_runGeneration = 0;
 
     // 统计的是稳定裸帧阶段的丢弃，不包含 RTSP/UDP 网络层和压缩 NALU 队列的丢包。
     // 日志仅在发生丢帧时最多每秒输出一次，避免反压时刷屏。

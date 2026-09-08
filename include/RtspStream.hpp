@@ -1,11 +1,11 @@
 #pragma once
 
+#include "Live555RtspClient.hh"
 #include "Stream.hpp"
 
+#include <atomic>
 #include <memory>
 #include <string>
-
-class Live555RtspClient;
 
 // 一路 RTSP 视频源。codec 不从外部传入：live555 从 SDP 选中 H264/H265 后，
 // 回调把实际 codec 交给 Stream 的 DecodeWorker 初始化对应 MPP decoder。
@@ -20,7 +20,9 @@ public:
     bool stop() override;
 
 private:
+    void onRtspClientState(Live555RtspClient::State state, const std::string& message);
+
     std::string m_url;
     std::unique_ptr<Live555RtspClient> m_client;
-    bool m_started = false;
+    std::atomic_bool m_started {false};
 };

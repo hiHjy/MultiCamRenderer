@@ -15,6 +15,67 @@ namespace {
 constexpr int kOutputPoolBufferCount = 4;
 constexpr size_t kMaxCompressedPackets = 512;
 
+enum class EncodedNaluKind {
+    Other,
+    ParameterSet,
+    RandomAccess,
+};
+
+struct EncodedNaluInfo {
+    EncodedNaluKind kind = EncodedNaluKind::Other;
+    bool hasVps = false;
+    bool hasSps = false;
+    bool hasPps = false;
+};
+
+EncodedNaluInfo inspectAnnexBNalu(MppCodec codec, const std::vector<uint8_t>& annexB)
+{
+    size_t offset = 0;
+    if (annexB.size() >= 4 && annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 0 && annexB[3] == 1) {
+        offset = 4;
+    } else if (annexB.size() >= 3 && annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 1) {
+        offset = 3;
+    } else {
+        return {};
+    }
+    if (offset >= annexB.size()) {
+        return {};
+    }
+
+    EncodedNaluInfo result;
+    if (codec == MppCodec::H264) {
+        const uint8_t nalType = annexB[offset] & 0x1FU;
+        if (nalType == 7) {
+            result.kind = EncodedNaluKind::ParameterSet;
+            result.hasSps = true;
+        } else if (nalType == 8) {
+            result.kind = EncodedNaluKind::ParameterSet;
+            result.hasPps = true;
+        } else if (nalType == 5) {
+            result.kind = EncodedNaluKind::RandomAccess;
+        }
+        return result;
+    }
+
+    if (codec == MppCodec::H265 && offset + 1 < annexB.size()) {
+        const uint8_t nalType = (annexB[offset] >> 1U) & 0x3FU;
+        if (nalType == 32) {
+            result.kind = EncodedNaluKind::ParameterSet;
+            result.hasVps = true;
+        } else if (nalType == 33) {
+            result.kind = EncodedNaluKind::ParameterSet;
+            result.hasSps = true;
+        } else if (nalType == 34) {
+            result.kind = EncodedNaluKind::ParameterSet;
+            result.hasPps = true;
+        } else if (nalType >= 16 && nalType <= 21) {
+            // H265 的 BLA/IDR/CRA 都是随机访问点；IPC 发送 IDR 时通常落在 19/20。
+            result.kind = EncodedNaluKind::RandomAccess;
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 class Stream::DecodeWorker {
@@ -50,6 +111,8 @@ public:
             m_acceptingPackets = false;
             m_stopRequested = true;
             m_packetQueue.clear();
+            resetRecoveryLocked();
+            m_resetDecoderBeforeNextPacket = false;
         }
         m_cv.notify_one();
 
@@ -59,6 +122,14 @@ public:
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_running = false;
+    }
+
+    void clearPendingPackets()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_packetQueue.clear();
+        resetRecoveryLocked();
+        m_resetDecoderBeforeNextPacket = false;
     }
 
     void enqueue(MppCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
@@ -79,9 +150,18 @@ public:
             }
 
             // 压缩 NALU 不能像裸帧一样随便丢弃；丢一条 slice 可能破坏后续参考链。
-            // 当前先明确报错，后续接编码器 IDR 请求后再实现“等待关键帧恢复”。
             if (m_packetQueue.size() >= kMaxCompressedPackets) {
-                m_owner.setError("RTSP 压缩 NALU 队列已满，NALU 已丢弃，需等待 IDR 恢复");
+                // 不再继续喂已经断开的参考链：清空积压，并从下一组参数集 + 随机访问帧恢复。
+                // 参数集本身不构成图像，不能只等 SPS/PPS 后就恢复送 P 帧。
+                m_packetQueue.clear();
+                resetRecoveryLocked();
+                m_waitingForRecovery = true;
+                LOG_WARN("Stream", "streamId=" << m_owner.streamId()
+                                                   << " RTSP 压缩 NALU 队列已满，已清空积压并等待下一组参数集 + IDR 恢复");
+            }
+
+            if (m_waitingForRecovery) {
+                enqueueRecoveryPacketLocked(std::move(packet));
                 return;
             }
 
@@ -96,6 +176,61 @@ private:
         std::vector<uint8_t> annexB;
         uint64_t timestampUs = 0;
     };
+
+    bool hasCompleteRecoveryParametersLocked() const
+    {
+        if (m_recoveryCodec == MppCodec::H264) {
+            return m_recoveryHasSps && m_recoveryHasPps;
+        }
+        if (m_recoveryCodec == MppCodec::H265) {
+            return m_recoveryHasVps && m_recoveryHasSps && m_recoveryHasPps;
+        }
+        return false;
+    }
+
+    void resetRecoveryLocked()
+    {
+        m_waitingForRecovery = false;
+        m_recoveryPackets.clear();
+        m_recoveryCodec = MppCodec::MJPEG;
+        m_recoveryHasVps = false;
+        m_recoveryHasSps = false;
+        m_recoveryHasPps = false;
+    }
+
+    void enqueueRecoveryPacketLocked(Packet packet)
+    {
+        const EncodedNaluInfo info = inspectAnnexBNalu(packet.codec, packet.annexB);
+        if (info.kind == EncodedNaluKind::ParameterSet) {
+            // 只保存当前一组参数集。再次看到参数集意味着编码器开始发送下一组恢复边界，
+            // 之前未等到 IDR 的残留参数不能再使用。
+            if (!m_recoveryPackets.empty() && m_recoveryCodec != packet.codec) {
+                resetRecoveryLocked();
+                m_waitingForRecovery = true;
+            }
+            m_recoveryCodec = packet.codec;
+            m_recoveryHasVps = m_recoveryHasVps || info.hasVps;
+            m_recoveryHasSps = m_recoveryHasSps || info.hasSps;
+            m_recoveryHasPps = m_recoveryHasPps || info.hasPps;
+            m_recoveryPackets.push_back(std::move(packet));
+            return;
+        }
+
+        if (info.kind != EncodedNaluKind::RandomAccess ||
+            packet.codec != m_recoveryCodec || !hasCompleteRecoveryParametersLocked()) {
+            // 等待期内普通 P/B NALU、或缺少完整参数集的随机访问帧都不能送入 MPP。
+            return;
+        }
+
+        // deinit/init 会在 DecodeWorker 取到这批数据前执行，清掉旧参考帧和 MPP 内部积压。
+        m_resetDecoderBeforeNextPacket = true;
+        while (!m_recoveryPackets.empty()) {
+            m_packetQueue.push_back(std::move(m_recoveryPackets.front()));
+            m_recoveryPackets.pop_front();
+        }
+        m_packetQueue.push_back(std::move(packet));
+        resetRecoveryLocked();
+    }
 
     void workLoop()
     {
@@ -128,6 +263,12 @@ private:
 
                 packet = std::move(m_packetQueue.front());
                 m_packetQueue.pop_front();
+
+                if (m_resetDecoderBeforeNextPacket) {
+                    m_resetDecoderBeforeNextPacket = false;
+                    decoder.deinit();
+                    decoderInitialized = false;
+                }
             }
 
             if (!decoderInitialized || activeCodec != packet.codec) {
@@ -163,6 +304,13 @@ private:
     bool m_running = false;
     bool m_acceptingPackets = false;
     bool m_stopRequested = false;
+    bool m_waitingForRecovery = false;
+    bool m_resetDecoderBeforeNextPacket = false;
+    MppCodec m_recoveryCodec = MppCodec::MJPEG;
+    bool m_recoveryHasVps = false;
+    bool m_recoveryHasSps = false;
+    bool m_recoveryHasPps = false;
+    std::deque<Packet> m_recoveryPackets;
 };
 
 Stream::Stream(size_t readyQueueCapacity)
@@ -209,6 +357,13 @@ void Stream::stopDecodeWorker()
         // 节流期间的最后几次丢帧也要在 stop 时汇总出来，保证日志累计数准确。
         logDroppedFrameStatistics(true);
         m_decodeWorker.reset();
+    }
+}
+
+void Stream::clearDecodePackets()
+{
+    if (m_decodeWorker != nullptr) {
+        m_decodeWorker->clearPendingPackets();
     }
 }
 
@@ -438,4 +593,30 @@ void Stream::setFrameReadyCallback(std::function<void()> callback)
 {
     std::lock_guard<std::mutex> lock(m_readyMutex);
     m_frameReadyCallback = std::move(callback);
+}
+
+void Stream::setRuntimeStateCallback(RuntimeStateCallback callback)
+{
+    std::lock_guard<std::mutex> lock(m_runtimeStateMutex);
+    m_runtimeStateCallback = std::move(callback);
+}
+
+void Stream::setRunGeneration(uint64_t generation)
+{
+    std::lock_guard<std::mutex> lock(m_runtimeStateMutex);
+    m_runGeneration = generation;
+}
+
+void Stream::reportRuntimeState(RuntimeState state, const std::string& message)
+{
+    RuntimeStateCallback callback;
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_runtimeStateMutex);
+        callback = m_runtimeStateCallback;
+        generation = m_runGeneration;
+    }
+    if (callback) {
+        callback(generation, state, message);
+    }
 }

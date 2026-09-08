@@ -2318,3 +2318,66 @@ git diff --check
 ```
 
 三个 RTSP aarch64 demo 均重新编译、链接通过。
+
+## 2026-09-08
+
+### StreamManager 第一版、RTSP 状态机与压缩码流恢复
+
+新增 `StreamManager`，用于管理多路 `Stream` 的生命周期，并将每路解码完成的稳定裸帧统一发布到其对应的 `FrameHub`。`CamManager` 保持独立；本模块只处理 RTSP 等非本地摄像头 source。
+
+发布线程不使用 `poll()`：`Stream::enqueueDecodedFrame()` 在稳定 `FramePacket` 成功入每路 `readyQueue` 后触发 ready 回调，`StreamManager` 用 `condition_variable` 被动唤醒。`m_hasPendingFrames` 用作事件合并标志，因此多路同时到帧不会为每帧重复唤醒；发布线程醒来后先处理状态事件，再快照全部 `Streaming` stream，并排空各自当前的 readyQueue：
+
+```text
+RtspStream / DecodeWorker
+  -> Stream readyQueue
+  -> StreamManager publisher thread
+  -> FrameHub
+  -> Sink::onFrame(FramePacket)
+```
+
+`FrameHub` 对 Sink 只保存 `weak_ptr`，应用/Manager 必须持有 Sink 的 `shared_ptr` 生命周期。`FramePacket` 通过共享 `FrameLease` 保护 DMA buffer，最后一个消费者释放 packet 后 buffer 才归还所属 `DmaBufferPool`。因此 Sink 必须快速 move/排队/提交 packet 并返回，不能在 `onFrame()` 内做磁盘 I/O、同步算法或其他阻塞工作；当前所有 Stream 共用唯一发布线程。
+
+新增独立 `demo/StreamManagerDemo.cpp` 与 `stream_manager_demo` CMake target，原有 RTSP demo 未改动。demo 默认拉取 `rtsp://192.168.1.5:8554/live`，可以通过第一个参数传入其他 URL，并打印每秒发布帧率及状态变化。
+
+### 异步 RTSP 状态与重连世代
+
+此前 `startStream()` 成功只表示 live555 事件线程已创建，不能代表服务端已接受播放。现在状态语义收口为：
+
+```text
+Ready / Stopped / Error
+  -> Starting       live555 事件线程已启动，DESCRIBE/SETUP/PLAY 尚未完成
+  -> Streaming      收到 PLAY 200 OK
+  -> Stopping
+  -> Stopped
+
+DESCRIBE / SETUP / PLAY / RTP source 异步失败
+  -> Error
+```
+
+`Live555RtspClient` 新增 `StateCallback`，由 `RtspStream` 转换为 `Stream::RuntimeState`。状态事件先进入 `StreamManager` 的待处理队列，再由发布线程更新 `StreamSlot`，避免 live555 回调线程直接争用 Manager 的 stream map 锁。
+
+每次 start/stop 均递增 `runGeneration`。异步状态事件携带 generation；Manager 只接收与当前 slot 一致的事件，因此 stop/restart 后迟到的旧连接 `Stopped/Error` 不能覆盖新连接状态。新增 `getStreamState()` 供 UI/业务查询每路状态和最近异步错误。
+
+### 压缩 NALU 队列溢出恢复
+
+`Stream::DecodeWorker` 的压缩队列满时不再只丢单条 NALU 后继续向 MPP 发送 P/B 帧。新策略为：清空旧积压、进入等待恢复状态、丢弃普通 NALU，直到收到完整参数集和随机访问帧后才恢复：
+
+```text
+H264: SPS + PPS + IDR
+H265: VPS + SPS + PPS + BLA / IDR / CRA
+```
+
+恢复点到达时，worker 在送参数集前执行 MPP `deinit -> init`，清理旧参考帧和内部积压，再将暂存参数集及随机访问帧送入解码器。当前压缩队列数量上限继续保持 `512`，未在本次擅自变更为时间阈值；后续应通过压测和实际 IDR 间隔再确定实时低延迟上限。
+
+### 验证
+
+```bash
+./wsl-build.sh build
+git diff --check
+```
+
+所有非 Qt aarch64 target 交叉编译通过。
+
+在 RK3568（`192.168.1.4`）实测 `stream_manager_demo` 拉取 RV1126B（`192.168.1.5`）的 H.264 1280x720 流：`PLAY 200 OK` 后状态正确进入 `Streaming`，发布帧率稳定约 `23~25 fps`，正常退出会发送 TEARDOWN。使用未监听端口 `65534` 验证异步错误路径，状态正确进入 `Error`，错误信息为连接拒绝；不再错误显示为 `Streaming`。
+
+压缩队列实际溢出后的“等待参数集 + IDR”恢复状态机已完成交叉编译和代码检查；尚未人为压慢 MPP 或构造压测码流触发该分支做板端运行验证。

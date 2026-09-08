@@ -148,6 +148,22 @@ if(MCR_BUILD_DEMOS)
     mcr_link_media(rtsp_stream_demo)
     mcr_link_live555(rtsp_stream_demo)
 
+    mcr_add_executable(stream_manager_demo
+        demo/StreamManagerDemo.cpp
+        src/StreamManager.cpp
+        src/Live555RtspClient.cpp
+        src/AnnexBSink.cpp
+        src/RtspStream.cpp
+        src/Stream.cpp
+        src/FrameHub.cpp
+        src/DmaAllocator.cpp
+        src/DmaBufferPool.cpp
+        src/RgaEngine.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    mcr_link_media(stream_manager_demo)
+    mcr_link_live555(stream_manager_demo)
+
     mcr_add_executable(drm_test
         drm/main.c
         drm/drm_display.c
