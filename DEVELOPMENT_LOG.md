@@ -2454,3 +2454,52 @@ git diff --check
 ```
 
 全部非 Qt aarch64 target 交叉编译通过。在 RK3568 上运行 `stream_manager_demo` 拉取 RV1126B H.264 1280x720 RTSP 流，状态正常进入 `Streaming`，发布帧率稳定约 `24 fps`，证明该类型重构未改变 RTSP → MPP → RGA → StreamManager 发布链路。
+
+## 2026-09-09
+
+### 收口 MPP 类型映射、VideoFrame 布局计算与 Qt 启动路径
+
+将原先分别散落在 `MppDecoder.cpp`、`MppEncoder.cpp` 的公共 MPP 类型映射抽到：
+
+```text
+include/MppTypes.hpp   声明 MppCodec / 项目类型 ↔ MPP 类型的接口
+src/MppTypes.cpp       唯一的 switch 映射实现
+```
+
+公共接口包括 `toMppCoding()`、`toMppFrameFormat()`、`fromMppFrameFormat()` 和
+`mppCodecName()`。映射层可以表示 MJPEG/H264/H265 三种编码；实际能力仍由模块自身
+校验，当前 `MppEncoder` 继续拒绝 MJPEG，`MppDecoder` 保持支持 MJPEG。
+
+同时将 `VideoFrame.hpp` 中的布局辅助函数（stride/对齐、buffer size、plane offset）
+迁入 `src/VideoFrame.cpp`。头文件只保留 `VideoFrame`、`FramePacket`、`FrameLease`、
+枚举、接口声明及其语义文档，减少每个引用该头文件的编译单元重复编译实现。CMake 的
+MPP 公共源集合和 Qt target 均加入 `MppTypes.cpp`、`VideoFrame.cpp`，避免漏链接。
+
+板测 Qt demo 时发现两个原有启动问题，已修正：
+
+- QML 实际资源路径为 `qrc:/qt/qml/QtDemo/Main.qml`，修复了 `main.cpp` 旧地址导致的
+  `QQmlApplicationEngine failed to load component`；
+- `qt/run.sh` 显式设置 `${QT6_DIR}/lib` 到 `LD_LIBRARY_PATH`，使 SSH/非交互 shell
+  也能找到 `libQt6QuickControls2.so.6` 等 Qt 动态库。
+
+### 验证
+
+```bash
+./wsl-build.sh build
+./wsl-build-qt.sh
+git diff --check
+```
+
+所有非 Qt 和 Qt aarch64 target 均交叉编译通过。RK3568 上实测：
+
+```text
+/dev/video10 MJPEG
+→ MPP MJPEG decode
+→ RGA
+→ Qt DisplaySink / EGLFS
+
+640x480，约 30.26 fps，dropped=0
+```
+
+`stream_manager_demo` 的 H.264 RTSP 板测也保持约 24 fps；两次超时停止后均确认无
+残留进程。

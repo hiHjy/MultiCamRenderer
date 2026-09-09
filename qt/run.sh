@@ -62,6 +62,10 @@ export LANG=en_US.utf8
 # Qt6 安装在板端的路径
 QT6_DIR="/opt/6.10.3-rk3568-aarch64"
 
+# SSH/非交互 shell 不一定已配置动态链接器搜索路径。
+# 显式保留已有路径并追加 Qt 库目录，确保 app 能找到 Qt6QuickControls2 等动态库。
+export LD_LIBRARY_PATH="${QT6_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 # Qt 插件路径
 export QT_PLUGIN_PATH="${QT6_DIR}/plugins"
 

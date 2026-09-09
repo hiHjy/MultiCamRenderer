@@ -22,6 +22,8 @@ qt_add_executable(app
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaAllocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaBufferPool.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/RgaEngine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/VideoFrame.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppTypes.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppDecoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppEncoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/mpp_simple.c

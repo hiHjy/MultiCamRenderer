@@ -76,6 +76,8 @@ function(mcr_link_live555 target)
 endfunction()
 
 set(MCR_MPP_DECODER_SOURCES
+    src/MppTypes.cpp
+    src/VideoFrame.cpp
     src/MppDecoder.cpp
     src/mpp_simple.c
     src/mpp_advance.c
@@ -203,6 +205,7 @@ if(MCR_BUILD_QT)
 
     mcr_add_executable(rga_ops_demo
         demo/rga/main.cpp
+        src/VideoFrame.cpp
         src/DmaAllocator.cpp
         src/RgaEngine.cpp
     )

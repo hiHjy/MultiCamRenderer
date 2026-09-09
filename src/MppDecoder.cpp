@@ -9,52 +9,6 @@
 #include <sstream>
 #include <utility>
 
-namespace {
-
-MppCodingType toMppCoding(MppCodec codec)
-{
-    switch (codec) {
-    case MppCodec::MJPEG:
-        return MPP_VIDEO_CodingMJPEG;
-    case MppCodec::H264:
-        return MPP_VIDEO_CodingAVC;
-    case MppCodec::H265:
-        return MPP_VIDEO_CodingHEVC;
-    }
-    return MPP_VIDEO_CodingUnused;
-}
-
-PixelFormat fromMppFrameFormat(RK_U32 format)
-{
-    switch (format & MPP_FRAME_FMT_MASK) {
-    case MPP_FMT_YUV420SP:
-        return PixelFormat::NV12;
-    case MPP_FMT_YUV420P:
-        return PixelFormat::YUV420P;
-    case MPP_FMT_YUV422_YUYV:
-        return PixelFormat::YUYV;
-    case MPP_FMT_RGBA8888:
-        return PixelFormat::RGBA8888;
-    default:
-        return PixelFormat::Unknown;
-    }
-}
-
-std::string codecName(MppCodec codec)
-{
-    switch (codec) {
-    case MppCodec::MJPEG:
-        return "MJPEG";
-    case MppCodec::H264:
-        return "H264";
-    case MppCodec::H265:
-        return "H265";
-    }
-    return "Unknown";
-}
-
-} // namespace
-
 struct MppDecoder::Impl {
     Impl()
     {
@@ -77,7 +31,7 @@ struct MppDecoder::Impl {
         resetCStructs();
         currentCodec = codec;
 
-        LOG_INFO("MppDecoder", "初始化 MPP 解码器 codec=" << codecName(codec));
+        LOG_INFO("MppDecoder", "初始化 MPP 解码器 codec=" << mppCodecName(codec));
 
         const MppCodingType coding = toMppCoding(codec);
         if (coding == MPP_VIDEO_CodingUnused) {
@@ -87,12 +41,12 @@ struct MppDecoder::Impl {
 
         if (codec == MppCodec::MJPEG) {
             if (rk_mpp_decoder_advance_init(&mjpegDecoder, coding) != 0) {
-                setError("rk_mpp_decoder_advance_init 失败 codec=" + codecName(codec));
+                setError(std::string("rk_mpp_decoder_advance_init 失败 codec=") + mppCodecName(codec));
                 return false;
             }
         } else {
             if (rk_mpp_decoder_init(&streamDecoder, coding, nullptr) != 0) {
-                setError("rk_mpp_decoder_init 失败 codec=" + codecName(codec));
+                setError(std::string("rk_mpp_decoder_init 失败 codec=") + mppCodecName(codec));
                 return false;
             }
             rk_mpp_decoder_set_frame_callback(&streamDecoder, &Impl::streamFrameCallback, this);

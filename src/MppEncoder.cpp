@@ -9,51 +9,6 @@
 
 namespace {
 
-MppCodingType toMppCoding(MppCodec codec)
-{
-    switch (codec) {
-    case MppCodec::H264:
-        return MPP_VIDEO_CodingAVC;
-    case MppCodec::H265:
-        return MPP_VIDEO_CodingHEVC;
-    case MppCodec::MJPEG:
-        break;
-    }
-    return MPP_VIDEO_CodingUnused;
-}
-
-MppFrameFormat toMppFrameFormat(PixelFormat format)
-{
-    switch (format) {
-    case PixelFormat::NV12:
-        return MPP_FMT_YUV420SP;
-    case PixelFormat::YUV420P:
-        return MPP_FMT_YUV420P;
-    case PixelFormat::YUYV:
-        return MPP_FMT_YUV422_YUYV;
-    case PixelFormat::RGBA8888:
-        return MPP_FMT_RGBA8888;
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-    case PixelFormat::MJPEG:
-        break;
-    }
-    return MPP_FMT_BUTT;
-}
-
-const char* codecName(MppCodec codec)
-{
-    switch (codec) {
-    case MppCodec::MJPEG:
-        return "MJPEG";
-    case MppCodec::H264:
-        return "H264";
-    case MppCodec::H265:
-        return "H265";
-    }
-    return "Unknown";
-}
-
 const char* bitratePresetName(MppBitratePreset preset)
 {
     switch (preset) {
@@ -123,7 +78,7 @@ struct MppEncoder::Impl {
         const int bitrate = cfg.bitrate > 0 ? cfg.bitrate : presetBitrate(cfg, fps);
         const int gop = cfg.gop > 0 ? cfg.gop : fps;
 
-        LOG_INFO("MppEncoder", "初始化 MPP 编码器 codec=" << codecName(cfg.codec)
+        LOG_INFO("MppEncoder", "初始化 MPP 编码器 codec=" << mppCodecName(cfg.codec)
                                  << " input=NV12 " << cfg.width << "x" << cfg.height
                                  << " stride=" << stride << "x" << heightStride
                                  << " fps=" << fps

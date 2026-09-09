@@ -87,12 +87,7 @@ struct FramePacket {
 //
 // 返回：
 // - 对齐后的数值。比如 value=641, alignment=16，返回 656。
-inline int videoFrameAlignUp(int value, int alignment)
-{
-    if (alignment <= 1)
-        return value;
-    return ((value + alignment - 1) / alignment) * alignment;
-}
+int videoFrameAlignUp(int value, int alignment);
 
 // 返回当前格式计算“每行 pitch”时使用的单像素字节数。
 //
@@ -104,23 +99,7 @@ inline int videoFrameAlignUp(int value, int alignment)
 // - YUYV 返回 2。
 // - RGBA8888 返回 4。
 // - MJPEG/Unknown/Auto 返回 0，因为压缩格式或未知格式不能用固定 bpp 描述裸帧 pitch。
-inline int videoFrameBytesPerPixelForStride(PixelFormat format)
-{
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-        return 1;
-    case PixelFormat::YUYV:
-        return 2;
-    case PixelFormat::RGBA8888:
-        return 4;
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 0;
-    }
-    return 0;
-}
+int videoFrameBytesPerPixelForStride(PixelFormat format);
 
 // 返回指定格式最小的宽高对齐粒度。
 //
@@ -134,21 +113,7 @@ inline int videoFrameBytesPerPixelForStride(PixelFormat format)
 // 注意：
 // - 这是通用最小对齐，不等于某个硬件模块的额外要求。
 // - MPP/JPEGD 外部输出如果要求 16 对齐，应在调用处显式传 16。
-inline int videoFrameMinDimensionAlignment(PixelFormat format)
-{
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-    case PixelFormat::YUYV:
-        return 2;
-    case PixelFormat::RGBA8888:
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 1;
-    }
-    return 1;
-}
+int videoFrameMinDimensionAlignment(PixelFormat format);
 
 // 计算某个可见宽度对应的横向 stride，单位是“像素”。
 //
@@ -163,22 +128,7 @@ inline int videoFrameMinDimensionAlignment(PixelFormat format)
 // 示例：
 // - RGBA8888, visibleWidth=641, byteAlignment=64：
 //   先按 4 字节/像素算 pitch，再把 pitch 对齐到 64 字节，最后换回像素 stride。
-inline int videoFrameAlignedStride(PixelFormat format, int visibleWidth, int byteAlignment = 0)
-{
-    if (visibleWidth <= 0)
-        return 0;
-
-    const int bpp = videoFrameBytesPerPixelForStride(format);
-    const int dimensionAlignment = videoFrameMinDimensionAlignment(format);
-    int stride = videoFrameAlignUp(visibleWidth, dimensionAlignment);
-
-    if (bpp > 0 && byteAlignment > 0) {
-        const int alignedBytes = videoFrameAlignUp(stride * bpp, byteAlignment);
-        stride = videoFrameAlignUp((alignedBytes + bpp - 1) / bpp, dimensionAlignment);
-    }
-
-    return stride;
-}
+int videoFrameAlignedStride(PixelFormat format, int visibleWidth, int byteAlignment = 0);
 
 // 计算纵向 stride，也就是 buffer 实际预留的行数。
 //
@@ -192,17 +142,9 @@ inline int videoFrameAlignedStride(PixelFormat format, int visibleWidth, int byt
 //
 // 示例：
 // - NV12, visibleHeight=481, dimensionAlignment=16，返回 496。
-inline int videoFrameAlignedHeightStride(PixelFormat format,
-                                         int visibleHeight,
-                                         int dimensionAlignment = 0)
-{
-    if (visibleHeight <= 0)
-        return 0;
-    const int alignment = dimensionAlignment > 0
-        ? dimensionAlignment
-        : videoFrameMinDimensionAlignment(format);
-    return videoFrameAlignUp(visibleHeight, alignment);
-}
+int videoFrameAlignedHeightStride(PixelFormat format,
+                                  int visibleHeight,
+                                  int dimensionAlignment = 0);
 
 // 取一帧的有效横向 stride。
 //
@@ -215,10 +157,7 @@ inline int videoFrameAlignedHeightStride(PixelFormat format,
 //
 // 注意：
 // - 返回单位是像素，不是字节。
-inline int videoFrameEffectiveStride(const VideoFrame& frame)
-{
-    return frame.stride > 0 ? frame.stride : frame.width;
-}
+int videoFrameEffectiveStride(const VideoFrame& frame);
 
 // 取一帧的有效纵向 stride。
 //
@@ -228,10 +167,7 @@ inline int videoFrameEffectiveStride(const VideoFrame& frame)
 // 返回：
 // - frame.heightStride > 0 时返回 frame.heightStride。
 // - 否则返回 frame.height，表示按可见高度兜底。
-inline int videoFrameEffectiveHeightStride(const VideoFrame& frame)
-{
-    return frame.heightStride > 0 ? frame.heightStride : frame.height;
-}
+int videoFrameEffectiveHeightStride(const VideoFrame& frame);
 
 // 按已经确定的 stride 计算 buffer 大小。
 //
@@ -250,32 +186,10 @@ inline int videoFrameEffectiveHeightStride(const VideoFrame& frame)
 // 注意：
 // - NV12/YUV420P 在 Payload 模式下是 stride * heightStride * 3 / 2。
 // - NV12/YUV420P 在 MppDecoderOutput 模式下是 stride * heightStride * 2。
-inline size_t videoFrameBufferSizeFor(PixelFormat format,
-                                      int widthStride,
-                                      int heightStride,
-                                      VideoBufferSizeMode mode = VideoBufferSizeMode::Payload)
-{
-    if (widthStride <= 0 || heightStride <= 0)
-        return 0;
-
-    const size_t pixels = static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride);
-    switch (format) {
-    case PixelFormat::NV12:
-    case PixelFormat::YUV420P:
-        if (mode == VideoBufferSizeMode::MppDecoderOutput)
-            return pixels * 2;
-        return pixels * 3 / 2;
-    case PixelFormat::YUYV:
-        return pixels * 2;
-    case PixelFormat::RGBA8888:
-        return pixels * 4;
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 0;
-    }
-    return 0;
-}
+size_t videoFrameBufferSizeFor(PixelFormat format,
+                               int widthStride,
+                               int heightStride,
+                               VideoBufferSizeMode mode = VideoBufferSizeMode::Payload);
 
 // 按可见宽高和行 pitch 对齐要求计算 buffer 大小。
 //
@@ -288,16 +202,11 @@ inline size_t videoFrameBufferSizeFor(PixelFormat format,
 //
 // 返回：
 // - 先计算横向 stride 和纵向 stride，再返回对应 buffer 字节数。
-inline size_t videoFrameBufferSizeFor(PixelFormat format,
-                                      int visibleWidth,
-                                      int visibleHeight,
-                                      int strideByteAlignment,
-                                      VideoBufferSizeMode mode)
-{
-    const int stride = videoFrameAlignedStride(format, visibleWidth, strideByteAlignment);
-    const int heightStride = videoFrameAlignedHeightStride(format, visibleHeight);
-    return videoFrameBufferSizeFor(format, stride, heightStride, mode);
-}
+size_t videoFrameBufferSizeFor(PixelFormat format,
+                               int visibleWidth,
+                               int visibleHeight,
+                               int strideByteAlignment,
+                               VideoBufferSizeMode mode);
 
 // 按 VideoFrame 当前 layout 计算 buffer 大小。
 //
@@ -312,14 +221,8 @@ inline size_t videoFrameBufferSizeFor(PixelFormat format,
 // - 这个函数不看 frame.capacity，也不看 frame.bytesUsed。
 // - capacity 是底层实际分配了多大；bytesUsed 是当前生产者写了多少有效数据。
 // - 本函数只回答“按这个 layout 理论上需要多少字节”。
-inline size_t videoFrameBufferSize(const VideoFrame& frame,
-                                   VideoBufferSizeMode mode = VideoBufferSizeMode::Payload)
-{
-    return videoFrameBufferSizeFor(frame.format,
-                                   videoFrameEffectiveStride(frame),
-                                   videoFrameEffectiveHeightStride(frame),
-                                   mode);
-}
+size_t videoFrameBufferSize(const VideoFrame& frame,
+                            VideoBufferSizeMode mode = VideoBufferSizeMode::Payload);
 
 // 计算指定 plane 在 buffer 内的字节偏移。
 //
@@ -337,35 +240,10 @@ inline size_t videoFrameBufferSize(const VideoFrame& frame,
 // - NV12: plane 0 是 Y，plane 1 是交织 UV，offset = stride * heightStride。
 // - YUV420P: plane 0 是 Y，plane 1 是 U，plane 2 是 V。
 // - YUYV/RGBA8888 是 packed 格式，只有 plane 0。
-inline size_t videoFramePlaneOffset(PixelFormat format,
-                                    int widthStride,
-                                    int heightStride,
-                                    int plane)
-{
-    if (plane <= 0)
-        return 0;
-    if (widthStride <= 0 || heightStride <= 0)
-        return 0;
-
-    const size_t ySize = static_cast<size_t>(widthStride) * static_cast<size_t>(heightStride);
-    switch (format) {
-    case PixelFormat::NV12:
-        return plane == 1 ? ySize : 0;
-    case PixelFormat::YUV420P:
-        if (plane == 1)
-            return ySize;
-        if (plane == 2)
-            return ySize + ySize / 4;
-        return 0;
-    case PixelFormat::YUYV:
-    case PixelFormat::RGBA8888:
-    case PixelFormat::MJPEG:
-    case PixelFormat::Unknown:
-    case PixelFormat::Auto:
-        return 0;
-    }
-    return 0;
-}
+size_t videoFramePlaneOffset(PixelFormat format,
+                             int widthStride,
+                             int heightStride,
+                             int plane);
 
 // 按 VideoFrame 当前 layout 计算指定 plane 的字节偏移。
 //
@@ -375,10 +253,4 @@ inline size_t videoFramePlaneOffset(PixelFormat format,
 //
 // 返回：
 // - plane 的字节偏移。
-inline size_t videoFramePlaneOffset(const VideoFrame& frame, int plane)
-{
-    return videoFramePlaneOffset(frame.format,
-                                 videoFrameEffectiveStride(frame),
-                                 videoFrameEffectiveHeightStride(frame),
-                                 plane);
-}
+size_t videoFramePlaneOffset(const VideoFrame& frame, int plane);

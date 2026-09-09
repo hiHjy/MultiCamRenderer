@@ -36,7 +36,7 @@ int main(int argc, char *argv[])
         Qt::QueuedConnection);
 
     // 直接从 Qt 资源系统加载（QML 编译进二进制，无需外部文件）
-    engine.load(QUrl("qrc:/QtDemo/Main.qml"));
+    engine.load(QUrl("qrc:/qt/qml/QtDemo/Main.qml"));
 
     // const QList<QObject*> roots = engine.rootObjects();
     // if (!roots.isEmpty()) {

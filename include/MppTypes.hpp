@@ -1,6 +1,12 @@
 #pragma once
 
 #include "VideoCodec.hpp"
+#include "VideoFrame.hpp"
+
+extern "C" {
+#include "mpp_frame.h"
+#include "rk_mpi.h"
+}
 
 enum class MppCodec {
     MJPEG,
@@ -20,3 +26,11 @@ constexpr MppCodec toMppCodec(VideoCodec codec)
     }
     return MppCodec::H264;
 }
+
+// 以下函数集中维护项目类型与 Rockchip MPP 类型之间的固定映射。
+// MppCodec::MJPEG 能映射为 MPP 编码类型，但是否支持该能力仍由具体模块决定：
+// MppDecoder 支持 MJPEG，MppEncoder 当前只支持 H264/H265。
+MppCodingType toMppCoding(MppCodec codec);
+MppFrameFormat toMppFrameFormat(PixelFormat format);
+PixelFormat fromMppFrameFormat(RK_U32 format);
+const char* mppCodecName(MppCodec codec);
