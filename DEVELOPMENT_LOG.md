@@ -2482,6 +2482,8 @@ MPP 公共源集合和 Qt target 均加入 `MppTypes.cpp`、`VideoFrame.cpp`，�
 - `qt/run.sh` 显式设置 `${QT6_DIR}/lib` 到 `LD_LIBRARY_PATH`，使 SSH/非交互 shell
   也能找到 `libQt6QuickControls2.so.6` 等 Qt 动态库。
 
+### 过滤p帧
+为了防止刚创建流时处于不太好的位置，比如会收到大量的p帧，这种数据包就不应该送解码器，所以创建流和数据包积压都统一走"等待恢复"
 ### 验证
 
 ```bash
