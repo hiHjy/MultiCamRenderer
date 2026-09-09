@@ -403,12 +403,11 @@ private:
                 LOG_INFO("RtspDrmDemo", "MPP 解码器已准备 codec=" << codecName(nalu.codec));
             }
 
-            VideoFrame packet {};
-            packet.va = nalu.data.data();
-            packet.capacity = nalu.data.size();
-            packet.bytesUsed = nalu.data.size();
+            CompressedPacket packet {};
+            packet.codec = nalu.codec;
+            packet.data = nalu.data.data();
+            packet.size = nalu.data.size();
             packet.timestampUs = nalu.timestampUs;
-            packet.format = PixelFormat::Unknown;
             if (!decoder.sendPacket(packet)) {
                 setError("MPP 解码失败: " + decoder.lastError());
                 m_workerFailed = true;

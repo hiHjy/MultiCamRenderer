@@ -390,10 +390,10 @@ bool runStream(const std::string& codecName,
 
     uint64_t pts = 0;
     for (const std::vector<unsigned char>& accessUnit : accessUnits) {
-        VideoFrame packet {};
-        packet.va = const_cast<unsigned char*>(accessUnit.data());
-        packet.bytesUsed = accessUnit.size();
-        packet.capacity = accessUnit.size();
+        CompressedPacket packet {};
+        packet.codec = codec == MppCodec::H265 ? VideoCodec::H265 : VideoCodec::H264;
+        packet.data = accessUnit.data();
+        packet.size = accessUnit.size();
         packet.timestampUs = pts;
         pts += 33000;
 
@@ -403,8 +403,8 @@ bool runStream(const std::string& codecName,
         }
     }
 
-    VideoFrame eos {};
-    eos.bytesUsed = 0;
+    CompressedPacket eos {};
+    eos.codec = codec == MppCodec::H265 ? VideoCodec::H265 : VideoCodec::H264;
     if (!decoder.sendPacket(eos, true)) {
         std::cerr << "发送 EOS 失败: " << decoder.lastError() << "\n";
         return false;

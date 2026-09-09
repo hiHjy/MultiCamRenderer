@@ -2409,3 +2409,48 @@ git diff --check
 ```
 
 RTSP 相关 aarch64 target 交叉编译通过。
+
+## 2026-09-09
+
+### 收口全局 CompressedPacket 压缩码流类型
+
+此前 H.264/H.265 的输入码流被临时装入 `VideoFrame` 再传给 `MppDecoder::sendPacket()`。这会混淆压缩数据与裸图像语义：压缩 NALU 不具备 width、height、stride、DMA 输出 buffer 或 `FrameLease` 等字段。
+
+新增通用 `include/CompressedPacket.hpp`：
+
+```cpp
+struct CompressedPacket {
+    VideoCodec codec;
+    const uint8_t* data;
+    size_t size;
+    uint64_t timestampUs;
+};
+```
+
+它是非 owning 的压缩码流 view，不依赖 MPP。调用方只在 `sendPacket()` 调用期间借用 `data`；跨线程队列仍由 `Stream::DecodeWorker::Packet` 内部的 `std::vector<uint8_t>` 持有数据。
+
+数据边界收口为：
+
+```text
+CompressedPacket
+  = H264/H265 压缩码流视图
+
+VideoFrame
+  = 解码后的裸图像 / DMA buffer 视图
+
+FramePacket
+  = VideoFrame + FrameLease
+```
+
+`Stream` 的网络输入、压缩队列项与 Annex-B 参数集/IDR 恢复状态机均改用通用 `VideoCodec`。仅在 DecodeWorker 实际初始化 MPP decoder 时才通过 `toMppCodec()` 转换为 MPP 私有类型；`MppDecoder::sendPacket()` 改为接受 `CompressedPacket` 并校验其 codec 与当前解码器一致。
+
+同步更新了 `Stream`、RTSP MPP demo、DRM RTSP demo 和文件解码 demo 的所有 H264/H265 `sendPacket()` 调用。MJPEG 的 `decodeMjpeg(VideoFrame, VideoFrame)` 保持不变，因为它使用另一套 DMA fd 输入/输出接口。
+
+验证：
+
+```bash
+./wsl-build.sh build
+git diff --check
+```
+
+全部非 Qt aarch64 target 交叉编译通过。在 RK3568 上运行 `stream_manager_demo` 拉取 RV1126B H.264 1280x720 RTSP 流，状态正常进入 `Streaming`，发布帧率稳定约 `24 fps`，证明该类型重构未改变 RTSP → MPP → RGA → StreamManager 发布链路。

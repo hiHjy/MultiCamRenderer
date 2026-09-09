@@ -198,7 +198,7 @@ struct MppDecoder::Impl {
         return true;
     }
 
-    bool sendPacket(const VideoFrame& packet, bool eos)
+    bool sendPacket(const CompressedPacket& packet, bool eos)
     {
         if (currentCodec != MppCodec::H264 && currentCodec != MppCodec::H265) {
             setError("sendPacket 只适用于 H264/H265，请先 init(H264/H265)");
@@ -206,16 +206,20 @@ struct MppDecoder::Impl {
         }
         if (!initialized && !init(currentCodec))
             return false;
-        if (packet.bytesUsed > 0 && packet.va == nullptr) {
-            setError("H264/H265 packet 需要有效 va");
+        if (packet.size > 0 && packet.data == nullptr) {
+            setError("H264/H265 CompressedPacket 需要有效 data");
+            return false;
+        }
+        if (!eos && toMppCodec(packet.codec) != currentCodec) {
+            setError("CompressedPacket codec 与当前 MPP 解码器不匹配");
             return false;
         }
 
         callbackOk = true;
         lastError.clear();
         const int ret = rk_mpp_decoder_send_data_with_pts(&streamDecoder,
-                                                          static_cast<const uint8_t*>(packet.va),
-                                                          packet.bytesUsed,
+                                                          packet.data,
+                                                          packet.size,
                                                           eos ? 1 : 0,
                                                           static_cast<RK_S64>(packet.timestampUs));
         if (ret < 0) {
@@ -321,7 +325,7 @@ bool MppDecoder::decodeMjpeg(const VideoFrame& input, VideoFrame& output)
     return m_impl->decodeMjpeg(input, output);
 }
 
-bool MppDecoder::sendPacket(const VideoFrame& packet, bool eos)
+bool MppDecoder::sendPacket(const CompressedPacket& packet, bool eos)
 {
     return m_impl->sendPacket(packet, eos);
 }

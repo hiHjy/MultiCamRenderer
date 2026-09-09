@@ -41,7 +41,7 @@ bool RtspStream::start()
     if (!m_client->start(
             m_url,
             [this](VideoCodec codec, uint8_t* data, size_t size, uint64_t timestampUs) {
-                onPacket(toMppCodec(codec), data, size, timestampUs);
+                onPacket(codec, data, size, timestampUs);
             },
             false,
             [this](Live555RtspClient::State state, const std::string& message) {

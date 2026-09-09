@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CompressedPacket.hpp"
 #include "VideoFrame.hpp"
 #include "MppTypes.hpp"
 
@@ -27,12 +28,13 @@ class MppDecoder {
 
 	bool decodeMjpeg(const VideoFrame &input, VideoFrame &output);
 
-	// H264/H265 流式入口接收顺序正确、带 Annex-B 起始码的压缩数据。
+    // H264/H265 流式入口接收顺序正确、带 Annex-B 起始码的压缩数据。CompressedPacket
+    // 只借用 data，调用返回前调用方必须保持其有效。
 	// 当前底层为 H264/H265 开启了 MPP split_parse，因此 RTSP/live555 可以一整个
 	// NALU 一次调用；也可以传上层已经组好的 access unit。不能按任意字节位置切断。
 	// 解码器不负责 RTP 重组、网络重连，也不配置宽高/fps/stride；这些信息由码流和
 	// MPP info_change 决定。
-	bool sendPacket(const VideoFrame &packet, bool eos = false);
+    bool sendPacket(const CompressedPacket &packet, bool eos = false);
 	void setFrameCallback(FrameCallback callback);
 
 	const std::string &lastError() const;

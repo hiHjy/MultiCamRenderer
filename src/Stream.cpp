@@ -2,6 +2,7 @@
 
 #include "Log.hpp"
 #include "MppDecoder.hpp"
+#include "MppTypes.hpp"
 #include "RgaEngine.hpp"
 
 #include <condition_variable>
@@ -28,7 +29,7 @@ struct EncodedNaluInfo {
     bool hasPps = false;
 };
 
-EncodedNaluInfo inspectAnnexBNalu(MppCodec codec, const std::vector<uint8_t>& annexB)
+EncodedNaluInfo inspectAnnexBNalu(VideoCodec codec, const std::vector<uint8_t>& annexB)
 {
     size_t offset = 0;
     if (annexB.size() >= 4 && annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 0 && annexB[3] == 1) {
@@ -43,7 +44,7 @@ EncodedNaluInfo inspectAnnexBNalu(MppCodec codec, const std::vector<uint8_t>& an
     }
 
     EncodedNaluInfo result;
-    if (codec == MppCodec::H264) {
+    if (codec == VideoCodec::H264) {
         const uint8_t nalType = annexB[offset] & 0x1FU;
         if (nalType == 7) {
             result.kind = EncodedNaluKind::ParameterSet;
@@ -57,7 +58,7 @@ EncodedNaluInfo inspectAnnexBNalu(MppCodec codec, const std::vector<uint8_t>& an
         return result;
     }
 
-    if (codec == MppCodec::H265 && offset + 1 < annexB.size()) {
+    if (codec == VideoCodec::H265 && offset + 1 < annexB.size()) {
         const uint8_t nalType = (annexB[offset] >> 1U) & 0x3FU;
         if (nalType == 32) {
             result.kind = EncodedNaluKind::ParameterSet;
@@ -132,7 +133,7 @@ public:
         m_resetDecoderBeforeNextPacket = false;
     }
 
-    void enqueue(MppCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
+    void enqueue(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
     {
         if (data == nullptr || size == 0) {
             return;
@@ -181,17 +182,17 @@ public:
 
 private:
     struct Packet {
-        MppCodec codec = MppCodec::H264;
+        VideoCodec codec = VideoCodec::H264;
         std::vector<uint8_t> annexB;
         uint64_t timestampUs = 0;
     };
 
     bool hasCompleteRecoveryParametersLocked() const
     {
-        if (m_recoveryCodec == MppCodec::H264) {
+        if (m_recoveryCodec == VideoCodec::H264) {
             return m_recoveryHasSps && m_recoveryHasPps;
         }
-        if (m_recoveryCodec == MppCodec::H265) {
+        if (m_recoveryCodec == VideoCodec::H265) {
             return m_recoveryHasVps && m_recoveryHasSps && m_recoveryHasPps;
         }
         return false;
@@ -201,7 +202,7 @@ private:
     {
         m_waitingForRecovery = false;
         m_recoveryPackets.clear();
-        m_recoveryCodec = MppCodec::MJPEG;
+        m_recoveryCodec = VideoCodec::H264;
         m_recoveryHasVps = false;
         m_recoveryHasSps = false;
         m_recoveryHasPps = false;
@@ -285,20 +286,21 @@ private:
                 }
             }
 
-            if (!decoderInitialized || activeCodec != packet.codec) {
+            const MppCodec packetMppCodec = toMppCodec(packet.codec);
+            if (!decoderInitialized || activeCodec != packetMppCodec) {
                 decoder.deinit();
-                if (!decoder.init(packet.codec)) {
+                if (!decoder.init(packetMppCodec)) {
                     m_owner.setError("MPP 解码器初始化失败: " + decoder.lastError());
                     continue;
                 }
-                activeCodec = packet.codec;
+                activeCodec = packetMppCodec;
                 decoderInitialized = true;
             }
 
-            VideoFrame input;
-            input.va = packet.annexB.data();
-            input.capacity = packet.annexB.size();
-            input.bytesUsed = packet.annexB.size();
+            CompressedPacket input;
+            input.codec = packet.codec;
+            input.data = packet.annexB.data();
+            input.size = packet.annexB.size();
             input.timestampUs = packet.timestampUs;
 
             if (!decoder.sendPacket(input)) {
@@ -320,7 +322,7 @@ private:
     bool m_stopRequested = false;
     bool m_waitingForRecovery = false;
     bool m_resetDecoderBeforeNextPacket = false;
-    MppCodec m_recoveryCodec = MppCodec::MJPEG;
+    VideoCodec m_recoveryCodec = VideoCodec::H264;
     bool m_recoveryHasVps = false;
     bool m_recoveryHasSps = false;
     bool m_recoveryHasPps = false;
@@ -347,7 +349,7 @@ bool Stream::OutputLayout::matches(const VideoFrame& frame) const
            format == frame.format;
 }
 
-void Stream::onPacket(MppCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
+void Stream::onPacket(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
 {
     if (m_decodeWorker != nullptr) {
         m_decodeWorker->enqueue(codec, data, size, timestampUs);

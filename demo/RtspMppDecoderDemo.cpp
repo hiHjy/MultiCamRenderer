@@ -62,13 +62,13 @@ int main() {
 							  totalBytes = 0;
 						  }
 
-						  VideoFrame packet{};
-						  packet.va = data;
-						  packet.bytesUsed = size;
-						  packet.capacity = size;
+						  CompressedPacket packet{};
+						  packet.codec = codec;
+						  packet.data = data;
+						  packet.size = size;
 						  packet.timestampUs = timestampUs;
 						  dec.sendPacket(packet);
-						  // 后续在这里将 data/size 封装成 VideoFrame，送 MppDecoder::sendPacket()。
+						  // data/size 被封装成 CompressedPacket，送 MppDecoder::sendPacket()。
 						  // data 仅在当前回调中有效；要异步处理时必须复制。
 						  (void)data;
 					  })) {
