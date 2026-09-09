@@ -2381,3 +2381,31 @@ git diff --check
 在 RK3568（`192.168.1.4`）实测 `stream_manager_demo` 拉取 RV1126B（`192.168.1.5`）的 H.264 1280x720 流：`PLAY 200 OK` 后状态正确进入 `Streaming`，发布帧率稳定约 `23~25 fps`，正常退出会发送 TEARDOWN。使用未监听端口 `65534` 验证异步错误路径，状态正确进入 `Error`，错误信息为连接拒绝；不再错误显示为 `Streaming`。
 
 压缩队列实际溢出后的“等待参数集 + IDR”恢复状态机已完成交叉编译和代码检查；尚未人为压慢 MPP 或构造压测码流触发该分支做板端运行验证。
+
+## 2026-09-09
+
+### 修正 IDR 恢复唤醒与补充链路学习注释
+
+检查压缩 NALU 队列的恢复路径时发现：原逻辑在收齐参数集和随机访问帧后，会将恢复数据放入 `m_packetQueue`，但从 `enqueue()` 提前返回，未执行 `m_cv.notify_one()`。若 DecodeWorker 此时正睡在条件变量上，它会依赖下一条普通 NALU 到达后的通知才开始处理已入队的恢复数据。
+
+现改为由 `enqueueRecoveryPacketLocked()` 返回“是否已真正入队可解码数据”：普通 NALU 丢弃、单独参数集暂存时返回 `false`；收齐“参数集 + IDR”并放入队列时返回 `true`。外层仅在正常入队或恢复边界完整入队时唤醒 DecodeWorker，恢复不再依赖下一条 NALU。
+
+同时补充 `Stream`、`RtspStream`、`StreamManager` 内的中文学习注释，明确：
+
+```text
+队列溢出后旧参考链不可信
+→ 参数集 + 随机访问帧已入队
+→ DecodeWorker 重置 MPP
+→ 重新 init 并解码恢复边界
+```
+
+`resetDroppedFrameStatistics()` 的统计字段说明移回函数内部，使 readyQueue 淘汰、pool lease 占满和 WARN 节流时间的语义与赋值位置对应。
+
+验证：
+
+```bash
+./wsl-build.sh build
+git diff --check
+```
+
+RTSP 相关 aarch64 target 交叉编译通过。

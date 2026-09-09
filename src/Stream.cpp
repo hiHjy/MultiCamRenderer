@@ -143,6 +143,7 @@ public:
         packet.timestampUs = timestampUs;
         packet.annexB.assign(data, data + size);
 
+        bool shouldNotifyWorker = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_acceptingPackets) {
@@ -159,15 +160,23 @@ public:
                 LOG_WARN("Stream", "streamId=" << m_owner.streamId()
                                                    << " RTSP 压缩 NALU 队列已满，已清空积压并等待下一组参数集 + IDR 恢复");
             }
-
+            // 压缩 NALU 队列严重积压时，会主动清空旧 NALU 并进入恢复等待状态。
+            // 后续 NALU 交给 enqueueRecoveryPacketLocked()：暂存参数集、丢弃普通帧，
+            // 直到收齐参数集和随机访问帧。此时 m_waitingForRecovery 重新变为 false，
+            // 代表 m_packetQueue 已放入可用于重新开始解码的“参数集 + IDR”；
+            // 后续新 NALU 恢复走正常入队路径。
             if (m_waitingForRecovery) {
-                enqueueRecoveryPacketLocked(std::move(packet));
-                return;
+                shouldNotifyWorker = enqueueRecoveryPacketLocked(std::move(packet));
+            } else {
+                m_packetQueue.push_back(std::move(packet));
+                shouldNotifyWorker = true;
             }
-
-            m_packetQueue.push_back(std::move(packet));
         }
-        m_cv.notify_one();
+        // 等待恢复期间的普通 NALU 不会入队；只有普通路径入队，或参数集 + IDR
+        // 恢复边界完整入队时才需要唤醒 DecodeWorker。
+        if (shouldNotifyWorker) {
+            m_cv.notify_one();
+        }
     }
 
 private:
@@ -198,7 +207,7 @@ private:
         m_recoveryHasPps = false;
     }
 
-    void enqueueRecoveryPacketLocked(Packet packet)
+    bool enqueueRecoveryPacketLocked(Packet packet)
     {
         const EncodedNaluInfo info = inspectAnnexBNalu(packet.codec, packet.annexB);
         if (info.kind == EncodedNaluKind::ParameterSet) {
@@ -213,13 +222,13 @@ private:
             m_recoveryHasSps = m_recoveryHasSps || info.hasSps;
             m_recoveryHasPps = m_recoveryHasPps || info.hasPps;
             m_recoveryPackets.push_back(std::move(packet));
-            return;
+            return false;
         }
 
         if (info.kind != EncodedNaluKind::RandomAccess ||
             packet.codec != m_recoveryCodec || !hasCompleteRecoveryParametersLocked()) {
             // 等待期内普通 P/B NALU、或缺少完整参数集的随机访问帧都不能送入 MPP。
-            return;
+            return false;
         }
 
         // deinit/init 会在 DecodeWorker 取到这批数据前执行，清掉旧参考帧和 MPP 内部积压。
@@ -230,6 +239,7 @@ private:
         }
         m_packetQueue.push_back(std::move(packet));
         resetRecoveryLocked();
+        return true;
     }
 
     void workLoop()
@@ -264,6 +274,10 @@ private:
                 packet = std::move(m_packetQueue.front());
                 m_packetQueue.pop_front();
 
+                // 压缩 NALU 队列溢出后，旧参考链已不再可信。
+                // 恢复逻辑收齐“参数集 + 随机访问帧”并将它们放入 m_packetQueue 后，
+                // 会置 m_resetDecoderBeforeNextPacket = true。DecodeWorker 取到这批恢复
+                // 数据前先重置 MPP，随后重新 init 并送入参数集和随机访问帧。
                 if (m_resetDecoderBeforeNextPacket) {
                     m_resetDecoderBeforeNextPacket = false;
                     decoder.deinit();
@@ -544,11 +558,13 @@ void Stream::logDroppedFrameStatistics(bool force)
 void Stream::resetDroppedFrameStatistics()
 {
     std::lock_guard<std::mutex> lock(m_dropStatisticsMutex);
+    // readyQueue 满时淘汰旧裸帧的累计数。
     m_readyQueueDroppedFrames = 0;
+    // pool 全被 Sink 持有的 lease 占满时，丢弃新裸帧的累计数。
     m_poolExhaustedDroppedFrames = 0;
+    // 上次打印 WARN 的时间；重启后发生首次丢帧时可以立即输出统计。
     m_lastDropStatisticsLog = {};
 }
-
 bool Stream::tryGetFrame(FramePacket& packet)
 {
     std::lock_guard<std::mutex> lock(m_readyMutex);

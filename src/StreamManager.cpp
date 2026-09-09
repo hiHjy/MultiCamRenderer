@@ -127,7 +127,7 @@ bool StreamManager::addFrameSink(int streamId, std::shared_ptr<Sink> sink)
 
 bool StreamManager::startStream(int streamId)
 {
-    // 没有 publisher 时，readyQueue 会很快填满；启动 source 前确保消费者已运行。
+    // 没有 publisher 时，readyQueue 会很快填满；启动 source 前确保消费者已运行，启动发布线程。
     startPublishing();
 
     std::lock_guard<std::mutex> lock(m_streamChangeMutex);
@@ -151,6 +151,8 @@ bool StreamManager::startStream(int streamId)
     slot.stream->clearReadyFrames();
     slot.state = StreamState::Starting;
     slot.lastError.clear();
+
+	//启动
     if (!slot.stream->start()) {
         slot.state = StreamState::Error;
         slot.lastError = slot.stream->lastError();
@@ -426,6 +428,7 @@ void StreamManager::notifyStreamRuntimeState(int streamId,
     }
 }
 
+//更新manager中的stream的状态
 void StreamManager::applyPendingStreamRuntimeStates()
 {
     std::deque<PendingStreamRuntimeState> pendingStates;

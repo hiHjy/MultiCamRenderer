@@ -34,6 +34,10 @@ bool RtspStream::start()
 
     clearError();
     m_started.store(true);
+
+	//启动live555线程
+	// 第一个lambda：当网络数据包到达时调用，用于将压缩数据包送给项目框架，
+	// 第二个lambda，握手状态变化时调用，用于上报状态
     if (!m_client->start(
             m_url,
             [this](VideoCodec codec, uint8_t* data, size_t size, uint64_t timestampUs) {
