@@ -100,6 +100,9 @@ public:
 
         m_stopRequested = false;
         m_acceptingPackets = true;
+        // RTSP PLAY 刚开始收到的首条 NALU 可能是依赖前序参考帧的 P/B 帧。
+        // 新 decoder 只能从“参数集 + 随机访问帧”开始，因此首帧也要经过恢复门控。
+        enterRecoveryWaitingLocked();
         m_running = true;
         m_thread = std::thread(&DecodeWorker::workLoop, this);
         return true;
@@ -128,9 +131,8 @@ public:
     void clearPendingPackets()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_packetQueue.clear();
-        resetRecoveryLocked();
-        m_resetDecoderBeforeNextPacket = false;
+        // 主动丢弃压缩数据后，旧参考链也不再可信；后续必须重新等待恢复边界。
+        enterRecoveryWaitingLocked();
     }
 
     void enqueue(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
@@ -155,13 +157,11 @@ public:
             if (m_packetQueue.size() >= kMaxCompressedPackets) {
                 // 不再继续喂已经断开的参考链：清空积压，并从下一组参数集 + 随机访问帧恢复。
                 // 参数集本身不构成图像，不能只等 SPS/PPS 后就恢复送 P 帧。
-                m_packetQueue.clear();
-                resetRecoveryLocked();
-                m_waitingForRecovery = true;
+                enterRecoveryWaitingLocked();
                 LOG_WARN("Stream", "streamId=" << m_owner.streamId()
                                                    << " RTSP 压缩 NALU 队列已满，已清空积压并等待下一组参数集 + IDR 恢复");
             }
-            // 压缩 NALU 队列严重积压时，会主动清空旧 NALU 并进入恢复等待状态。
+            // 起流、主动清空或压缩队列严重积压后，都会进入恢复等待状态。
             // 后续 NALU 交给 enqueueRecoveryPacketLocked()：暂存参数集、丢弃普通帧，
             // 直到收齐参数集和随机访问帧。此时 m_waitingForRecovery 重新变为 false，
             // 代表 m_packetQueue 已放入可用于重新开始解码的“参数集 + IDR”；
@@ -206,6 +206,16 @@ private:
         m_recoveryHasVps = false;
         m_recoveryHasSps = false;
         m_recoveryHasPps = false;
+    }
+
+    // 必须在 m_mutex 已加锁时调用。清掉旧码流后，只能由完整恢复边界重新开始：
+    // H264 为 SPS + PPS + IDR；H265 为 VPS + SPS + PPS + BLA / IDR / CRA。
+    void enterRecoveryWaitingLocked()
+    {
+        m_packetQueue.clear();
+        resetRecoveryLocked();
+        m_waitingForRecovery = true;
+        m_resetDecoderBeforeNextPacket = false;
     }
 
     bool enqueueRecoveryPacketLocked(Packet packet)
