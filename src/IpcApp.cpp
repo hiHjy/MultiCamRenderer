@@ -1,4 +1,5 @@
 #include "CamManager.hpp"
+#include "IspController.hpp"
 #include "Live555RtspServer.hh"
 #include "Log.hpp"
 #include "RtspPublishSink.hpp"
@@ -60,23 +61,21 @@ RtspPublishSink::Config makePublishConfig(const std::string& streamName,
 Live555RtspServer::StreamConfig makeRtspStreamConfig(
     const std::string& streamName,
     VideoCodec codec,
-    CamManager& cameraManager,
-    int cameraId,
     const std::shared_ptr<RtspPublishSink>& publishSink)
 {
     Live555RtspServer::StreamConfig config {};
     config.streamName = streamName;
     config.codec = codec;
-    config.onClientActiveChanged = [&cameraManager, cameraId, publishSink, streamName](bool active) {
-        // 该回调在 live555 事件线程执行；两个接口都只投递内部命令，不直接做 V4L2/MPP 重活。
+    config.onClientActiveChanged = [publishSink, streamName](bool active) {
+        // 该回调在 live555 事件线程执行，只切换本路编码器状态，不做 V4L2/MPP 重活。
+        //
+        // VPSS 的 V4L2 采集必须保持 STREAMON：AIQ 的 AE/AWB/AF 依赖连续的 sensor
+        // 帧时钟。无人观看时让相机 STREAMOFF 会打断 3A 状态，重新 PLAY 后可能出现
+        // 黑帧或异常色彩。因此无客户端时由 PublishSink 丢弃裸帧、停止 MPP 编码器，
+        // 而不是停止 CamManager。
         publishSink->setActive(active);
-        const bool accepted = active ? cameraManager.startCamera(cameraId)
-                                     : cameraManager.stopCamera(cameraId);
-        if (!accepted) {
-            LOG_ERROR("IpcApp", "stream=" << streamName
-                                               << (active ? " 启动" : " 停止")
-                                               << "相机命令投递失败: " << cameraManager.lastError());
-        }
+        LOG_INFO("IpcApp", "stream=" << streamName
+                                           << (active ? " 有客户端，启动编码" : " 无客户端，停止编码并丢弃裸帧"));
     };
     return config;
 }
@@ -87,6 +86,11 @@ int main()
 {
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+
+    IspController ispController;
+    if (!ispController.start()) {
+        return 1;
+    }
 
     CamManager cameraManager;
     Live555RtspServer rtspServer;
@@ -114,14 +118,22 @@ int main()
         return 1;
     }
 
-    // 先起 poll 线程，确保 live555 PLAY 回调投递的 startCamera()/stopCamera() 能立即被执行。
+    // 先起 poll 线程并启动两路 VPSS。即使无 RTSP 客户端也保持 V4L2 STREAMON，
+    // 使板端 AIQ 的 3A 持续收敛；无客户端时 PublishSink 不接收/编码这些帧。
     cameraManager.startPolling();
+    if (!cameraManager.startAllCameras()) {
+        LOG_ERROR("IpcApp", "启动 VPSS Camera 失败: " << cameraManager.lastError());
+        // startAllCameras() 可能已成功启动前一路，必须先逐路 STREAMOFF，
+        // 再退出 poll 线程，最后才允许 IspController 析构停止 AIQ。
+        cameraManager.stopAllCameras();
+        cameraManager.shutdownPolling();
+        return 1;
+    }
 
-    if (!rtspServer.addStream(makeRtspStreamConfig("main", VideoCodec::H265,
-                                                   cameraManager, mainCameraId, mainPublishSink)) ||
-        !rtspServer.addStream(makeRtspStreamConfig("sub", VideoCodec::H264,
-                                                   cameraManager, subCameraId, subPublishSink))) {
+    if (!rtspServer.addStream(makeRtspStreamConfig("main", VideoCodec::H265, mainPublishSink)) ||
+        !rtspServer.addStream(makeRtspStreamConfig("sub", VideoCodec::H264, subPublishSink))) {
         LOG_ERROR("IpcApp", "注册 RTSP stream 失败: " << rtspServer.lastError());
+        cameraManager.stopAllCameras();
         cameraManager.shutdownPolling();
         return 1;
     }
@@ -129,11 +141,12 @@ int main()
     // 空用户名/密码表示不启用认证。
     if (!rtspServer.start(kRtspPort, "", "")) {
         LOG_ERROR("IpcApp", "启动 RTSP Server 失败: " << rtspServer.lastError());
+        cameraManager.stopAllCameras();
         cameraManager.shutdownPolling();
         return 1;
     }
 
-    LOG_INFO("IpcApp", "IPC RTSP 服务已就绪（无客户端时两路 VPSS 均停止采集）"
+    LOG_INFO("IpcApp", "IPC RTSP 服务已就绪（两路 VPSS 保持采集；无客户端时不编码）"
                            << " main=" << rtspServer.rtspURL("main")
                            << " sub=" << rtspServer.rtspURL("sub"));
 

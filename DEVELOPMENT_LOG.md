@@ -2545,3 +2545,49 @@ VPSS 节点拒绝 dma-heap 外部 buffer 导入时，`V4L2CameraSource` 自动�
 2026-09-11 板测：RV1126B 服务可正常启动；RK3568 分别及同时拉取 `/main`、`/sub`，
 MPP 解码与 StreamManager 发布均稳定约 30fps。客户端 TEARDOWN 后对应的活动客户端数
 回到 0，编码器正常 deinit；测试进程正常退出，8554 已释放。
+
+### RV1126B：应用内 AIQ 生命周期与 OEM 开机自启
+
+首次接入时，板端启动脚本中的独立 `aiq_v4l2_daemon` 与 `ipc_app` 分属两个进程：
+daemon 持有 AIQ/3A，`ipc_app` 直接操作 VPSS V4L2 节点。应用退出后再次启动时，两个
+生命周期不同步，容易留下 ISP 的 frame-lost/SOF disorder，并表现为第二次启动画面偏黑或
+异常色彩。
+
+现新增 `IspController`，由 `ipc_app` 成为唯一 ISP owner：
+
+```text
+启动：发现 sensor
+  → preInit_scene(normal/day)
+  → rk_aiq_uapi2_sysctl_init(IQ files)
+  → prepare
+  → start（AIQ 持续执行 AE/AWB/AF）
+  → 创建并 STREAMON 两路 VPSS V4L2 Camera
+
+退出：停止 RTSP/编码 worker
+  → 两路 VPSS V4L2 STREAMOFF + poll 线程退出
+  → AIQ stop
+  → AIQ deinit
+```
+
+实现严格参考 SDK `project/app/aiq_v4l2_daemon/aiq_v4l2_daemon.c`：该程序就是“AIQ
+owner + 其他用户程序直接打开 V4L2 节点”的模式，因此 IPC app 仅链接 `librkaiq.so`，不
+引入 RKiPC 的 `librockit.so` / `RK_MPI_SYS_Init()` 管线。
+
+`IpcApp` 不再在 RTSP 客户端 0↔1 时对 VPSS 执行 STREAMOFF/STREAMON；VPSS 持续采集，
+无人观看时只由 `RtspPublishSink` 停止编码、丢弃裸帧。这样 3A 的 sensor 帧时钟保持连续。
+
+OEM 部署约定：二进制放在 `/oem/usr/bin/multicam_ipc_app`，SDK 两份 `RkLunch.sh` 和
+板端实际脚本在启动网络后后台启动它；`RkLunch-stop.sh` 向该进程发送 `SIGTERM`，让应用
+按上述顺序清理。开机自启的 stdout/stderr 重定向至 `/dev/null`，因为 `/tmp` 为 tmpfs，
+把 AIQ/MPP 标准输出长期重定向到文件会无上限消耗 RAM；需要排障时停止服务后手工前台运行。
+
+验证：
+
+```bash
+./wsl-build-ipc.sh build
+```
+
+RV1126B 板测通过：在没有 `aiq_v4l2_daemon` 的条件下，应用可完成 AIQ
+`init/prepare/start`，正常停止后无需重启板子即可再次启动并重新完成 AIQ 初始化；OEM 路径
+下运行的 `multicam_ipc_app` 已成功注册 `rtsp://<board-ip>:8554/main`（H265）与 `/sub`
+（H264）。

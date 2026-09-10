@@ -27,17 +27,21 @@ set(MCR_MEDIA_ROOT "" CACHE PATH "Rockchip media_out 根目录（含 include/ �
 if(MCR_MEDIA_ROOT)
     if(NOT EXISTS "${MCR_MEDIA_ROOT}/include/rockchip/mpp_frame.h" OR
        NOT EXISTS "${MCR_MEDIA_ROOT}/include/rga/im2d.h" OR
-       NOT EXISTS "${MCR_MEDIA_ROOT}/lib/librockchip_mpp.so")
+       NOT EXISTS "${MCR_MEDIA_ROOT}/include/rkaiq/uAPI2/rk_aiq_user_api2_sysctl.h" OR
+       NOT EXISTS "${MCR_MEDIA_ROOT}/lib/librockchip_mpp.so" OR
+       NOT EXISTS "${MCR_MEDIA_ROOT}/lib/librkaiq.so")
         message(FATAL_ERROR "MCR_MEDIA_ROOT 不完整: ${MCR_MEDIA_ROOT}")
     endif()
     set(MCR_MPP_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/rockchip")
     set(MCR_DRM_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/libdrm")
     set(MCR_RGA_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/rga")
     set(MCR_MEDIA_COMMON_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include")
+    set(MCR_RKAIQ_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/rkaiq")
     # media_out 中是 SDK 已发布的明确库路径，不依赖交叉 CMake 的 sysroot 搜索规则。
     set(MCR_MPP_LIBRARY "${MCR_MEDIA_ROOT}/lib/librockchip_mpp.so")
     set(MCR_RGA_LIBRARY "${MCR_MEDIA_ROOT}/lib/librga.so")
     set(MCR_DRM_LIBRARY "${MCR_MEDIA_ROOT}/lib/libdrm.so")
+    set(MCR_RKAIQ_LIBRARY "${MCR_MEDIA_ROOT}/lib/librkaiq.so")
 else()
     set(MCR_MPP_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/rockchip")
     set(MCR_DRM_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/libdrm")
@@ -146,6 +150,7 @@ set_source_files_properties(
 if(MCR_BUILD_IPC_APP)
     mcr_add_executable(ipc_app
         src/IpcApp.cpp
+        src/IspController.cpp
         src/RtspPublishSink.cpp
         src/CamManager.cpp
         src/DmaAllocator.cpp
@@ -156,6 +161,8 @@ if(MCR_BUILD_IPC_APP)
         ${MCR_MPP_DECODER_SOURCES}
     )
     target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
+    target_include_directories(ipc_app PRIVATE "${MCR_RKAIQ_INCLUDE_DIR}")
+    target_link_libraries(ipc_app PRIVATE "${MCR_RKAIQ_LIBRARY}")
     mcr_link_media(ipc_app)
     mcr_link_live555(ipc_app)
     # RV1126B 量产 rootfs 将 Rockchip 媒体运行库部署在此目录；交叉 SDK 中的
