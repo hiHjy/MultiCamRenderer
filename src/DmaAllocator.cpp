@@ -143,6 +143,11 @@ bool DmaMemory::valid() const
     return m_fd >= 0 && m_va != nullptr && m_va != MAP_FAILED && m_size > 0;
 }
 
+DmaMemory DmaMemory::adopt(int dmaFd, void* va, size_t size)
+{
+    return DmaMemory(dmaFd, va, size);
+}
+
 void DmaMemory::reset()
 {
     if (m_va != nullptr && m_va != MAP_FAILED) {

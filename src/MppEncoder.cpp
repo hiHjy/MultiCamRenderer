@@ -148,7 +148,7 @@ struct MppEncoder::Impl {
             return false;
 
         callbackOk = true;
-        if (rk_mpp_encoder_send_frame(&encoder, frame.dmaFd, eos ? 1 : 0) != 0) {
+        if (rk_mpp_encoder_send_frame(&encoder, frame.dmaFd, frame.timestampUs, eos ? 1 : 0) != 0) {
             setError("rk_mpp_encoder_send_frame 失败");
             return false;
         }
@@ -253,6 +253,7 @@ private:
 
     static void packetCallback(const uint8_t* data,
                                size_t size,
+                               uint64_t timestampUs,
                                int isHeader,
                                int isIntra,
                                int eos,
@@ -266,6 +267,7 @@ private:
         packet.data = data;
         packet.size = size;
         packet.codec = self->config.codec;
+        packet.timestampUs = timestampUs;
         packet.isHeader = isHeader != 0;
         packet.isKeyFrame = isIntra != 0;
         packet.eos = eos != 0;

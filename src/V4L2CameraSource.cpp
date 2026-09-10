@@ -6,6 +6,7 @@
 #include <linux/videodev2.h>
 #include <sstream>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <utility>
 
@@ -149,6 +150,8 @@ bool V4L2CameraSource::openDevice(const std::string& devicePath)
         closeDevice();
         return false;
     }
+
+    m_bufferMemory = V4L2_MEMORY_DMABUF;
 
     if ((capabilities & V4L2_CAP_STREAMING) == 0) {
         setError("设备不支持 streaming I/O");
@@ -327,6 +330,8 @@ bool V4L2CameraSource::setupDmaImportBuffers(
         return false;
     }
 
+    m_bufferMemory = V4L2_MEMORY_DMABUF;
+
     releaseBuffers();
     m_buffers.reserve(req.count);
 
@@ -351,6 +356,95 @@ bool V4L2CameraSource::setupDmaImportBuffers(
         m_currentConfig.bufferCapacity = m_buffers.front().memory.size();
     }
 
+    bool importQueueSucceeded = true;
+    for (DmaBuffer& buffer : m_buffers) {
+        if (!queueBuffer(buffer.index)) {
+            importQueueSucceeded = false;
+            break;
+        }
+    }
+
+    if (!importQueueSucceeded) {
+        // 部分 VPSS 节点只接受自己通过 MMAP 分配的 buffer，拒绝 dma-heap 导入。
+        // 退回到 MMAP 后通过 EXPBUF 导出 fd，MPP 仍然拿到同一块零拷贝 DMA-BUF。
+        const std::string importError = m_lastError;
+        releaseBuffers();
+        if (!setupMmapExportBuffers(bufferCount)) {
+            setError("DMA-BUF 导入失败(" + importError + ")，MMAP/EXPBUF 回退也失败: " +
+                     m_lastError);
+            return false;
+        }
+        return true;
+    }
+
+    m_state = State::BufferAllocated;
+    m_lastError.clear();
+    return true;
+}
+
+bool V4L2CameraSource::setupMmapExportBuffers(int bufferCount)
+{
+    v4l2_requestbuffers req {};
+    req.count = static_cast<uint32_t>(bufferCount);
+    req.type = static_cast<v4l2_buf_type>(m_bufferType);
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctlRetry(m_v4l2Fd, VIDIOC_REQBUFS, &req) < 0) {
+        setError(errnoText("VIDIOC_REQBUFS(MMAP) 失败"));
+        return false;
+    }
+    if (req.count == 0) {
+        setError("驱动没有分配任何 MMAP V4L2 buffer 槽位");
+        return false;
+    }
+
+    m_bufferMemory = V4L2_MEMORY_MMAP;
+    m_buffers.reserve(req.count);
+    for (uint32_t i = 0; i < req.count; ++i) {
+        v4l2_plane planes[1] {};
+        v4l2_buffer query {};
+        query.type = static_cast<v4l2_buf_type>(m_bufferType);
+        query.memory = V4L2_MEMORY_MMAP;
+        query.index = i;
+        if (m_multiPlanar) {
+            query.length = 1;
+            query.m.planes = planes;
+        }
+        if (ioctlRetry(m_v4l2Fd, VIDIOC_QUERYBUF, &query) < 0) {
+            setError(errnoText("VIDIOC_QUERYBUF(MMAP) 失败"));
+            releaseBuffers();
+            return false;
+        }
+
+        const size_t length = m_multiPlanar ? planes[0].length : query.length;
+        const off_t offset = static_cast<off_t>(m_multiPlanar ? planes[0].m.mem_offset
+                                                               : query.m.offset);
+        void* va = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, m_v4l2Fd, offset);
+        if (va == MAP_FAILED) {
+            setError(errnoText("mmap V4L2 buffer 失败"));
+            releaseBuffers();
+            return false;
+        }
+
+        v4l2_exportbuffer exportBuffer {};
+        exportBuffer.type = static_cast<v4l2_buf_type>(m_bufferType);
+        exportBuffer.index = i;
+        exportBuffer.plane = 0;
+        exportBuffer.flags = O_CLOEXEC;
+        if (ioctlRetry(m_v4l2Fd, VIDIOC_EXPBUF, &exportBuffer) < 0) {
+            const std::string error = errnoText("VIDIOC_EXPBUF 失败");
+            munmap(va, length);
+            setError(error);
+            releaseBuffers();
+            return false;
+        }
+
+        DmaBuffer buffer {};
+        buffer.index = static_cast<int>(i);
+        buffer.memory = DmaMemory::adopt(exportBuffer.fd, va, length);
+        m_buffers.push_back(std::move(buffer));
+    }
+
+    m_currentConfig.bufferCapacity = m_buffers.front().memory.size();
     for (DmaBuffer& buffer : m_buffers) {
         if (!queueBuffer(buffer.index)) {
             releaseBuffers();
@@ -434,7 +528,7 @@ bool V4L2CameraSource::dequeueFrame(Frame& frame)
     v4l2_plane planes[1] {};
     v4l2_buffer buf {};
     buf.type = static_cast<v4l2_buf_type>(m_bufferType);
-    buf.memory = V4L2_MEMORY_DMABUF;
+    buf.memory = m_bufferMemory;
     if (m_multiPlanar) {
         buf.length = 1;
         buf.m.planes = planes;
@@ -515,16 +609,20 @@ bool V4L2CameraSource::queueBuffer(int index)
     v4l2_plane planes[1] {};
     v4l2_buffer buf {};
     buf.type = static_cast<v4l2_buf_type>(m_bufferType);
-    buf.memory = V4L2_MEMORY_DMABUF;
+    buf.memory = m_bufferMemory;
     buf.index = static_cast<uint32_t>(index);
     if (m_multiPlanar) {
         buf.length = 1;
         buf.m.planes = planes;
         planes[0].length = static_cast<uint32_t>(buffer.memory.size());
-        planes[0].m.fd = buffer.memory.fd();
+        if (m_bufferMemory == V4L2_MEMORY_DMABUF) {
+            planes[0].m.fd = buffer.memory.fd();
+        }
     } else {
         buf.length = static_cast<uint32_t>(buffer.memory.size());
-        buf.m.fd = buffer.memory.fd();
+        if (m_bufferMemory == V4L2_MEMORY_DMABUF) {
+            buf.m.fd = buffer.memory.fd();
+        }
     }
 
     if (ioctlRetry(m_v4l2Fd, VIDIOC_QBUF, &buf) < 0) {
@@ -546,7 +644,15 @@ bool V4L2CameraSource::validateBufferIndex(int index) const
 
 void V4L2CameraSource::releaseBuffers()
 {
+    if (m_v4l2Fd >= 0 && !m_buffers.empty()) {
+        v4l2_requestbuffers req {};
+        req.type = static_cast<v4l2_buf_type>(m_bufferType);
+        req.memory = m_bufferMemory;
+        // count=0 通知驱动释放 V4L2 槽位；随后 DmaMemory 关闭导出的 fd 和映射。
+        (void)ioctlRetry(m_v4l2Fd, VIDIOC_REQBUFS, &req);
+    }
     m_buffers.clear();
+    m_bufferMemory = V4L2_MEMORY_DMABUF;
 }
 
 void V4L2CameraSource::setError(const std::string& message)

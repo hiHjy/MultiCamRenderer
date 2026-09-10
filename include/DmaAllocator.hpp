@@ -21,6 +21,10 @@ public:
     size_t size() const;
     bool valid() const;
 
+    // 接管一个已经由其他子系统创建的 DMA-BUF 及其映射。
+    // 调用后 DmaMemory 负责 munmap()/close()；传入方不得再释放这两个资源。
+    static DmaMemory adopt(int dmaFd, void* va, size_t size);
+
     void reset();
 
 private:

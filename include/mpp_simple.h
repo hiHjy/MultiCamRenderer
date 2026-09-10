@@ -68,6 +68,7 @@ void rk_mpp_decoder_deinit(RkMppDecoder *dec);
 
 typedef void (*RkMppPacketCallback)(const uint8_t *data,
                                     size_t size,
+                                    uint64_t timestamp_us,
                                     int is_header,
                                     int is_intra,
                                     int eos,
@@ -122,7 +123,10 @@ void rk_mpp_encoder_set_packet_callback(RkMppEncoder *enc,
                                         void *userdata);
 int rk_mpp_encoder_write_header(RkMppEncoder *enc);
 int rk_mpp_encoder_request_idr(RkMppEncoder *enc);
-int rk_mpp_encoder_send_frame(RkMppEncoder *enc, int fd, int eos);
+int rk_mpp_encoder_send_frame(RkMppEncoder *enc,
+                              int fd,
+                              uint64_t timestamp_us,
+                              int eos);
 void rk_mpp_encoder_deinit(RkMppEncoder *enc);
 
 #ifdef __cplusplus

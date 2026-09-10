@@ -1,0 +1,29 @@
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+set(RV1126B_SDK_ROOT "/home/hjy/2026-07-18/rv1126b_linux_ipc_xiaoyu" CACHE PATH "RV1126B Linux IPC SDK 根目录")
+set(RV1126B_TOOLCHAIN_ROOT
+    "${RV1126B_SDK_ROOT}/tools/linux/toolchain/aarch64-rockchip1240-linux-gnu"
+    CACHE PATH "RV1126B aarch64 工具链根目录")
+set(RV1126B_SYSROOT
+    "${RV1126B_TOOLCHAIN_ROOT}/aarch64-rockchip1240-linux-gnu/sysroot"
+    CACHE PATH "RV1126B aarch64 sysroot")
+
+if(NOT EXISTS "${RV1126B_TOOLCHAIN_ROOT}/bin/aarch64-rockchip1240-linux-gnu-g++" OR
+   NOT EXISTS "${RV1126B_SYSROOT}/usr/include")
+    message(FATAL_ERROR "RV1126B aarch64 toolchain 或 sysroot 不存在，请检查 RV1126B_SDK_ROOT")
+endif()
+
+set(CMAKE_C_COMPILER "${RV1126B_TOOLCHAIN_ROOT}/bin/aarch64-rockchip1240-linux-gnu-gcc")
+set(CMAKE_CXX_COMPILER "${RV1126B_TOOLCHAIN_ROOT}/bin/aarch64-rockchip1240-linux-gnu-g++")
+set(CMAKE_SYSROOT "${RV1126B_SYSROOT}")
+
+set(CMAKE_FIND_ROOT_PATH "${RV1126B_SYSROOT}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${RV1126B_SYSROOT}")
+set(ENV{PKG_CONFIG_LIBDIR} "${RV1126B_SYSROOT}/usr/lib/pkgconfig:${RV1126B_SYSROOT}/usr/share/pkgconfig")

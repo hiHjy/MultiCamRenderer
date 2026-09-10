@@ -763,6 +763,7 @@ static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
 {
     const uint8_t *data = NULL;
     size_t size = 0;
+    RK_S64 pts_us = 0;
     int eos = 0;
     int is_intra = 0;
 
@@ -771,6 +772,7 @@ static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
 
     data = (const uint8_t *)mpp_packet_get_pos(packet);
     size = mpp_packet_get_length(packet);
+    pts_us = mpp_packet_get_pts(packet);
     eos = mpp_packet_get_eos(packet);
     if (mpp_packet_has_meta(packet)) {
         MppMeta meta = mpp_packet_get_meta(packet);
@@ -823,7 +825,9 @@ static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
     }
 
     if (size > 0 && enc->packet_callback)
-        enc->packet_callback(data, size, is_header, is_intra, eos,
+        enc->packet_callback(data, size,
+                             pts_us >= 0 ? (uint64_t)pts_us : 0,
+                             is_header, is_intra, eos,
                              enc->packet_callback_userdata);
 
     return 0;
@@ -1023,7 +1027,10 @@ int rk_mpp_encoder_request_idr(RkMppEncoder *enc)
     return 0;
 }
 
-int rk_mpp_encoder_send_frame(RkMppEncoder *enc, int fd, int eos)
+int rk_mpp_encoder_send_frame(RkMppEncoder *enc,
+                              int fd,
+                              uint64_t timestamp_us,
+                              int eos)
 {
     MPP_RET ret = MPP_OK;
     MppMeta meta = NULL;
@@ -1062,6 +1069,7 @@ int rk_mpp_encoder_send_frame(RkMppEncoder *enc, int fd, int eos)
     mpp_frame_set_hor_stride(enc->frame, enc->h_stride);
     mpp_frame_set_ver_stride(enc->frame, enc->v_stride);
     mpp_frame_set_fmt(enc->frame, enc->fmt);
+    mpp_frame_set_pts(enc->frame, (RK_S64)timestamp_us);
     mpp_frame_set_eos(enc->frame, eos ? 1 : 0);
     mpp_frame_set_buffer(enc->frame, frm_buf);
 

@@ -95,6 +95,7 @@ public:
     const std::string& lastError() const;
 
 private:
+    bool setupMmapExportBuffers(int bufferCount);
     bool queueBuffer(int index);
     bool validateBufferIndex(int index) const;
     void releaseBuffers();
@@ -104,6 +105,7 @@ private:
     int m_cameraId = -1;
     int m_v4l2Fd = -1;
     uint32_t m_bufferType = 0;
+    uint32_t m_bufferMemory = 0;
     bool m_multiPlanar = false;
     State m_state = State::Closed;
     VideoMode m_currentMode {};

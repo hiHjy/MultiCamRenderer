@@ -13,6 +13,8 @@ struct EncodedPacket {
     const uint8_t* data = nullptr;
     size_t size = 0;
     MppCodec codec = MppCodec::H264;
+    // 与输入 VideoFrame 对应的源时间戳。MPP header 不对应图像，值为 0。
+    uint64_t timestampUs = 0;
     bool isHeader = false;
     bool isKeyFrame = false;
     bool eos = false;

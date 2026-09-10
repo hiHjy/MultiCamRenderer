@@ -218,6 +218,8 @@ private:
         m_resetDecoderBeforeNextPacket = false;
     }
 
+	//返回false，不唤醒解码线程
+	//返回true， 唤醒解码线程
     bool enqueueRecoveryPacketLocked(Packet packet)
     {
         const EncodedNaluInfo info = inspectAnnexBNalu(packet.codec, packet.annexB);

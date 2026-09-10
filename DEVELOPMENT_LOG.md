@@ -2505,3 +2505,43 @@ git diff --check
 
 `stream_manager_demo` 的 H.264 RTSP 板测也保持约 24 fps；两次超时停止后均确认无
 残留进程。
+
+### 后续：推流服务端的客户端请求 IDR 控制
+
+客户端已经在 `DecodeWorker` 中实现首帧/恢复门控：只有等到参数集加随机访问帧才将
+压缩码流送入 MPP，避免新加入流时把无法独立解码的 P/B NALU 送给 decoder。
+
+接入推流服务端与编码器 API 时，补充 RTSP 控制面请求关键帧：
+
+```text
+客户端：SETUP 200
+  → SET_PARAMETER: request-key-frame: 1
+  → PLAY
+
+服务端：RTSPClientSession::handleCmd_SET_PARAMETER()
+  → 解析 request-key-frame
+  → 投递给编码线程调用编码器 API 请求 IDR
+  → 编码器在 IDR 前输出 SPS/PPS（H265 还包括 VPS）
+```
+
+使用 live555 `RTSPClient::sendSetParameterCommand()` 和服务端
+`RTSPClientSession::handleCmd_SET_PARAMETER()` 实现。该请求是低频控制数据；服务端对
+同一编码器做约 300–500ms 的合并限流，多个客户端同时请求只实际触发一次 IDR。不能在
+live555 事件线程直接执行可能阻塞的编码器调用，应投递给编码线程。
+
+### RV1126B IPC 双路 RTSP 首版
+
+新增 `ipc_app`：`/dev/video33`（VPSS scale0）作为 `/main`，输出
+H.265 1920×1080@30；`/dev/video34`（VPSS scale1）作为 `/sub`，输出
+H.264 1280×720@30。一个 `Live555RtspServer` 共用 8554 端口与一个 event-loop，
+每路独立的 `RtspPublishSink` 在首个 PLAY 时启动本路 CamManager 与 MPP encoder，最后
+一个客户端离开后停止本路采集与编码。
+
+VPSS 节点拒绝 dma-heap 外部 buffer 导入时，`V4L2CameraSource` 自动回退到
+`V4L2_MEMORY_MMAP + VIDIOC_EXPBUF`：采集 buffer 仍导出为 DMA fd，因此 VPSS 到 MPP
+保持零拷贝。RV1126B 构建通过独立 toolchain/media_out 配置，并将运行时 RPATH 固定为
+板端 `/oem/usr/lib`。
+
+2026-09-11 板测：RV1126B 服务可正常启动；RK3568 分别及同时拉取 `/main`、`/sub`，
+MPP 解码与 StreamManager 发布均稳定约 30fps。客户端 TEARDOWN 后对应的活动客户端数
+回到 0，编码器正常 deinit；测试进程正常退出，8554 已释放。

@@ -188,6 +188,7 @@ int main(int argc, char** argv)
     MppEncoder encoder;
     encoder.setPacketCallback([&](const EncodedPacket& packet) {
         std::cout << "收到编码包: size=" << packet.size
+                  << " ts=" << packet.timestampUs
                   << " header=" << packet.isHeader
                   << " keyFrame=" << packet.isKeyFrame
                   << " eos=" << packet.eos << "\n";

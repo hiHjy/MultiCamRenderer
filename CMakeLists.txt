@@ -4,6 +4,7 @@ project(MultiCamRenderer LANGUAGES C CXX)
 
 option(MCR_BUILD_DEMOS "构建非 Qt 的 demo 与 DRM demo" ON)
 option(MCR_BUILD_QT "构建 Qt 应用与 Qt/RGA demo" OFF)
+option(MCR_BUILD_IPC_APP "构建 RV1126B IPC 双路 RTSP 应用" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -15,14 +16,37 @@ find_package(Threads REQUIRED)
 
 set(MCR_SYSROOT "${CMAKE_SYSROOT}")
 if(NOT MCR_SYSROOT)
-    message(FATAL_ERROR "需要通过 cmake/wsl-aarch64-toolchain.cmake 配置 RK3568 sysroot")
+    message(FATAL_ERROR "需要通过目标板 toolchain 文件配置 CMAKE_SYSROOT")
 endif()
 
 set(MCR_LIVE555_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/live555")
 
-find_library(MCR_MPP_LIBRARY NAMES rockchip_mpp REQUIRED)
-find_library(MCR_RGA_LIBRARY NAMES rga REQUIRED)
-find_library(MCR_DRM_LIBRARY NAMES drm REQUIRED)
+# RK3568 的媒体库位于 sysroot；RV1126B SDK 的媒体发布包则位于独立 media_out 目录。
+# MCR_MEDIA_ROOT 仅由 RV1126B IPC 构建脚本设置，默认构建行为保持不变。
+set(MCR_MEDIA_ROOT "" CACHE PATH "Rockchip media_out 根目录（含 include/ 与 lib/）")
+if(MCR_MEDIA_ROOT)
+    if(NOT EXISTS "${MCR_MEDIA_ROOT}/include/rockchip/mpp_frame.h" OR
+       NOT EXISTS "${MCR_MEDIA_ROOT}/include/rga/im2d.h" OR
+       NOT EXISTS "${MCR_MEDIA_ROOT}/lib/librockchip_mpp.so")
+        message(FATAL_ERROR "MCR_MEDIA_ROOT 不完整: ${MCR_MEDIA_ROOT}")
+    endif()
+    set(MCR_MPP_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/rockchip")
+    set(MCR_DRM_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/libdrm")
+    set(MCR_RGA_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include/rga")
+    set(MCR_MEDIA_COMMON_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include")
+    # media_out 中是 SDK 已发布的明确库路径，不依赖交叉 CMake 的 sysroot 搜索规则。
+    set(MCR_MPP_LIBRARY "${MCR_MEDIA_ROOT}/lib/librockchip_mpp.so")
+    set(MCR_RGA_LIBRARY "${MCR_MEDIA_ROOT}/lib/librga.so")
+    set(MCR_DRM_LIBRARY "${MCR_MEDIA_ROOT}/lib/libdrm.so")
+else()
+    set(MCR_MPP_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/rockchip")
+    set(MCR_DRM_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/libdrm")
+    set(MCR_RGA_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/rga")
+    set(MCR_MEDIA_COMMON_INCLUDE_DIR "")
+    find_library(MCR_MPP_LIBRARY NAMES rockchip_mpp REQUIRED)
+    find_library(MCR_RGA_LIBRARY NAMES rga REQUIRED)
+    find_library(MCR_DRM_LIBRARY NAMES drm REQUIRED)
+endif()
 
 foreach(live555_library IN ITEMS liveMedia groupsock BasicUsageEnvironment UsageEnvironment)
     if(NOT EXISTS "${MCR_LIVE555_ROOT}/lib/aarch64/lib${live555_library}.a")
@@ -40,9 +64,10 @@ function(mcr_add_executable target)
         "${MCR_LIVE555_ROOT}/include/groupsock"
         "${MCR_LIVE555_ROOT}/include/BasicUsageEnvironment"
         "${MCR_LIVE555_ROOT}/include/UsageEnvironment"
-        "${MCR_SYSROOT}/usr/include/rockchip"
-        "${MCR_SYSROOT}/usr/include/libdrm"
-        "${MCR_SYSROOT}/usr/include/rga"
+        "${MCR_MPP_INCLUDE_DIR}"
+        "${MCR_DRM_INCLUDE_DIR}"
+        "${MCR_RGA_INCLUDE_DIR}"
+        "${MCR_MEDIA_COMMON_INCLUDE_DIR}"
     )
     target_compile_options(${target} PRIVATE -Wall -Wextra)
 endfunction()
@@ -75,6 +100,32 @@ function(mcr_link_live555 target)
     )
 endfunction()
 
+# 项目自己的 RTSP 发布服务。一个 Server 可在同一 live555 event-loop 中注册多路
+# ServerMediaSession，不会为每一路复制端口或事件线程。
+set(MCR_RTSP_SERVER_SOURCES
+    src/AnnexBFrameQueue.cpp
+    src/AnnexBSource.cpp
+    src/VideoSubsession.cpp
+    src/Live555RtspServer.cpp
+)
+add_library(mcr_rtsp_server STATIC ${MCR_RTSP_SERVER_SOURCES})
+target_include_directories(mcr_rtsp_server
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE
+        "${MCR_LIVE555_ROOT}/include/liveMedia"
+        "${MCR_LIVE555_ROOT}/include/groupsock"
+        "${MCR_LIVE555_ROOT}/include/BasicUsageEnvironment"
+        "${MCR_LIVE555_ROOT}/include/UsageEnvironment"
+)
+target_compile_options(mcr_rtsp_server PRIVATE -Wall -Wextra)
+mcr_link_live555(mcr_rtsp_server)
+if(MCR_MEDIA_ROOT)
+    # RV1126B rootfs 未部署 OpenSSL；当前静态 live555 库本身已按无 TLS 模式构建，
+    # 使用同一宏让公开头文件不再包含 openssl/ssl.h。
+    target_compile_definitions(mcr_rtsp_server PUBLIC NO_OPENSSL)
+endif()
+
 set(MCR_MPP_DECODER_SOURCES
     src/MppTypes.cpp
     src/VideoFrame.cpp
@@ -91,6 +142,29 @@ set_source_files_properties(
     src/mpp_advance.c
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
+
+if(MCR_BUILD_IPC_APP)
+    mcr_add_executable(ipc_app
+        src/IpcApp.cpp
+        src/RtspPublishSink.cpp
+        src/CamManager.cpp
+        src/DmaAllocator.cpp
+        src/DmaBufferPool.cpp
+        src/FrameHub.cpp
+        src/V4L2CameraSource.cpp
+        src/MppEncoder.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
+    mcr_link_media(ipc_app)
+    mcr_link_live555(ipc_app)
+    # RV1126B 量产 rootfs 将 Rockchip 媒体运行库部署在此目录；交叉 SDK 中的
+    # media_out 仅用于构建，不能把主机 SDK 的绝对路径写进目标程序。
+    set_target_properties(ipc_app PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+endif()
 
 if(MCR_BUILD_DEMOS)
     mcr_add_executable(mpp_decoder_demo
