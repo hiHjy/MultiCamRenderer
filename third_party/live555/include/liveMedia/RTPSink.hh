@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // RTP Sinks
 // C++ header
 
@@ -26,9 +26,6 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #endif
 #ifndef _RTP_INTERFACE_HH
 #include "RTPInterface.hh"
-#endif
-#ifndef _SRTP_CRYPTOGRAPHIC_CONTEXT_HH
-#include "SRTPCryptographicContext.hh"
 #endif
 
 class RTPTransmissionStatsDB; // forward
@@ -44,23 +41,15 @@ public:
 
   unsigned char rtpPayloadType() const { return fRTPPayloadType; }
   unsigned rtpTimestampFrequency() const { return fTimestampFrequency; }
-  void setRTPTimestampFrequency(unsigned freq) { fTimestampFrequency = freq; }
-  char const* rtpPayloadFormatName() const { return fRTPPayloadFormatName; }
+  void setRTPTimestampFrequency(unsigned freq) {
+    fTimestampFrequency = freq;
+  }
+  char const* rtpPayloadFormatName() const {return fRTPPayloadFormatName;}
 
   unsigned numChannels() const { return fNumChannels; }
 
-  void setupForSRTP(Boolean useEncryption, u_int32_t roc);
-      // sets up keying/encryption state for streaming via SRTP, using default values.
-  u_int8_t* setupForSRTP(Boolean useEncryption, u_int32_t roc,
-			 unsigned& resultMIKEYStateMessageSize);
-      // as above, but returns the binary MIKEY state
-  void setupForSRTP(u_int8_t const* MIKEYStateMessage, unsigned MIKEYStateMessageSize,
-		    u_int32_t roc);
-      // as above, but takes a MIKEY state message as parameter
-
   virtual char const* sdpMediaType() const; // for use in SDP m= lines
   virtual char* rtpmapLine() const; // returns a string to be delete[]d
-  virtual char* keyMgmtLine(); // returns a string to be delete[]d
   virtual char const* auxSDPLine();
       // optional SDP line (e.g. a=fmtp:...)
 
@@ -86,22 +75,19 @@ public:
   void resetPresentationTimes();
 
   // Hacks to allow sending RTP over TCP (RFC 2236, section 10.12):
-  void setStreamSocket(int sockNum, unsigned char streamChannelId, TLSState* tlsState) {
-    fRTPInterface.setStreamSocket(sockNum, streamChannelId, tlsState);
+  void setStreamSocket(int sockNum, unsigned char streamChannelId) {
+    fRTPInterface.setStreamSocket(sockNum, streamChannelId);
   }
-  void addStreamSocket(int sockNum, unsigned char streamChannelId, TLSState* tlsState) {
-    fRTPInterface.addStreamSocket(sockNum, streamChannelId, tlsState);
+  void addStreamSocket(int sockNum, unsigned char streamChannelId) {
+    fRTPInterface.addStreamSocket(sockNum, streamChannelId);
   }
   void removeStreamSocket(int sockNum, unsigned char streamChannelId) {
     fRTPInterface.removeStreamSocket(sockNum, streamChannelId);
   }
   unsigned& estimatedBitrate() { return fEstimatedBitrate; } // kbps; usually 0 (i.e., unset)
 
-  u_int32_t SSRC() const { return fSSRC; }
+  u_int32_t SSRC() const {return fSSRC;}
      // later need a means of changing the SSRC if there's a collision #####
-
-  SRTPCryptographicContext* getCrypto() const { return fCrypto; }
-  u_int32_t srtpROC() const;
 
 protected:
   RTPSink(UsageEnvironment& env,
@@ -127,10 +113,6 @@ protected:
   struct timeval fTotalOctetCountStartTime, fInitialPresentationTime, fMostRecentPresentationTime;
   u_int32_t fCurrentTimestamp;
   u_int16_t fSeqNo;
-
-  // Optional key management and crypto state; used if we are streaming SRTP
-  MIKEYState* fMIKEYState;
-  SRTPCryptographicContext* fCrypto;
 
 private:
   // redefined virtual functions:

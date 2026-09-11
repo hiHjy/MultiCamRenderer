@@ -3,6 +3,7 @@
 #include "AnnexBSink.hh"
 
 #include <BasicUsageEnvironment.hh>
+#include <GroupsockHelper.hh>
 #include <liveMedia.hh>
 
 #include <atomic>
@@ -15,6 +16,9 @@
 namespace {
 
 constexpr unsigned kMaxReceivedNaluBytes = 2U * 1024U * 1024U;
+// 1080p H265 的单个 IDR 往往会拆成数百个 UDP RTP 包。默认 socket 接收缓冲很容易
+// 小于一个 IDR 的突发量；丢任一 FU 分片都会令整条 IDR NALU 失效。
+constexpr unsigned kUdpRtpReceiveBufferBytes = 4U * 1024U * 1024U;
 
 bool codecFromSubsession(const MediaSubsession& subsession, VideoCodec& codec)
 {
@@ -337,6 +341,12 @@ struct Live555RtspClient::Impl {
                 reportError(std::string("初始化 RTP 接收端失败：") + clientRef.envir().getResultMsg());
                 requestEventLoopExit();
                 return;
+            }
+
+            if (!requestRtpOverTcp_ && subsession.rtpSource() != nullptr
+                && subsession.rtpSource()->RTPgs() != nullptr) {
+                const int socket = subsession.rtpSource()->RTPgs()->socketNum();
+                increaseReceiveBufferTo(clientRef.envir(), socket, kUdpRtpReceiveBufferBytes);
             }
 
             clientRef.state.selectedCodec = codec;

@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // Basic Usage Environment: for a simple, non-scripted, console application
 // C++ header
 
@@ -67,12 +67,7 @@ private:
 
 class HandlerSet; // forward
 
-// Note: You may redefine MAX_NUM_EVENT_TRIGGERS,
-// but it must be <= the number of bits in an "EventTriggerId"
-#ifndef MAX_NUM_EVENT_TRIGGERS
 #define MAX_NUM_EVENT_TRIGGERS 32
-#endif
-#define EVENT_TRIGGER_ID_HIGH_BIT (1 << (MAX_NUM_EVENT_TRIGGERS-1))
 
 // An abstract base class, useful for subclassing
 // (e.g., to redefine the implementation of socket event handling)
@@ -91,7 +86,7 @@ public:
 				void* clientData);
   virtual void unscheduleDelayedTask(TaskToken& prevTask);
 
-  virtual void doEventLoop(EventLoopWatchVariable* watchVariable);
+  virtual void doEventLoop(char volatile* watchVariable);
 
   virtual EventTriggerId createEventTrigger(TaskFunc* eventHandlerProc);
   virtual void deleteEventTrigger(EventTriggerId eventTriggerId);
@@ -102,7 +97,6 @@ protected:
 
 protected:
   // To implement delayed operations:
-  intptr_t fTokenCounter;
   DelayQueue fDelayQueue;
 
   // To implement background reads:
@@ -110,16 +104,11 @@ protected:
   int fLastHandledSocketNum;
 
   // To implement event triggers:
-#ifndef NO_STD_LIB
-  std::atomic_flag fTriggersAwaitingHandling[MAX_NUM_EVENT_TRIGGERS];
-#else
-  Boolean volatile fTriggersAwaitingHandling[MAX_NUM_EVENT_TRIGGERS];
-#endif
-  u_int32_t fLastUsedTriggerMask; // implemented as a 32-bit bitmap
+  EventTriggerId volatile fTriggersAwaitingHandling; // implemented as a 32-bit bitmap
+  EventTriggerId fLastUsedTriggerMask; // implemented as a 32-bit bitmap
   TaskFunc* fTriggeredEventHandlers[MAX_NUM_EVENT_TRIGGERS];
   void* fTriggeredEventClientDatas[MAX_NUM_EVENT_TRIGGERS];
   unsigned fLastUsedTriggerNum; // in the range [0,MAX_NUM_EVENT_TRIGGERS)
-  Boolean fEventTriggersAreBeingUsed;
 };
 
 #endif

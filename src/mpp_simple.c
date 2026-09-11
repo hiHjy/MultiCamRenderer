@@ -467,33 +467,31 @@ static int rk_mpp_decoder_handle_info_change(RkMppDecoder *dec, MppFrame frame)
  */
 static int rk_mpp_decoder_handle_frame(RkMppDecoder *dec, MppFrame frame)
 {
-   
     RK_U32 fmt = mpp_frame_get_fmt(frame);
     RK_U32 width = mpp_frame_get_width(frame);
     RK_U32 height = mpp_frame_get_height(frame);
     RK_U32 h_stride = mpp_frame_get_hor_stride(frame);
     RK_U32 v_stride = mpp_frame_get_ver_stride(frame);
     MppBuffer buf = mpp_frame_get_buffer(frame);
-    RK_U32 size = mpp_frame_get_buf_size(frame);
     int fd = buf ? mpp_buffer_get_fd(buf) : -1;
-    printf("[rkmpp decoder]mpp decoded frame:%p fmt:%u(%s) %ux%u stride=%ux%u buf=%p fd=%d size=%u pts=%lld\n",
-       frame, fmt, rk_mpp_frame_fmt_name(fmt),
-       width, height, h_stride, v_stride,
-       buf, fd, size, mpp_frame_get_pts(frame));
-    printf(" [rkmpp decoder]errinfo=%u discard=%d info_change=%d eos=%d\n",
-       mpp_frame_get_errinfo(frame),
-       mpp_frame_get_discard(frame),
-       mpp_frame_get_info_change(frame),
-       mpp_frame_get_eos(frame));
-
     if (mpp_frame_get_info_change(frame))
         return rk_mpp_decoder_handle_info_change(dec, frame);
 
-    //printf("成功读取到一帧数据 %d\n", ++dec->frame_count);
-    // if (dec->f_out && !mpp_frame_get_errinfo(frame))
-    //     rk_mpp_dump_frame_nv12(frame, dec->f_out);
-    printf("errinfo:%d, discard:%d\n", mpp_frame_get_errinfo(frame), mpp_frame_get_discard(frame));
-    if (dec->frame_callback && !mpp_frame_get_discard(frame)) {
+    // 解码器标记为错误或应丢弃的输出不能交给下游显示。否则 RGA/DRM 会把不完整
+    // 的 NV12 当成正常图像显示，常见现象就是瞬时绿屏/花屏。
+    const RK_U32 errinfo = mpp_frame_get_errinfo(frame);
+    const RK_U32 discard = mpp_frame_get_discard(frame);
+    if (errinfo != 0 || discard != 0) {
+        // 本文件的 printf 被上方宏禁用，异常帧必须走 fprintf 才会真正输出。
+        fprintf(stderr,
+                "[RKMPP Decoder] 丢弃异常输出 errinfo=%u discard=%u "
+                "fmt=%u(%s) %ux%u stride=%ux%u fd=%d pts=%lld\n",
+                errinfo, discard, fmt, rk_mpp_frame_fmt_name(fmt),
+                width, height, h_stride, v_stride, fd, mpp_frame_get_pts(frame));
+        return 0;
+    }
+
+    if (dec->frame_callback) {
         MppBuffer buffer = mpp_frame_get_buffer(frame);
         const uint8_t *data = NULL;
         size_t size = 0;
@@ -533,7 +531,6 @@ static int rk_mpp_decoder_handle_frame(RkMppDecoder *dec, MppFrame frame)
             dec->last_output_log_ms = now_ms;
         }
 
-        printf("2\n");
         dec->frame_callback(data, size, fd, width, height, h_stride, v_stride, fmt,
                             mpp_frame_get_pts(frame),
                             dec->frame_callback_userdata);

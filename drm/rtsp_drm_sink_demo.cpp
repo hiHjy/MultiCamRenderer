@@ -8,6 +8,7 @@
 #include "Live555RtspClient.hh"
 
 #include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <utility>
@@ -595,10 +597,20 @@ private:
 
 int main(int argc, char** argv)
 {
-    const std::string url = argc > 1 ? argv[1] : "rtsp://192.168.1.5:8554/live";
-    const int seconds = argc > 2 ? std::stoi(argv[2]) : 30;
-    const bool rtpOverTcp = argc > 3 && std::string(argv[3]) == "tcp";
-    const bool useRgbOutput = argc > 4 && std::string(argv[4]) == "rgb";
+    // 在创建 live555/解码线程前统一阻塞退出信号；子线程会继承这个屏蔽字，
+    // 主线程通过 sigwait() 收到 Ctrl+C 后再按正常顺序释放 RTSP、MPP 和 DRM 资源。
+    sigset_t stopSignals;
+    sigemptyset(&stopSignals);
+    sigaddset(&stopSignals, SIGINT);
+    sigaddset(&stopSignals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &stopSignals, nullptr) != 0) {
+        std::cerr << "屏蔽退出信号失败\n";
+        return 1;
+    }
+
+    const std::string url = argc > 1 ? argv[1] : "rtsp://192.168.1.5:8554/sub";
+    const bool rtpOverTcp = argc > 2 && std::string(argv[2]) == "tcp";
+    const bool useRgbOutput = argc > 3 && std::string(argv[3]) == "rgb";
 
     RtspDrmPipeline pipeline(useRgbOutput);
     if (!pipeline.start(url, rtpOverTcp)) {
@@ -606,7 +618,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    LOG_INFO("RtspDrmDemo", "持续运行中，按 Ctrl+C 停止");
+    int receivedSignal = 0;
+    if (sigwait(&stopSignals, &receivedSignal) != 0) {
+        LOG_ERROR("RtspDrmDemo", "等待退出信号失败");
+    }
     pipeline.stop();
     return 0;
 }

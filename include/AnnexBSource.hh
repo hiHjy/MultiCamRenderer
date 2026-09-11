@@ -4,6 +4,7 @@
 
 #include "AnnexBFrameQueue.hh"
 
+#include <cstdint>
 #include <memory>
 
 // 单个 live555 FramedSource 适配器：在 RTP sink 请求数据时从共享 Annex-B 队列取一个 NALU。

@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // RTP Sources
 // C++ header
 
@@ -46,11 +46,6 @@ public:
 
   Groupsock* RTPgs() const { return fRTPInterface.gs(); }
 
-  // Did the teardown classifier PROVE the far end closed this stream (captured FIN/RST)?
-  // Exposed so the session layer can re-establish on PROOF instead of waiting for an inactivity
-  // timer to INFER the same fault seconds later. See SessionRecoveryPolicy.hh.
-  Boolean farEndCloseProven() const { return fRTPInterface.farEndCloseProven(); }
-
   virtual void setPacketReorderingThresholdTime(unsigned uSeconds) = 0;
 
   void setCrypto(SRTPCryptographicContext* crypto) { fCrypto = crypto; }
@@ -76,9 +71,9 @@ public:
   Boolean& enableRTCPReports() { return fEnableRTCPReports; }
   Boolean const& enableRTCPReports() const { return fEnableRTCPReports; }
 
-  void setStreamSocket(int sockNum, unsigned char streamChannelId, TLSState* tlsState) {
+  void setStreamSocket(int sockNum, unsigned char streamChannelId) {
     // hack to allow sending RTP over TCP (RFC 2236, section 10.12)
-    fRTPInterface.setStreamSocket(sockNum, streamChannelId, tlsState);
+    fRTPInterface.setStreamSocket(sockNum, streamChannelId);
   }
 
   void setAuxilliaryReadHandler(AuxHandlerFunc* handlerFunc,

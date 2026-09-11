@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // State encapsulating a TLS connection
 // C++ header
 
@@ -27,81 +27,32 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #ifndef _BOOLEAN_HH
 #include "Boolean.hh"
 #endif
-#ifndef _USAGE_ENVIRONMENT_HH
-#include "UsageEnvironment.hh"
-#endif
 #ifndef NO_OPENSSL
 #include <openssl/ssl.h>
 #endif
 
 class TLSState {
 public:
+  TLSState(class RTSPClient& client);
+  virtual ~TLSState();
+
+public:
   Boolean isNeeded;
 
+  int connect(int socketNum); // returns: -1 (unrecoverable error), 0 (pending), 1 (done)
   int write(const char* data, unsigned count);
   int read(u_int8_t* buffer, unsigned bufferSize);
 
-  void nullify(); // clear the state so that the destructor will have no effect
-
-protected: // we're an abstract base class
-  TLSState();
-  virtual ~TLSState();
+private:
+  void reset();
+  Boolean setup(int socketNum);
 
 #ifndef NO_OPENSSL
-  void initLibrary();
-  void reset();
-
-protected:
+private:
+  class RTSPClient& fClient;
   Boolean fHasBeenSetup;
   SSL_CTX* fCtx;
   SSL* fCon;
-#endif
-};
-
-class ClientTLSState: public TLSState {
-public:
-  ClientTLSState(class RTSPClient& client);
-  virtual ~ClientTLSState();
-
-  int connect(int socketNum); // returns: <0 (error), 0 (pending), >0 (success)
-
-#ifndef NO_OPENSSL
-private:
-  Boolean setup(int socketNum);
-  Boolean setupContinue(int socketNum);// called to complete "setup()" (perhaps via a callback)
-#ifdef CLIENT_TLS_SETUP_EXTRA
-  // If you want to do some extra work during the client TLS setup (e.g., to check the server's
-  // certificate), then you would do so by defining CLIENT_TLS_SETUP_EXTRA during
-  // the compilation, and implementing this member function (which, if it succeeds, must
-  // eventually cause "setupContinue()" to be called:
-  Boolean setupExtra(int socketNum);
-#endif
-
-private:
-  class RTSPClient& fClient;
-#endif
-};
-
-class ServerTLSState: public TLSState {
-public:
-  ServerTLSState(UsageEnvironment& env);
-  virtual ~ServerTLSState();
-
-  void setCertificateAndPrivateKeyFileNames(char const* certFileName, char const* privKeyFileName);
-  void assignStateFrom(ServerTLSState const& from);
-
-  int accept(int socketNum); // returns: <0 (error), 0 (pending), >0 (success)
-
-  Boolean tlsAcceptIsNeeded;
-
-#ifndef NO_OPENSSL
-private:
-  Boolean setup(int socketNum);
-
-private:
-  UsageEnvironment& fEnv;
-  char const* fCertificateFileName;
-  char const* fPrivateKeyFileName;
 #endif
 };
 

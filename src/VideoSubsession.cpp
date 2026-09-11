@@ -7,10 +7,14 @@
 #include <H264VideoStreamDiscreteFramer.hh>
 #include <H265VideoRTPSink.hh>
 #include <H265VideoStreamDiscreteFramer.hh>
+#include <GroupsockHelper.hh>
 
 namespace {
 
 constexpr unsigned kMaxVideoNaluBytes = 8U * 1024U * 1024U;
+// H265 IDR 会被拆成大量 RTP FU。目标板默认 208KiB 的 UDP 发送缓冲太小，
+// 在一个大 IDR 的突发发送时容易触发内核队列压力。
+constexpr unsigned kUdpRtpSendBufferBytes = 4U * 1024U * 1024U;
 
 } // namespace
 
@@ -43,6 +47,12 @@ RTPSink* VideoSubsession::createNewRTPSink(Groupsock* rtpGroupsock,
 {
     (void)inputSource;
     OutPacketBuffer::maxSize = kMaxVideoNaluBytes;
+
+    if (rtpGroupsock != nullptr) {
+        const int socket = rtpGroupsock->socketNum();
+        increaseSendBufferTo(envir(), socket, kUdpRtpSendBufferBytes);
+    }
+
     return m_codec == VideoCodec::H264
         ? static_cast<RTPSink*>(H264VideoRTPSink::createNew(envir(), rtpGroupsock, rtpPayloadTypeIfDynamic))
         : static_cast<RTPSink*>(H265VideoRTPSink::createNew(envir(), rtpGroupsock, rtpPayloadTypeIfDynamic));

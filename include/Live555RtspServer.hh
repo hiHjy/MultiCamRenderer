@@ -88,7 +88,12 @@ private:
     bool m_startFinished = false;
     bool m_startOk = false;
 
+#if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
     EventLoopWatchVariable m_eventLoopWatchVariable {0};
+#else
+    // 2021.05.03 的 doEventLoop() 使用 char volatile* 退出标志。
+    char volatile m_eventLoopWatchVariable = 0;
+#endif
     TaskScheduler* m_scheduler = nullptr;
     UsageEnvironment* m_env = nullptr;
     UserAuthenticationDatabase* m_authDb = nullptr;

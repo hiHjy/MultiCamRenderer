@@ -1,12 +1,18 @@
-# live555
+# live555（统一依赖）
 
-这个目录是 MultiCamRenderer 使用的 live555 第三方依赖，不包含项目自己的
-RTSP 封装代码。
+本目录只使用一套未经项目修改的 upstream 源码：`live.2021.05.03`。
 
-- `include/`：live555 的四组公开头文件。
-- `lib/aarch64/`：为 RK aarch64 SDK 编译的静态库：`liveMedia`、`groupsock`、
-  `BasicUsageEnvironment`、`UsageEnvironment`。
+- 来源：`https://github.com/lengfeld/live555-unofficial-git-archive`
+- 固定 tag：`v2021.05.03-tree`
+- 与 RK3568 板子原有 `libliveMedia.so.94` 的版本一致。
+- 许可证：LGPL；原始许可证文件见上游源码包。
 
-项目封装的拉流客户端源码位于 `src/`。构建 RTSP + MPP 学习 demo 时使用
-`drm/wsl-build-rtsp-mpp-demo.sh`；它只引用本目录的 live555 头文件和静态库，不再
-依赖另一份 live555 工程或 SDK 内的 live555 动态库。
+目录中的 `include/` 是该源码包原样导出的头文件，不能手工修改。
+静态库以同一源码分别使用目标 SDK 的工具链构建：
+
+```text
+lib/aarch64-rk3568/   # RK3568 Buildroot toolchain
+lib/aarch64-rv1126b/  # RV1126B SDK toolchain
+```
+
+构建脚本会显式传入 `MCR_LIVE555_TARGET`，因此不会再发生“新头文件配旧静态库”的混搭。

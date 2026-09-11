@@ -81,7 +81,11 @@ bool Live555RtspServer::start(unsigned short rtspPort,
     m_username = username;
     m_password = password;
     m_lastError.clear();
+#if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
     m_eventLoopWatchVariable.store(0);
+#else
+    m_eventLoopWatchVariable = 0;
+#endif
     m_startFinished = false;
     m_startOk = false;
     for (const auto& entry : m_streamMap) {
@@ -115,7 +119,11 @@ void Live555RtspServer::stop()
         if (!m_running.load() && !m_rtspThread.joinable())
             return;
 
+#if LIVEMEDIA_LIBRARY_VERSION_INT >= 1700000000
         m_eventLoopWatchVariable.store(1);
+#else
+        m_eventLoopWatchVariable = 1;
+#endif
         scheduler = m_scheduler;
         stopTrigger = m_stopTrigger;
     }

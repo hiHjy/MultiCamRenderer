@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A data structure that represents a session that consists of
 // potentially multiple (audio and/or video) sub-sessions
 // (This data structure is used for media *streamers* - i.e., servers.
@@ -69,12 +69,9 @@ public:
 
   void deleteAllSubsessions();
     // Removes and deletes all subsessions added by "addSubsession()", returning us to an 'empty' state
-    // Note: If you have already added this "ServerMediaSession" to a server then, before calling this function,
+    // Note: If you have already added this "ServerMediaSession" to a "RTSPServer" then, before calling this function,
     //   you must first close any client connections that use it,
-    //   by calling "GenericMediaServer::closeAllClientSessionsForServerMediaSession()".
-
-  Boolean streamingUsesSRTP; // by default, False
-  Boolean streamingIsEncrypted; // by default, False
+    //   by calling "RTSPServer::closeAllClientSessionsForServerMediaSession()".
 
 protected:
   ServerMediaSession(UsageEnvironment& env, char const* streamName,
@@ -132,7 +129,6 @@ public:
 				   int tcpSocketNum, // in (-1 means use UDP, not TCP)
 				   unsigned char rtpChannelId, // in (used if TCP)
 				   unsigned char rtcpChannelId, // in (used if TCP)
-				   TLSState* tlsState, // in (used if TCP)
 				   struct sockaddr_storage& destinationAddress, // in out
 				   u_int8_t& destinationTTL, // in out
 				   Boolean& isMulticast, // out
@@ -165,7 +161,7 @@ public:
   virtual float getCurrentNPT(void* streamToken);
   virtual FramedSource* getStreamSource(void* streamToken);
   virtual void getRTPSinkandRTCP(void* streamToken,
-				 RTPSink*& rtpSink, RTCPInstance*& rtcp) = 0;
+				 RTPSink const*& rtpSink, RTCPInstance const*& rtcp) = 0;
      // Returns pointers to the "RTPSink" and "RTCPInstance" objects for "streamToken".
      // (This can be useful if you want to get the associated 'Groupsock' objects, for example.)
      // You must not delete these objects, or start/stop playing them; instead, that is done
@@ -187,7 +183,6 @@ protected: // we're a virtual base class
       // returns a string to be delete[]d
 
   ServerMediaSession* fParentSession;
-  u_int32_t fSRTP_ROC; // horrible hack for SRTP; when the ROC changes, regenerate the SDP
 
 private:
   friend class ServerMediaSession;

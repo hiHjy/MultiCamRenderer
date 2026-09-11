@@ -2591,3 +2591,243 @@ RV1126B 板测通过：在没有 `aiq_v4l2_daemon` 的条件下，应用可完�
 `init/prepare/start`，正常停止后无需重启板子即可再次启动并重新完成 AIQ 初始化；OEM 路径
 下运行的 `multicam_ipc_app` 已成功注册 `rtsp://<board-ip>:8554/main`（H265）与 `/sub`
 （H264）。
+
+## 2026-09-12
+
+### H265 RTSP/UDP 丢包：完整排查、根因与修复
+
+#### 现象
+
+RV1126B IPC 推送 `/main`（H265 1920×1080@30）时，手机播放器通常正常；但 RK3568 的
+live555 拉流 → MPP 解码 → DRM 显示链路偶发绿屏/花屏，OBS/FFmpeg 日志还会出现：
+
+```text
+RTP: missed N packets
+Could not find ref with POC ...
+Error constructing the frame RPS
+Skipping invalid undecodable NALU
+```
+
+H264 `/sub`（1280×720）稳定得多。MPP 侧一度持续报告：
+
+```text
+[RKMPP Decoder] 丢弃异常输出 errinfo=1 discard=0
+```
+
+静态画面比运动画面更容易暴露 MPP `errinfo=1`；但这不是“静止时 live555 或 MPP 偷懒”。静态
+画面通常更容易压缩，不能只凭现象归因于“静态 IDR 更大、UDP 缓冲不足”。本次确认到 UDP socket
+容量不足；静态/运动差异仍需以本地 Annex-B 回放进一步隔离。
+
+随后以服务端编码输出日志按同一口径核对，实际测得本设备当前 MPP H265 RC 行为为：
+
+```text
+静态画面 IDR NALU：约 270–314 KiB
+  272300 / 271753 / 269652 / 313388 / 314141 bytes
+
+动态画面 IDR NALU：约 83–151 KiB
+  151490 / 151343 / 106408 / 108052 / 101967 /
+   97634 /  82975 /  90785 /  85921 /  86433 bytes
+```
+
+因此本次“静态时更易出错、运动时恢复”的直接差异是静态 IDR 实际大约多出 160–230 KiB，而不是
+“静态编码必然更小”的通用规律。编码大小由具体的 MPP 码率控制、GOP 状态和图像内容共同决定，必须
+以实际码流统计为准。
+
+#### 不要先猜播放器或解码器：按数据边界分三段取证
+
+为定位丢失发生的位置，临时加入了仅在 `MCR_PACKET_TRACE=1` 下启用的逐 NALU 日志，并分别
+记录 H265 的时间戳、NAL 类型、长度：
+
+```text
+编码器输出（RtspPublishSink）
+  → Live555RtspServer::pushAnnexBFrame()
+  → AnnexBFrameQueue
+  → AnnexBSource::deliverFrame()        # source_out，交给 live555 RTP sink 前
+  → RTP/UDP 网络
+  → Live555RtspClient / AnnexBSink
+  → Stream::DecodeWorker::enqueue()     # client_enqueue
+  → MPP decoder
+```
+
+同时新增临时 `rtsp_annexb_record_demo`，把客户端 `AnnexBSink` 已经重组完毕的 Annex-B NALU
+直接落盘。它的意义是把“RTP 分片重组是否完整”与“MPP/DRM 是否显示正确”分开判断。
+
+结论如下：
+
+1. 编码器输出的 H265 NAL 类型、PTS、IDR 数量正常；每个 IDR 前存在 VPS/SPS/PPS，随后是
+   IDR，普通帧为 type 1。
+2. `AnnexBSource` 的 `source_out` 与编码器输出逐条对应，证明项目自己的
+   `RtspPublishSink → AnnexBFrameQueue → AnnexBSource` 没有丢 NALU。
+3. 默认 UDP socket 参数下，服务端已输出的一部分大 IDR 没有出现在客户端录制 Annex-B 文件中。
+   该样本证明 `source_out` 之后（live555 RTP sink、内核 UDP 缓冲或网络）存在真实丢包；它只
+   解释缺失 NALU，不能据此排除编码器或 MPP 对静态场景异常的影响。
+4. `ffprobe -count_frames` 对增大缓存后的 60 秒 H265 录制文件统计为 `1800` 帧，正好对应
+   `30 fps × 60 s`；该验证证明该次提高缓存后的 RTP→Annex-B 接收链路没有持续少帧，不能
+   单独证明所有 MPP `errinfo` 都由网络导致。
+
+临时诊断代码在定位完成后已经移除，避免实时链路长期保留字符串解析、日志 I/O 和额外 mutex。
+保留 `rtsp_annexb_record_demo` 作为独立诊断工具：以后遇到播放器、解码器或网络争议时，可先
+录制客户端收到的原始 Annex-B，再用 `ffprobe`/`ffplay`/MPP 分别验证。
+
+#### 已证实根因之一：H265 UDP 突发超过默认 socket 队列余量
+
+默认内核值为：
+
+```text
+net.core.rmem_default = 212992
+net.core.rmem_max     = 212992
+net.core.wmem_default = 212992
+net.core.wmem_max     = 212992
+```
+
+Linux 对 `SO_RCVBUF`/`SO_SNDBUF` 有内部记账和倍增语义，实际可观察到的 socket 缓冲约为
+`425984` 字节量级。1080p H265 的单张 IDR 常为数百 KiB，live555 会依据 MTU 将其分为数百个
+RFC 7798 FU RTP 包。这里必须理解：
+
+```text
+H265 NALU 被 RTP FU 分片
+≠ 每个 FU 会被发送端按帧率均匀节流
+≠ UDP 有反压、重传或可靠传输
+```
+
+一张 IDR 的大量 UDP datagram 会在很短时间内连续写入 socket；每包除 payload 外还有 skb/协议
+记账开销。默认约 416 KiB 的收发队列无法可靠容纳该突发时，内核会丢 UDP datagram。IDR 只要
+丢失一个 FU 分片，整个 NALU 就不能重组/解码；随后的 P 帧继续引用失去的参考图像，MPP 会输出
+`errinfo=1`，FFmpeg 则报告 POC/RPS 缺参考。这是已由逐 NALU 对照确认的网络故障模式，但不是
+“静态画面 MPP 异常”的完整归因。
+
+本设备实测的静态约 300 KiB IDR 需要约两百多个 RTP UDP 包突发发送；动态约 100 KiB IDR 仅需
+约几十个包。前者显著更容易越过默认 socket 队列余量，这与“静态阶段丢 IDR、动态阶段未复现”的
+现象直接一致。
+
+运动时“看起来恢复”可能与完整 IDR、码率控制、参考结构或 MPP 行为有关；当前数据不足以把它
+归因于其中任意一项。`fDurationInMicroseconds` 影响帧间调度，却不能为一张 IDR 内部的数百个
+UDP FU 提供可靠性；它不是 UDP 丢包的替代修复。
+
+#### 修复
+
+代码层保持显式 socket 扩容，避免依赖某一发行版的微小默认值：
+
+```text
+服务端 VideoSubsession::createNewRTPSink()
+  → increaseSendBufferTo(..., 4 MiB)
+
+客户端 Live555RtspClient::setupNextSubsession()
+  → increaseReceiveBufferTo(..., 4 MiB)
+```
+
+系统层把 socket 默认值和上限设为：
+
+```text
+RV1126B RTSP 服务端：
+  net.core.wmem_default = 4 MiB
+  net.core.wmem_max     = 16 MiB
+
+RK3568 RTSP 客户端：
+  net.core.rmem_default = 4 MiB
+  net.core.rmem_max     = 16 MiB
+```
+
+4 MiB 是默认突发余量；16 MiB 是未来 4K/更大 IDR 时可申请的上限，不会在启动时为每一个 socket
+预先分配 16 MiB。当前代码请求 4 MiB，Linux 的 socket 缓冲倍增语义下可获得约 8 MiB 级实际
+容量；未来以真实最大 IDR、码率和客户端数压测后，再决定是否将代码请求目标提高到 8 MiB。
+
+持久化方式不需要重编 kernel、更不需要向未知分区 `dd`：运行时 `sysctl -w` 已经生效，说明内核
+本来就支持该参数。只需在 rootfs 开机阶段配置：
+
+```text
+RK3568：/etc/sysctl.d/90-multicam-rtp.conf
+  由现有 /etc/init.d/S02sysctl 自动加载
+
+RV1126B：/etc/init.d/S19multicam-rtp-sysctl
+  在 S21appinit 启动 IPC 应用前设置 wmem 参数
+```
+
+两块板子重启后均已回读确认配置生效。临时把实际 socket 缓冲提升到 8 MiB 后，H265 UDP 连续
+60 秒录制得到完整 1800 帧，证明该次 UDP 传输问题消失；仍需将同一次落盘 Annex-B 直接喂给
+MPP，作为静态 `errinfo` 的最终归因测试。
+
+#### MPP 异常输出的正确处理
+
+`src/mpp_simple.c` 保留并收紧了异常帧逻辑：当 `mpp_frame_get_errinfo(frame) != 0` 或
+`mpp_frame_get_discard(frame) != 0` 时，打印一次完整的 format、尺寸、stride、fd、PTS 诊断并
+直接释放该 MPP 输出，不再交给 RGA/DRM。
+
+```text
+错误/应丢弃的 MPP NV12
+  → 不做 RGA copy
+  → 不进入 Display/FrameHub
+  → 防止不完整 buffer 被显示成瞬时绿屏或花屏
+```
+
+这不是“吞掉网络故障”，而是下游的安全边界；网络恢复仍依赖下一组完整的参数集 + IDR。该底层
+错误过滤与打印属于长期保留的防御代码，不随临时 RTP/NAL 调试一同删除。
+
+#### AnnexBSource 的时序原则
+
+`AnnexBSource` 每次被 RTP sink 请求时直接取出一个 NALU，`fDurationInMicroseconds` 固定为零。
+IPC 的摄像头采集和编码器本身已按真实帧率生产数据；在这里额外用下一条 NALU 的 PTS 推导时长，
+既没有必要，还会遇到 MPP 独立 VPS/SPS/PPS header 的 `PTS=0` 与真实帧时间戳相减这一错误边界。
+因此不保留 look-ahead 节流逻辑。
+
+### live555 依赖统一
+
+项目此前存在“头文件和静态库可能来自不同 live555 版本”的风险。现统一为 upstream
+`live.2021.05.03`（`v2021.05.03-tree`），该版本与 RK3568 板端原有
+`libliveMedia.so.94` 对应。
+
+```text
+third_party/live555/include/             # 同一源码原样导出的头文件
+third_party/live555/lib/aarch64-rk3568/  # RK3568 Buildroot toolchain 静态库
+third_party/live555/lib/aarch64-rv1126b/ # RV1126B SDK toolchain 静态库
+```
+
+`CMakeLists.txt` 新增 `MCR_LIVE555_TARGET`，`wsl-build.sh` 固定选择 `rk3568`，
+`wsl-build-ipc.sh` 固定选择 `rv1126b`。这保证同一次 target 构建不会再把一套头文件和另一套
+工具链构建的静态库混用。旧的单一 `lib/aarch64/` 已不再使用。
+
+旧 live555 的 `TaskScheduler::doEventLoop()` 退出标志是 `char volatile*`，而新版本是
+`EventLoopWatchVariable`；`Live555RtspServer` 按 `LIVEMEDIA_LIBRARY_VERSION_INT` 做了编译期
+兼容分支，避免切回 2021.05.03 后出现类型不匹配。
+
+### MPP SDK 库更新
+
+两套 SDK 使用的 MPP 源码/根文件系统库统一更新到 Rockchip upstream `develop` 的：
+
+```text
+0986d01294d5c2449c14cf13af9b740368c33967
+2026-08-26  fix[vproc]: Fix calloc transposed args
+SONAME: librockchip_mpp.so.1
+```
+
+- RK3568 SDK 原 `external/mpp` 为 2023-09-15 版本。已切换至上述提交，并保留
+  `mcr-before-mpp-20260912` 分支作为源码回退点；已编好的新版 `librockchip_mpp.so.0` 和
+  `librockchip_vpu.so.0` 已直接放入当前 Buildroot target rootfs 的 `usr/lib/`。
+- RV1126B SDK 原 MPP 源码快照为 2026-02-13。旧快照保存为
+  `media/mpp/mpp-rv1126b-d7dd00e4-backup-20260912`，新版按 RV1126B SoC、其自身 aarch64
+  工具链重新编译成功，并替换当前 OEM rootfs 的 `oem/usr/lib/` 中 MPP/VPU 库。
+
+两边的 `.so` 都已核对 AArch64 架构与 `librockchip_mpp.so.1` SONAME；RV1126B rootfs 中的
+库与本次交叉编译产物 SHA256 一致。
+
+注意：本次是将已验证产物直接同步至“当前 rootfs 目录”，没有重新打完整固件镜像、更没有刷写
+kernel 或分区。下次进行 SDK 全量构建/打包后，应再核对最终 image 中的 MPP 版本字符串。
+
+### 其他本次改动
+
+- `rtsp_drm_sink_demo` 默认 URL 改为 `/sub`，运行方式改为持续运行；启动前统一屏蔽
+  `SIGINT`/`SIGTERM`，主线程 `sigwait()` 收到 Ctrl+C 后按 RTSP → MPP → DRM 正常 stop，便于
+  长时间观察显示链路，不再由 demo 固定超时自行退出。
+- `StreamManagerDemo` 默认 URL 改为 IPC 的 `/main`。
+- 临时 NAL 序列统计、编码前/服务端 source/client enqueue 三段 trace、解码帧率统计和 socket
+  实际值打印已全部删除；保留独立录制 demo 与长期需要的 MPP 错误帧过滤。
+
+### 本次验证
+
+```bash
+./wsl-build.sh
+git diff --check
+```
+
+RK3568 非 Qt aarch64 demos 交叉构建通过，其中包含：RTSP 拉流、MPP 解码、DRM 显示、
+Stream/StreamManager、Annex-B 录制与 RTSP server 相关 target。

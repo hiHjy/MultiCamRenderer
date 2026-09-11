@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A 'ServerMediaSubsession' object that represents an existing
 // 'RTPSink', rather than one that creates new 'RTPSink's on demand.
 // C++ header
@@ -54,7 +54,6 @@ protected: // redefined virtual functions
 				   int tcpSocketNum,
                                    unsigned char rtpChannelId,
                                    unsigned char rtcpChannelId,
-				   TLSState* tlsSTate,
                                    struct sockaddr_storage& destinationAddress,
 				   u_int8_t& destinationTTL,
                                    Boolean& isMulticast,
@@ -70,7 +69,7 @@ protected: // redefined virtual functions
                            void* serverRequestAlternativeByteHandlerClientData);
   virtual float getCurrentNPT(void* streamToken);
   virtual void getRTPSinkandRTCP(void* streamToken,
-				 RTPSink*& rtpSink, RTCPInstance*& rtcp);
+				 RTPSink const*& rtpSink, RTCPInstance const*& rtcp);
   virtual void deleteStream(unsigned clientSessionId, void*& streamToken);
 
 protected:

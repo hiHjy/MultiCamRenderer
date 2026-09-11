@@ -74,7 +74,7 @@ int main(int argc, char* argv[])
     }
 
     StreamManager manager;
-    const std::string url = argc > 1 ? argv[1] : "rtsp://192.168.1.5:8554/live";
+    const std::string url = argc > 1 ? argv[1] : "rtsp://192.168.1.5:8554/main";
     auto stream = std::make_shared<RtspStream>(url, 2);
     const int streamId = manager.addStream(stream);
     if (streamId < 0) {

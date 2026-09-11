@@ -14,16 +14,12 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A generic RTSP client - for a single "rtsp://" URL
 // C++ header
 
 #ifndef _RTSP_CLIENT_HH
 #define _RTSP_CLIENT_HH
-
-#ifndef _REQUEST_RETRY_POLICY_HH
-#include "RequestRetryPolicy.hh" // RequestFailureCause: what actually went wrong, recorded at the site
-#endif
 
 #ifndef _MEDIA_SESSION_HH
 #include "MediaSession.hh"
@@ -149,23 +145,10 @@ public:
       // Issues an aggregate RTSP "SET_PARAMETER" command on "session", then returns the "CSeq" sequence number that was used in the command.
       // (The "responseHandler" and "authenticator" parameters are as described for "sendDescribeCommand".)
 
-  unsigned sendLivenessSetParameterCommand(MediaSession& session, responseHandler* responseHandler,
-					   Authenticator* authenticator = NULL);
-      // Issues a BODYLESS aggregate RTSP "SET_PARAMETER" on "session", purely as a session keep-alive
-      // ping, and returns the "CSeq" used. This is what GStreamer's rtspsrc sends as its preferred
-      // keep-alive (gst_rtspsrc_send_keep_alive_internal). It is deliberately distinct from
-      // sendSetParameterCommand() above, which always writes a "name: value" body: inventing a
-      // parameter name just to say "still here" is what some cameras reject.
-
   unsigned sendGetParameterCommand(MediaSession& session, responseHandler* responseHandler, char const* parameterName,
 				   Authenticator* authenticator = NULL);
       // Issues an aggregate RTSP "GET_PARAMETER" command on "session", then returns the "CSeq" sequence number that was used in the command.
       // (The "responseHandler" and "authenticator" parameters are as described for "sendDescribeCommand".)
-
-  void setRequireValue(char const* requireValue = NULL);
-      // Sets a string to be used as the value of a "Require:" header to be included in
-      // subsequent RTSP commands.  Call "setRequireValue()" again (i.e., with no parameter)
-      // to clear this (and so stop "Require:" headers from being included in subsequent cmds).
 
   void sendDummyUDPPackets(MediaSession& session, unsigned numDummyPackets = 2);
   void sendDummyUDPPackets(MediaSubsession& subsession, unsigned numDummyPackets = 2);
@@ -206,6 +189,8 @@ public:
   unsigned sessionTimeoutParameter() const { return fSessionTimeoutParameter; }
 
   char const* url() const { return fBaseURL; }
+
+  void useTLS() { fTLS.isNeeded = True; }
 
   static unsigned responseBufferSize;
 
@@ -256,31 +241,6 @@ protected:
       // called only by createNew();
   virtual ~RTSPClient();
 
-  // What went wrong with the most recent failed request, as recorded by the site that DETECTED it.
-  // Response handlers must prefer this over interpreting their `resultCode` whenever that code is
-  // negative, because a negative code is `-errno` sampled at an arbitrary moment and describes
-  // nothing. Protected rather than public: it is meaningful only to a subclass handling its own
-  // responses, and only immediately after a failure.
-  RequestFailureCause lastFailureCause() const { return fLastFailureCause; }
-
-  // Does an RTSP session id exist yet? A SET_PARAMETER/GET_PARAMETER cannot be SENT without one
-  // (setRequestFields refuses), and the id only exists once the first SETUP's RESPONSE arrives --
-  // counting SETUPs *sent* is the wrong fact for "may I use a session-scoped method". Exposed so a
-  // subclass choosing a keep-alive method can ask the real question.
-  Boolean haveRTSPSessionId() const { return fLastSessionId != NULL; }
-
-  // THE derivation of a failure cause from a response handler's `resultCode`. One place, because the
-  // rule is subtle and was already copy-pasted at two call sites (with a third due when PLAY gains a
-  // retry):
-  //   resultCode > 0  the real RTSP status, set deliberately at handleResponseBytes -- classify it.
-  //   resultCode <= 0 `-errno` sampled at an arbitrary moment, describing nothing (decoding it is
-  //                   how a response-PARSE failure was once diagnosed as EADDRINUSE) -- ask the
-  //                   failure site what it recorded instead.
-  // Living here, beside lastFailureCause(), keeps the rule next to the convention it depends on.
-  RequestFailureCause failureCauseFor(int resultCode) const {
-    return resultCode > 0 ? classifyRequestFailure(resultCode) : lastFailureCause();
-  }
-
   void reset();
   void setBaseURL(char const* url);
   int grabSocket(); // allows a subclass to reuse our input socket, so that it won't get closed when we're deleted
@@ -320,24 +280,7 @@ private:
   char* createAuthenticatorString(char const* cmd, char const* url);
   char* createBlocksizeString(Boolean streamUsingTCP);
   char* createKeyMgmtString(char const* url, MediaSubsession const& subsession);
-  // 🚨 The cause is RECORDED AT THE FAILURE SITE, never reconstructed afterwards.
-  //
-  // This used to be `handleRequestError(request)`, which built its result as `-envir().getErrno()`.
-  // errno is process-global state left behind by whatever syscall ran last, and this function is
-  // reached from six places -- including a pure RESPONSE-PARSING failure (handleResponseBytes) where
-  // no syscall failed at all. So the number handed to every response handler was frequently
-  // unrelated to what actually went wrong.
-  //
-  // Real cost: production SETUP failures on 6397272975e8c006c6fc reported `result -98`. 98 is
-  // EADDRINUSE, which led to a diagnosis of local RTP-port contention and a "fix" built on it. The
-  // value proved nothing of the sort -- it was simply whatever errno happened to hold. Diagnosing
-  // from it is the same error as explaining away an empty command result: inventing a mechanism to
-  // fit a number nobody verified.
-  //
-  // Callers now state what happened. `cause` is mandatory: there is no default, so a new call site
-  // cannot quietly inherit the old guesswork.
-  void handleRequestError(RequestRecord* request, RequestFailureCause cause);
-
+  void handleRequestError(RequestRecord* request);
   Boolean parseResponseCode(char const* line, unsigned& responseCode, char const*& responseString);
   void handleIncomingRequest();
   static Boolean checkForHeader(char const* line, char const* headerName, unsigned headerNameLength, char const*& headerParams);
@@ -352,7 +295,7 @@ private:
   Boolean handlePLAYResponse(MediaSession* session, MediaSubsession* subsession,
                              char const* scaleParamsStr, const char* speedParamsStr,
 			     char const* rangeParamsStr, char const* rtpInfoParamsStr);
-  Boolean handleTEARDOWNResponse(MediaSession* session, MediaSubsession* subsession);
+  Boolean handleTEARDOWNResponse(MediaSession& session, MediaSubsession& subsession);
   Boolean handleGET_PARAMETERResponse(char const* parameterName, char*& resultValueString, char* resultValueStringEnd);
   Boolean handleAuthenticationFailure(char const* wwwAuthenticateParamsStr);
   Boolean resendCommand(RequestRecord* request);
@@ -390,10 +333,6 @@ public:
 
 protected:
   int fVerbosityLevel;
-  // Set by handleRequestError from the call site that detected the failure, so a response handler
-  // can ask what happened instead of decoding a stale errno. Starts UNKNOWN rather than any real
-  // cause: "nothing has failed yet" must never read as a specific failure.
-  RequestFailureCause fLastFailureCause;
   unsigned fCSeq; // sequence number, used in consecutive requests
   Authenticator fCurrentAuthenticator;
   Boolean fAllowBasicAuthentication;
@@ -411,7 +350,6 @@ private:
   char* fResponseBuffer;
   unsigned fResponseBytesAlreadySeen, fResponseBufferBytesLeft;
   RequestQueue fRequestsAwaitingConnection, fRequestsAwaitingHTTPTunneling, fRequestsAwaitingResponse;
-  char* fRequireStr;
 
   // Support for tunneling RTSP-over-HTTP:
   char fSessionCookie[33];
@@ -419,11 +357,8 @@ private:
   Boolean fHTTPTunnelingConnectionIsPending;
 
   // Optional support for TLS:
-  ClientTLSState fTLS;
-  ClientTLSState fPOSTSocketTLS; // used only for RTSP-over-HTTPS
-  ClientTLSState* fInputTLS;
-  ClientTLSState* fOutputTLS;
-  friend class ClientTLSState;
+  TLSState fTLS;
+  friend class TLSState;
 };
 
 

@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A 'ServerMediaSubsession' object that creates new, unicast, "RTPSink"s
 // on demand.
 // C++ header
@@ -51,7 +51,6 @@ protected: // redefined virtual functions
 				   int tcpSocketNum,
                                    unsigned char rtpChannelId,
                                    unsigned char rtcpChannelId,
-				   TLSState* tlsState,
                                    struct sockaddr_storage& destinationAddress,
 				   u_int8_t& destinationTTL,
                                    Boolean& isMulticast,
@@ -74,7 +73,7 @@ protected: // redefined virtual functions
   virtual float getCurrentNPT(void* streamToken);
   virtual FramedSource* getStreamSource(void* streamToken);
   virtual void getRTPSinkandRTCP(void* streamToken,
-				 RTPSink*& rtpSink, RTCPInstance*& rtcp);
+				 RTPSink const*& rtpSink, RTCPInstance const*& rtcp);
   virtual void deleteStream(unsigned clientSessionId, void*& streamToken);
 
 protected: // new virtual functions, possibly redefined by subclasses
@@ -133,8 +132,6 @@ protected:
 
 protected:
   char* fSDPLines;
-  u_int8_t* fMIKEYStateMessage; // used if we're streaming SRTP
-  unsigned fMIKEYStateMessageSize; // ditto
   HashTable* fDestinationsHashTable; // indexed by client session id
 
 private:
@@ -160,11 +157,9 @@ public:
                Port const& rtcpDestPort)
     : isTCP(False), addr(destAddr), rtpPort(rtpDestPort), rtcpPort(rtcpDestPort) {
   }
-  Destinations(int tcpSockNum, unsigned char rtpChanId, unsigned char rtcpChanId,
-	       TLSState* tlsSt)
+  Destinations(int tcpSockNum, unsigned char rtpChanId, unsigned char rtcpChanId)
     : isTCP(True), rtpPort(0) /*dummy*/, rtcpPort(0) /*dummy*/,
-      tcpSocketNum(tcpSockNum), rtpChannelId(rtpChanId), rtcpChannelId(rtcpChanId),
-      tlsState(tlsSt) {
+      tcpSocketNum(tcpSockNum), rtpChannelId(rtpChanId), rtcpChannelId(rtcpChanId) {
   }
 
 public:
@@ -174,7 +169,6 @@ public:
   Port rtcpPort;
   int tcpSocketNum;
   unsigned char rtpChannelId, rtcpChannelId;
-  TLSState* tlsState;
 };
 
 class StreamState {

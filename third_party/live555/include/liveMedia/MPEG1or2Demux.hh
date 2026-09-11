@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // Demultiplexer for a MPEG 1 or 2 Program Stream
 // C++ header
 
@@ -27,15 +27,11 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 class MPEG1or2DemuxedElementaryStream; // forward
 
-typedef void MPEG1or2DemuxOnDeletionFunc(void* objectToNotify, class MPEG1or2Demux* demuxBeingDeleted);
-
 class MPEG1or2Demux: public Medium {
 public:
   static MPEG1or2Demux* createNew(UsageEnvironment& env,
 				  FramedSource* inputSource,
-				  Boolean reclaimWhenLastESDies = False,
-				  MPEG1or2DemuxOnDeletionFunc* onDeletionFunc = NULL,
-				  void* objectToNotify = NULL);
+				  Boolean reclaimWhenLastESDies = False);
   // If "reclaimWhenLastESDies" is True, the the demux is deleted when
   // all "MPEG1or2DemuxedElementaryStream"s that we created get deleted.
 
@@ -85,8 +81,7 @@ public:
 
 private:
   MPEG1or2Demux(UsageEnvironment& env,
-		FramedSource* inputSource, Boolean reclaimWhenLastESDies,
-		MPEG1or2DemuxOnDeletionFunc* onDeletionFunc, void* objectToNotify);
+		FramedSource* inputSource, Boolean reclaimWhenLastESDies);
       // called only by createNew()
   virtual ~MPEG1or2Demux();
 
@@ -146,9 +141,6 @@ private:
 
   unsigned fNumPendingReads;
   Boolean fHaveUndeliveredData;
-
-  MPEG1or2DemuxOnDeletionFunc* fOnDeletionFunc;
-  void* fOnDeletionObjectToNotify;
 
 private: // parsing state
   class MPEGProgramStreamParser* fParser;

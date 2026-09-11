@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A class that encapsulates a Matroska file.
 // C++ header
 
@@ -34,8 +34,6 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 class MatroskaTrack; // forward
 class MatroskaDemux; // forward
 
-typedef void MatroskaDemuxOnDeletionFunc(void* objectToNotify, MatroskaDemux* demuxBeingDeleted);
-
 class MatroskaFile: public Medium {
 public:
   typedef void (onCreationFunc)(MatroskaFile* newFile, void* clientData);
@@ -47,9 +45,8 @@ public:
 
   MatroskaTrack* lookup(unsigned trackNumber) const;
 
-  MatroskaDemux* newDemux(MatroskaDemuxOnDeletionFunc* onDeletionFunc = NULL, void* objectToNotify = NULL);
-      // Creates a demultiplexor for extracting tracks from this file.
-      // (Separate clients will typically have separate demultiplexors.)
+  // Create a demultiplexor for extracting tracks from this file.  (Separate clients will typically have separate demultiplexors.)
+  MatroskaDemux* newDemux();
 
   // Parameters of the file ('Segment'); set when the file is parsed:
   unsigned timecodeScale() { return fTimecodeScale; } // in nanoseconds
@@ -154,11 +151,11 @@ public:
   unsigned samplingFrequency;
   unsigned numChannels;
   char const* mimeType;
-  u_int32_t codecPrivateSize;
+  unsigned codecPrivateSize;
   u_int8_t* codecPrivate;
   Boolean codecPrivateUsesH264FormatForH265; // a hack specifically for H.265 video tracks
   Boolean codecIsOpus; // a hack for Opus audio
-  u_int32_t headerStrippedBytesSize;
+  unsigned headerStrippedBytesSize;
   u_int8_t* headerStrippedBytes;
   char const* colorSampling;
   char const* colorimetry;

@@ -16,6 +16,7 @@ fi
 cmake -S "${BASE}" -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DMCR_LIVE555_TARGET=rk3568 \
     -DMCR_BUILD_DEMOS=ON \
     -DMCR_BUILD_QT=OFF
 

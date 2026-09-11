@@ -20,6 +20,9 @@ if(NOT MCR_SYSROOT)
 endif()
 
 set(MCR_LIVE555_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/live555")
+set(MCR_LIVE555_TARGET "rk3568" CACHE STRING "live555 静态库目标平台（rk3568 或 rv1126b）")
+set_property(CACHE MCR_LIVE555_TARGET PROPERTY STRINGS rk3568 rv1126b)
+set(MCR_LIVE555_LIBRARY_DIR "${MCR_LIVE555_ROOT}/lib/aarch64-${MCR_LIVE555_TARGET}")
 
 # RK3568 的媒体库位于 sysroot；RV1126B SDK 的媒体发布包则位于独立 media_out 目录。
 # MCR_MEDIA_ROOT 仅由 RV1126B IPC 构建脚本设置，默认构建行为保持不变。
@@ -53,8 +56,8 @@ else()
 endif()
 
 foreach(live555_library IN ITEMS liveMedia groupsock BasicUsageEnvironment UsageEnvironment)
-    if(NOT EXISTS "${MCR_LIVE555_ROOT}/lib/aarch64/lib${live555_library}.a")
-        message(FATAL_ERROR "缺少 aarch64 live555 库: lib${live555_library}.a")
+    if(NOT EXISTS "${MCR_LIVE555_LIBRARY_DIR}/lib${live555_library}.a")
+        message(FATAL_ERROR "缺少 ${MCR_LIVE555_TARGET} live555 库: lib${live555_library}.a")
     endif()
 endforeach()
 
@@ -95,10 +98,10 @@ endfunction()
 function(mcr_link_live555 target)
     target_link_libraries(${target} PRIVATE
         "-Wl,--start-group"
-        "${MCR_LIVE555_ROOT}/lib/aarch64/libliveMedia.a"
-        "${MCR_LIVE555_ROOT}/lib/aarch64/libgroupsock.a"
-        "${MCR_LIVE555_ROOT}/lib/aarch64/libBasicUsageEnvironment.a"
-        "${MCR_LIVE555_ROOT}/lib/aarch64/libUsageEnvironment.a"
+        "${MCR_LIVE555_LIBRARY_DIR}/libliveMedia.a"
+        "${MCR_LIVE555_LIBRARY_DIR}/libgroupsock.a"
+        "${MCR_LIVE555_LIBRARY_DIR}/libBasicUsageEnvironment.a"
+        "${MCR_LIVE555_LIBRARY_DIR}/libUsageEnvironment.a"
         "-Wl,--end-group"
         Threads::Threads
     )
@@ -216,6 +219,15 @@ if(MCR_BUILD_DEMOS)
     )
     mcr_link_media(rtsp_mpp_decoder_demo)
     mcr_link_live555(rtsp_mpp_decoder_demo)
+
+    # 临时诊断工具：把 live555 已重组的完整 Annex-B NALU 原样落盘，便于区分
+    # RTP/服务端问题和播放器兼容性问题。
+    mcr_add_executable(rtsp_annexb_record_demo
+        demo/RtspAnnexBRecordDemo.cpp
+        src/Live555RtspClient.cpp
+        src/AnnexBSink.cpp
+    )
+    mcr_link_live555(rtsp_annexb_record_demo)
 
     mcr_add_executable(rtsp_stream_demo
         demo/RtspStreamDemo.cpp

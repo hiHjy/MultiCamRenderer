@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2021 Live Networks, Inc.  All rights reserved.
 // A generic media server class, used to implement a RTSP server, and any other server that uses
 //  "ServerMediaSession" objects to describe media to be served.
 // C++ header
@@ -39,11 +39,11 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 // Typedef for a handler function that gets called when "lookupServerMediaSession()"
 // (defined below) completes:
 typedef void lookupServerMediaSessionCompletionFunc(void* clientData,
-						    ServerMediaSession* smsLookedUp);
+						    ServerMediaSession* sessionLookedUp);
 
 class GenericMediaServer: public Medium {
 public:
-  virtual void addServerMediaSession(ServerMediaSession* serverMediaSession);
+  void addServerMediaSession(ServerMediaSession* serverMediaSession);
 
   virtual void lookupServerMediaSession(char const* streamName,
 					lookupServerMediaSessionCompletionFunc* completionFunc,
@@ -96,18 +96,11 @@ protected:
   void incomingConnectionHandlerIPv6();
   void incomingConnectionHandlerOnSocket(int serverSocket);
 
-  void setTLSFileNames(char const* certFileName, char const* privKeyFileName);
-
 public: // should be protected, but some old compilers complain otherwise
   // The state of a TCP connection used by a client:
   class ClientConnection {
-  public:
-    unsigned id() const { return fConnectionId; }
-    
   protected:
-    ClientConnection(GenericMediaServer& ourServer,
-		     int clientSocket, struct sockaddr_storage const& clientAddr,
-		     Boolean useTLS);
+    ClientConnection(GenericMediaServer& ourServer, int clientSocket, struct sockaddr_storage const& clientAddr);
     virtual ~ClientConnection();
 
     UsageEnvironment& envir() { return fOurServer.envir(); }
@@ -122,21 +115,13 @@ public: // should be protected, but some old compilers complain otherwise
     friend class GenericMediaServer;
     friend class ClientSession;
     friend class RTSPServer; // needed to make some broken Windows compilers work; remove this in the future when we end support for Windows
-    unsigned fConnectionId;
     GenericMediaServer& fOurServer;
     int fOurSocket;
     struct sockaddr_storage fClientAddr;
     unsigned char fRequestBuffer[REQUEST_BUFFER_SIZE];
     unsigned char fResponseBuffer[RESPONSE_BUFFER_SIZE];
     unsigned fRequestBytesAlreadySeen, fRequestBufferBytesLeft;
-
-    // Optional support for TLS:
-    ServerTLSState fTLS;
-    ServerTLSState* fInputTLS; // by default, just points to "fTLS", but subclasses may change
-    ServerTLSState* fOutputTLS; // ditto
   };
-
-  ClientConnection* lookupClientConnection(u_int32_t connectionId) const;
 
   // The state of an individual client session (using one or more sequential TCP connections) handled by a server:
   class ClientSession {
@@ -190,15 +175,12 @@ protected:
   int fServerSocketIPv4, fServerSocketIPv6;
   Port fServerPort;
   unsigned fReclamationSeconds;
+
+private:
   HashTable* fServerMediaSessions; // maps 'stream name' strings to "ServerMediaSession" objects
   HashTable* fClientConnections; // the "ClientConnection" objects that we're using
   HashTable* fClientSessions; // maps 'session id' strings to "ClientSession" objects
-
-private:
   u_int32_t fPreviousClientSessionId;
-
-  char const* fTLSCertificateFileName;
-  char const* fTLSPrivateKeyFileName;
 };
 
 // A data structure used for optional user/password authentication:
