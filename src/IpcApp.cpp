@@ -75,7 +75,13 @@ Live555RtspServer::StreamConfig makeRtspStreamConfig(
         // 而不是停止 CamManager。
         publishSink->setActive(active);
         LOG_INFO("IpcApp", "stream=" << streamName
-                                           << (active ? " 有客户端，启动编码" : " 无客户端，停止编码并丢弃裸帧"));
+                                        << (active ? " 有客户端，启动编码" : " 无客户端，停止编码并丢弃裸帧"));
+    };
+    config.onAdditionalClientStarted = [publishSink, streamName] {
+        // 此回调来自 live555 事件线程；PublishSink 只置位标志，MPP 控制命令由编码
+        // worker 在下一次送帧前串行执行。首个客户端会新建编码器，天然从 IDR 起流。
+        publishSink->requestKeyFrame();
+        LOG_INFO("IpcApp", "stream=" << streamName << " 新客户端加入，已请求下一帧 IDR");
     };
     return config;
 }

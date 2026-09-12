@@ -2831,3 +2831,43 @@ git diff --check
 
 RK3568 非 Qt aarch64 demos 交叉构建通过，其中包含：RTSP 拉流、MPP 解码、DRM 显示、
 Stream/StreamManager、Annex-B 录制与 RTSP server 相关 target。
+
+## 2026-09-13
+
+### 新 RTSP 客户端加入时请求下一帧 IDR
+
+`Live555RtspServer` 原有的 `onClientActiveChanged(bool)` 只表达某一路客户端人数的
+`0 → 1` 和 `1 → 0` 边界：前者启动编码器，后者停止编码器。首个客户端启动新编码器时，编码序列
+天然从 IDR 开始；但第二个及后续客户端在已有编码序列中加入，只能等待下一次周期 IDR，最坏等待
+一个 GOP。
+
+为此在 `Live555RtspServer::StreamConfig` 增加 `onAdditionalClientStarted`：仅当一个新客户端
+完成 PLAY，且该路原本已存在播放客户端时触发。IPC App 将此回调接到
+`RtspPublishSink::requestKeyFrame()`。
+
+```text
+第一个客户端 PLAY：0 → 1
+  → onClientActiveChanged(true)
+  → PublishSink init MPP
+  → 第一帧天然 IDR
+
+后续客户端 PLAY：1 → 2 / 2 → 3
+  → onAdditionalClientStarted()
+  → PublishSink 仅置位 m_keyFrameRequested
+  → 编码 worker 下一次 sendFrame() 前调用 MPP_ENC_SET_IDR_FRAME
+  → 下一帧输出 VPS/SPS/PPS + IDR
+```
+
+live555 回调运行在事件线程，不能直接调用 MPP。`RtspPublishSink` 将重复请求合并为一个 bool；只有
+其编码 worker 串行调用 `MppEncoder::requestKeyFrame()`，因此不存在跨线程同时操作 MPP 的风险。若
+强制 IDR 命令失败，仅记录 warning，正常编码与周期 IDR 仍继续。
+
+板测：在 RV1126B 上先启动一个 RK3568 `/main` 客户端，再加入第二、第三个客户端；服务端分别记录
+`active clients=2/3`，随后 PublishSink 均成功记录“已请求 MPP 下一帧 IDR”。两路 RK3568 客户端在
+整个测试过程中稳定发布约 29–31 fps。
+
+已将验证过的 RV1126B `ipc_app` 安装到 `/oem/usr/bin/multicam_ipc_app`，原程序备份为：
+
+```text
+/oem/usr/bin/multicam_ipc_app.20260913-idr-request.bak
+```

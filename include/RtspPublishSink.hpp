@@ -34,6 +34,10 @@ public:
     // active=false 时立即丢弃待编码帧并 deinit 编码器。
     void setActive(bool active);
 
+    // 请求编码 worker 在下一次 sendFrame() 前强制 IDR。可由 live555 事件线程调用；
+    // 多次请求合并为一次，绝不在调用线程直接操作 MPP。
+    void requestKeyFrame();
+
     void onFrame(FramePacket packet) override;
 
     bool isActive() const;
@@ -54,6 +58,7 @@ private:
     std::optional<FramePacket> m_pendingFrame;
     bool m_activeRequested = false;
     bool m_acceptingFrames = false;
+    bool m_keyFrameRequested = false;
     bool m_stopping = false;
     uint64_t m_droppedFrames = 0;
     std::string m_lastError;

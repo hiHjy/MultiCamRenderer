@@ -38,9 +38,20 @@ void RtspPublishSink::setActive(bool active)
             // optional 被销毁时会释放旧 FrameLease，CamManager 随后可将 V4L2 buffer QBUF。
             m_acceptingFrames = false;
             m_pendingFrame.reset();
+            m_keyFrameRequested = false;
         }
     }
     m_cv.notify_one();
+}
+
+void RtspPublishSink::requestKeyFrame()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_stopping || !m_activeRequested)
+        return;
+
+    // 只需要下一帧成为 IDR；同一时刻多个新客户端加入时无需重复向 MPP 发控制命令。
+    m_keyFrameRequested = true;
 }
 
 void RtspPublishSink::onFrame(FramePacket packet)
@@ -122,6 +133,7 @@ void RtspPublishSink::workerMain()
 
         while (shouldEncode) {
             FramePacket packet;
+            bool requestKeyFrame = false;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cv.wait(lock, [this] {
@@ -137,10 +149,23 @@ void RtspPublishSink::workerMain()
 
                 packet = std::move(*m_pendingFrame);
                 m_pendingFrame.reset();
+                requestKeyFrame = m_keyFrameRequested;
+                m_keyFrameRequested = false;
             }
 
             // 当前 mpp_simple 封装会在 sendFrame() 内取回编码包后才返回；packet 的 lease
             // 因而会一直保护输入 dmaFd 到 MPP 使用完成。
+            if (requestKeyFrame) {
+                if (!encoder.requestKeyFrame()) {
+                    // 强制 IDR 失败不应阻断普通编码；编码器的周期 IDR 仍能让客户端恢复。
+                    LOG_WARN("RtspPublishSink", "stream=" << m_config.streamName
+                                                                << " 请求下一帧 IDR 失败: "
+                                                                << encoder.lastError());
+                } else {
+                    LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                                << " 已请求 MPP 下一帧 IDR");
+                }
+            }
             if (!encoder.sendFrame(packet.frame)) {
                 const std::string error = encoder.lastError();
                 {

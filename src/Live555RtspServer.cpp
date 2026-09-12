@@ -323,6 +323,7 @@ void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& str
 {
     bool activeChanged = false;
     bool active = false;
+    bool additionalClientStarted = false;
     unsigned activeClientCount = 0;
     {
         std::lock_guard<std::mutex> lock(stream->clientStateMutex);
@@ -330,6 +331,9 @@ void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& str
             ++stream->activeClientCount;
             activeChanged = stream->activeClientCount == 1;
             active = true;
+            // 首个客户端会启动新的编码器，首帧天然从 IDR 开始；只有后来加入的
+            // 客户端才需要额外请求下一帧 IDR。
+            additionalClientStarted = !activeChanged;
         } else {
             if (stream->activeClientCount == 0)
                 return;
@@ -350,6 +354,11 @@ void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& str
     // 不能持有 clientStateMutex 调用外部代码；IpcApp 会在该回调中投递相机/编码器启停命令。
     if (activeChanged && stream->config.onClientActiveChanged)
         stream->config.onClientActiveChanged(active);
+
+    // 不能在 live555 线程直接调用 MPP。IpcApp 的回调只会向 PublishSink 投递一个
+    // “下一帧 IDR”标志，真正的 MPP_ENC_SET_IDR_FRAME 由编码 worker 串行执行。
+    if (additionalClientStarted && stream->config.onAdditionalClientStarted)
+        stream->config.onAdditionalClientStarted();
 }
 
 Live555RtspServer::PublishStreamPtr Live555RtspServer::findStream(const std::string& streamName) const

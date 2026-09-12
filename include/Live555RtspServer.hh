@@ -29,6 +29,10 @@ public:
         // 仅在已 PLAY 客户端数发生 0->1 或 1->0 变化时调用。
         // 回调运行在 live555 事件线程；应只投递轻量控制命令，不能阻塞。
         std::function<void(bool active)> onClientActiveChanged;
+        // 仅在已有客户端播放时，又有一个新客户端完成 PLAY 时调用。
+        // 典型用途是请求编码器下一帧 IDR，让新客户端立即获得可解码边界。
+        // 回调运行在 live555 事件线程；不得直接操作 MPP。
+        std::function<void()> onAdditionalClientStarted;
     };
 
     Live555RtspServer();
