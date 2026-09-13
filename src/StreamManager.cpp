@@ -461,7 +461,9 @@ void StreamManager::applyPendingStreamRuntimeStates()
             }
             break;
         case Stream::RuntimeState::Streaming:
-            if (slot.state == StreamState::Starting) {
+            // live555 PLAY 后也可能因解码恢复超时暂时进入 Error；当后续重新收到
+            // 完整参数集 + IDR 时，DecodeWorker 会重新上报 Streaming，不需要重建 RTSP 会话。
+            if (slot.state != StreamState::Stopping && slot.state != StreamState::Stopped) {
                 slot.state = StreamState::Streaming;
                 slot.lastError.clear();
                 clearError();

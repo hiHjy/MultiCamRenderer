@@ -272,6 +272,20 @@ if(MCR_BUILD_DEMOS)
     mcr_link_media(stream_manager_demo)
     mcr_link_live555(stream_manager_demo)
 
+    # 不依赖网络或摄像头，直接验证 Stream 的恢复门控、超时上报、合并 Annex-B 恢复边界
+    # 与 StreamManager Error -> Streaming 状态回转。
+    mcr_add_executable(stream_recovery_demo
+        demo/StreamRecoveryDemo.cpp
+        src/StreamManager.cpp
+        src/Stream.cpp
+        src/FrameHub.cpp
+        src/DmaAllocator.cpp
+        src/DmaBufferPool.cpp
+        src/RgaEngine.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    mcr_link_media(stream_recovery_demo)
+
     mcr_add_executable(drm_test
         drm/main.c
         drm/drm_display.c

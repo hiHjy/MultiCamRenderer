@@ -6,7 +6,9 @@
 #include "RgaEngine.hpp"
 
 #include <condition_variable>
+#include <chrono>
 #include <deque>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -19,6 +21,9 @@ namespace {
 
 constexpr int kOutputPoolBufferCount = 4;
 constexpr size_t kMaxCompressedPackets = 512;
+// 常规 IPC GOP 为约一秒。等待五秒仍没有“参数集 + 随机访问帧”说明恢复没有真正完成；
+// 此处上报解码健康错误，但不直接从 DecodeWorker 线程操作 live555。
+constexpr auto kRecoveryWaitTimeout = std::chrono::seconds(5);
 
 enum class EncodedNaluKind {
     Other,
@@ -33,7 +38,9 @@ struct EncodedNaluInfo {
     bool hasPps = false;
 };
 
-EncodedNaluInfo inspectAnnexBNalu(VideoCodec codec, const std::vector<uint8_t>& annexB)
+// 此函数只分析一个 NALU。DecodeWorker 在恢复等待期会先将 access unit 拆成单 NALU，
+// 因而也兼容上游偶尔将 [SPS][PPS][IDR] 合在同一个 Annex-B 包中的情况。
+EncodedNaluInfo inspectSingleAnnexBNalu(VideoCodec codec, const std::vector<uint8_t>& annexB)
 {
     size_t offset = 0;
     if (annexB.size() >= 4 && annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 0 && annexB[3] == 1) {
@@ -155,6 +162,7 @@ public:
         packet.annexB.assign(data, data + size);
 
         bool shouldNotifyWorker = false;
+        bool recoveredAfterTimeout = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_acceptingPackets) {
@@ -175,11 +183,18 @@ public:
             // 代表 m_packetQueue 已放入可用于重新开始解码的“参数集 + IDR”；
             // 后续新 NALU 恢复走正常入队路径。
             if (m_waitingForRecovery) {
-                shouldNotifyWorker = enqueueRecoveryPacketLocked(std::move(packet));
+                shouldNotifyWorker = enqueueRecoveryPacketLocked(std::move(packet), recoveredAfterTimeout);
             } else {
                 m_packetQueue.push_back(std::move(packet));
                 shouldNotifyWorker = true;
             }
+        }
+        if (recoveredAfterTimeout) {
+            // live555 的 PLAY 状态没有变化，但解码恢复边界已经到达；重新上报健康状态，
+            // 让 StreamManager 从 Error 回到 Streaming。不得持有 DecodeWorker 的 m_mutex
+            // 调用外部回调，以免未来回调路径反向操作 Stream 时形成锁顺序问题。
+            m_owner.clearError();
+            m_owner.reportRuntimeState(Stream::RuntimeState::Streaming);
         }
         // 等待恢复期间的普通 NALU 不会入队；只有普通路径入队，或参数集 + IDR
         // 恢复边界完整入队时才需要唤醒 DecodeWorker。
@@ -198,10 +213,10 @@ private:
     bool hasCompleteRecoveryParametersLocked() const
     {
         if (m_recoveryCodec == VideoCodec::H264) {
-            return m_recoveryHasSps && m_recoveryHasPps;
+            return m_recoverySps.has_value() && m_recoveryPps.has_value();
         }
         if (m_recoveryCodec == VideoCodec::H265) {
-            return m_recoveryHasVps && m_recoveryHasSps && m_recoveryHasPps;
+            return m_recoveryVps.has_value() && m_recoverySps.has_value() && m_recoveryPps.has_value();
         }
         return false;
     }
@@ -209,18 +224,18 @@ private:
     void resetRecoveryLocked()
     {
         m_waitingForRecovery = false;
+        m_recoveryWaitingSince = {};
+        m_recoveryTimeoutReported = false;
         clearRecoveryParametersLocked();
     }
 
     // 仅清掉当前等待中的参数集，不改变“是否仍在等待 IDR”的状态。
     void clearRecoveryParametersLocked()
     {
-        m_recoveryPackets.clear();
         m_recoveryCodec = VideoCodec::H264;
-        m_recoveryParameterSetTimestampUs = 0;
-        m_recoveryHasVps = false;
-        m_recoveryHasSps = false;
-        m_recoveryHasPps = false;
+        m_recoveryVps.reset();
+        m_recoverySps.reset();
+        m_recoveryPps.reset();
     }
 
     // 必须在 m_mutex 已加锁时调用。清掉旧码流后，只能由完整恢复边界重新开始：
@@ -230,31 +245,77 @@ private:
         m_packetQueue.clear();
         resetRecoveryLocked();
         m_waitingForRecovery = true;
+        m_recoveryWaitingSince = std::chrono::steady_clock::now();
         m_resetDecoderBeforeNextPacket = false;
     }
 
-	//返回false，不唤醒解码线程
-	//返回true， 唤醒解码线程
-    bool enqueueRecoveryPacketLocked(Packet packet)
+    static size_t findStartCode(const std::vector<uint8_t>& data, size_t from, size_t& startCodeSize)
     {
-        const EncodedNaluInfo info = inspectAnnexBNalu(packet.codec, packet.annexB);
+        for (size_t index = from; index + 3 <= data.size(); ++index) {
+            if (data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1) {
+                startCodeSize = 3;
+                return index;
+            }
+            if (index + 4 <= data.size() && data[index] == 0 && data[index + 1] == 0 &&
+                data[index + 2] == 0 && data[index + 3] == 1) {
+                startCodeSize = 4;
+                return index;
+            }
+        }
+        startCodeSize = 0;
+        return std::numeric_limits<size_t>::max();
+    }
+
+    // 正常 RTSP 路径每次只交付一个 NALU。仅在恢复等待期做完整扫描，既兼容其他上游
+    // 交付整个 access unit，又不把 NALU 扫描放进正常逐帧热路径。
+    static std::vector<Packet> splitRecoveryPacket(Packet packet)
+    {
+        constexpr size_t kNoPosition = std::numeric_limits<size_t>::max();
+        std::vector<Packet> nalus;
+        size_t startCodeSize = 0;
+        size_t start = findStartCode(packet.annexB, 0, startCodeSize);
+        if (start == kNoPosition) {
+            nalus.push_back(std::move(packet));
+            return nalus;
+        }
+
+        while (start != kNoPosition) {
+            size_t nextStartCodeSize = 0;
+            const size_t nextStart = findStartCode(packet.annexB, start + startCodeSize, nextStartCodeSize);
+            const size_t end = nextStart == kNoPosition ? packet.annexB.size() : nextStart;
+            if (end > start + startCodeSize) {
+                Packet nalu;
+                nalu.codec = packet.codec;
+                nalu.timestampUs = packet.timestampUs;
+                nalu.annexB.assign(packet.annexB.begin() + static_cast<std::ptrdiff_t>(start),
+                                   packet.annexB.begin() + static_cast<std::ptrdiff_t>(end));
+                nalus.push_back(std::move(nalu));
+            }
+            start = nextStart;
+            startCodeSize = nextStartCodeSize;
+        }
+        return nalus;
+    }
+
+    // 返回 false：尚未形成恢复边界，不唤醒解码线程。
+    // 返回 true：已经将完整“参数集 + 随机访问帧”放入 m_packetQueue。
+    bool enqueueRecoveryNaluLocked(Packet packet, bool& recoveredAfterTimeout)
+    {
+        const EncodedNaluInfo info = inspectSingleAnnexBNalu(packet.codec, packet.annexB);
         if (info.kind == EncodedNaluKind::ParameterSet) {
-            // 只保存当前一组参数集。同一个 access unit 的 VPS/SPS/PPS 使用相同
-            // timestampUs；时间戳切换意味着上一组没有等到 IDR，旧参数不能再混入
-            // 新恢复边界。这样等待期内最多缓存 H264 的 SPS/PPS 或 H265 的 VPS/SPS/PPS。
-            if (!m_recoveryPackets.empty()
-                && (m_recoveryCodec != packet.codec
-                    || m_recoveryParameterSetTimestampUs != packet.timestampUs)) {
+            // 参数集按类型覆盖而不是持续 append：恢复等待期最多只保留 H264 的 SPS/PPS，
+            // 或 H265 的 VPS/SPS/PPS。它不依赖发送端怎样填写 header 的时间戳。
+            if ((m_recoveryVps || m_recoverySps || m_recoveryPps) && m_recoveryCodec != packet.codec) {
                 clearRecoveryParametersLocked();
             }
-            if (m_recoveryPackets.empty()) {
-                m_recoveryCodec = packet.codec;
-                m_recoveryParameterSetTimestampUs = packet.timestampUs;
+            m_recoveryCodec = packet.codec;
+            if (info.hasVps) {
+                m_recoveryVps = std::move(packet);
+            } else if (info.hasSps) {
+                m_recoverySps = std::move(packet);
+            } else if (info.hasPps) {
+                m_recoveryPps = std::move(packet);
             }
-            m_recoveryHasVps = m_recoveryHasVps || info.hasVps;
-            m_recoveryHasSps = m_recoveryHasSps || info.hasSps;
-            m_recoveryHasPps = m_recoveryHasPps || info.hasPps;
-            m_recoveryPackets.push_back(std::move(packet));
             return false;
         }
 
@@ -266,13 +327,30 @@ private:
 
         // deinit/init 会在 DecodeWorker 取到这批数据前执行，清掉旧参考帧和 MPP 内部积压。
         m_resetDecoderBeforeNextPacket = true;
-        while (!m_recoveryPackets.empty()) {
-            m_packetQueue.push_back(std::move(m_recoveryPackets.front()));
-            m_recoveryPackets.pop_front();
+        recoveredAfterTimeout = m_recoveryTimeoutReported;
+        if (m_recoveryCodec == VideoCodec::H265) {
+            m_packetQueue.push_back(std::move(*m_recoveryVps));
         }
+        m_packetQueue.push_back(std::move(*m_recoverySps));
+        m_packetQueue.push_back(std::move(*m_recoveryPps));
         m_packetQueue.push_back(std::move(packet));
         resetRecoveryLocked();
         return true;
+    }
+
+    bool enqueueRecoveryPacketLocked(Packet packet, bool& recoveredAfterTimeout)
+    {
+        bool shouldNotifyWorker = false;
+        for (Packet nalu : splitRecoveryPacket(std::move(packet))) {
+            if (!m_waitingForRecovery) {
+                m_packetQueue.push_back(std::move(nalu));
+                shouldNotifyWorker = true;
+                continue;
+            }
+            shouldNotifyWorker = enqueueRecoveryNaluLocked(std::move(nalu), recoveredAfterTimeout)
+                || shouldNotifyWorker;
+        }
+        return shouldNotifyWorker;
     }
 
     void workLoop()
@@ -294,35 +372,66 @@ private:
 
         while (true) {
             Packet packet;
+            bool recoveryTimedOut = false;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this] {
-                    return m_stopRequested || !m_packetQueue.empty();
-                });
+                while (!m_stopRequested && m_packetQueue.empty()) {
+                    if (m_waitingForRecovery && !m_recoveryTimeoutReported) {
+                        const auto deadline = m_recoveryWaitingSince + kRecoveryWaitTimeout;
+                        if (m_cv.wait_until(lock, deadline) == std::cv_status::timeout &&
+                            m_waitingForRecovery && m_packetQueue.empty()) {
+                            m_recoveryTimeoutReported = true;
+                            recoveryTimedOut = true;
+                            break;
+                        }
+                    } else {
+                        m_cv.wait(lock);
+                    }
+                }
 
                 if (m_stopRequested) {
                     break;
                 }
 
-                packet = std::move(m_packetQueue.front());
-                m_packetQueue.pop_front();
+                if (recoveryTimedOut) {
+                    // 锁外上报，避免 RuntimeStateCallback 反向进入 StreamManager 时持有 worker 锁。
+                } else {
+                    packet = std::move(m_packetQueue.front());
+                    m_packetQueue.pop_front();
 
-                // 压缩 NALU 队列溢出后，旧参考链已不再可信。
-                // 恢复逻辑收齐“参数集 + 随机访问帧”并将它们放入 m_packetQueue 后，
-                // 会置 m_resetDecoderBeforeNextPacket = true。DecodeWorker 取到这批恢复
-                // 数据前先重置 MPP，随后重新 init 并送入参数集和随机访问帧。
-                if (m_resetDecoderBeforeNextPacket) {
-                    m_resetDecoderBeforeNextPacket = false;
-                    decoder.deinit();
-                    decoderInitialized = false;
+                    // 压缩 NALU 队列溢出后，旧参考链已不再可信。
+                    // 恢复逻辑收齐“参数集 + 随机访问帧”并将它们放入 m_packetQueue 后，
+                    // 会置 m_resetDecoderBeforeNextPacket = true。DecodeWorker 取到这批恢复
+                    // 数据前先重置 MPP，随后重新 init 并送入参数集和随机访问帧。
+                    if (m_resetDecoderBeforeNextPacket) {
+                        m_resetDecoderBeforeNextPacket = false;
+                        decoder.deinit();
+                        decoderInitialized = false;
+                    }
                 }
+            }
+
+            if (recoveryTimedOut) {
+                const std::string message = "RTSP 解码恢复等待超过 "
+                    + std::to_string(kRecoveryWaitTimeout.count())
+                    + " 秒，未收到完整参数集 + IDR";
+                m_owner.setError(message);
+                m_owner.reportRuntimeState(Stream::RuntimeState::Error, message);
+                continue;
             }
 
             const MppCodec packetMppCodec = toMppCodec(packet.codec);
             if (!decoderInitialized || activeCodec != packetMppCodec) {
                 decoder.deinit();
                 if (!decoder.init(packetMppCodec)) {
-                    m_owner.setError("MPP 解码器初始化失败: " + decoder.lastError());
+                    const std::string message = "MPP 解码器初始化失败: " + decoder.lastError();
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        // 已消费的恢复边界不能再用于下一次 init；清掉余包，等待下一组完整边界。
+                        enterRecoveryWaitingLocked();
+                    }
+                    m_owner.setError(message);
+                    m_owner.reportRuntimeState(Stream::RuntimeState::Error, message);
                     continue;
                 }
                 activeCodec = packetMppCodec;
@@ -355,11 +464,11 @@ private:
     bool m_waitingForRecovery = false;
     bool m_resetDecoderBeforeNextPacket = false;
     VideoCodec m_recoveryCodec = VideoCodec::H264;
-    bool m_recoveryHasVps = false;
-    bool m_recoveryHasSps = false;
-    bool m_recoveryHasPps = false;
-    uint64_t m_recoveryParameterSetTimestampUs = 0;
-    std::deque<Packet> m_recoveryPackets;
+    std::optional<Packet> m_recoveryVps;
+    std::optional<Packet> m_recoverySps;
+    std::optional<Packet> m_recoveryPps;
+    std::chrono::steady_clock::time_point m_recoveryWaitingSince {};
+    bool m_recoveryTimeoutReported = false;
 };
 
 Stream::Stream(size_t readyQueueCapacity)
