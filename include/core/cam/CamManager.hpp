@@ -117,17 +117,25 @@ public:
     // 只由 CamManager 的 poll 线程在 m_camChangeMutex 保护下读写。
     // FrameLease 回调不直接访问它，而是把归还事件投递回 poll 线程处理。
     struct CameraRuntimeStatus {
-        short lastRevents = 0;
-        uint64_t errorGeneration = 0;
+        // 第几轮故障恢复。旧的 ProcessError/RestartCamera 命令代号不匹配时会被忽略。
+        uint64_t recoveryGeneration = 0;
+        // 第几轮 V4L2 buffer 生命周期。旧 FrameLease 归还时不能 QBUF 到新一轮驱动队列。
         uint64_t leaseGeneration = 1;
+        // 连续恢复失败次数；用于选择 0/1/2/5/10 秒的退避等待时间。
         uint32_t restartAttempts = 0;
+        // 已经 DQBUF 并交给下游、但 FrameLease 尚未归还的帧数。
         uint32_t inFlightFrames = 0;
+        // 正常 start 因旧帧未归还而暂缓时的等待/已投递标志。
         bool startPending = false;
         bool startQueued = false;
+        // 故障恢复等待/已投递 RestartCamera 命令的标志。
         bool restartPending = false;
         bool restartQueued = false;
-        bool requiresFullRecovery = false;
-        std::chrono::steady_clock::time_point restartNotBefore {};
+        // true 表示不能只 STREAMOFF/STREAMON，必须 close → open → configure 完整重建设备。
+        bool requiresDeviceReopen = false;
+        // 本轮恢复最早允许尝试的时间。
+        std::chrono::steady_clock::time_point nextRestartTime {};
+        // 仅用于“旧 FrameLease 长时间不归还”的限频告警，不参与恢复正确性判断。
         std::chrono::steady_clock::time_point leaseWaitStarted {};
         std::chrono::steady_clock::time_point nextLeaseWaitWarning {};
     };
@@ -188,7 +196,7 @@ private:
     struct Command {
         CommandType type;
         int cameraId = -1;
-        uint64_t errorGeneration = 0;
+        uint64_t recoveryGeneration = 0;
     };
 
     struct ReturnedFrame {
@@ -209,11 +217,12 @@ private:
                            const std::shared_ptr<V4L2CameraSource>& expectedSource,
                            short revents,
                            const std::string& message);
-    void enqueueDueRestartCommands();
+    void checkAndPostCameraRestartCommands();
     int recoveryAwarePollTimeoutMs(int timeoutMs);
     void postReturnedFrame(int cameraId, int bufferIndex, uint64_t leaseGeneration);
-    void notifyReturnEvent();
-    bool drainReturnEvent();
+    // 唤醒正阻塞在 poll() 的 poll 线程；命令和 FrameLease 归还共用它。
+    void wakePollThread();
+    bool drainPollWakeEvent();
     bool drainReturnedFrames();
 
 private:
@@ -232,7 +241,8 @@ private:
     std::queue<ReturnedFrame> m_returnQueue;
     std::mutex m_commandMutex;
     std::queue<Command> m_commandQueue;
-    int m_returnEventFd = -1;
+    // 有相机 fd 时 poll() 不能被 condition_variable 唤醒，因此使用 eventfd 唤醒。
+    int m_pollWakeEventFd = -1;
     std::mutex m_threadMutex;
 	std::thread m_pollThread {};
 };

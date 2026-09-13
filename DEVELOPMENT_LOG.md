@@ -2948,3 +2948,101 @@ git diff --check
 
 RK3568 非 Qt aarch64 demo 全量交叉构建通过；`cam_recovery_stress_demo` 已部署到 RK3568 并完成
 模拟恢复与真实 USB 拔插恢复验证。
+
+## 2026-09-14
+
+### CamManager 恢复逻辑可读性收口
+
+上一版自动恢复已经具备正确的线程边界和压力测试，但恢复状态字段、eventfd 命名与无效唤醒混在一起，
+阅读时容易把“正确性保护”与“历史遗留/日志辅助”混为一谈。本次不扩展媒体能力，只收口可读性并删除
+确认无效的状态。
+
+`CameraRuntimeStatus` 现在按职责补齐中文注释，阅读时只需按四组理解：
+
+```text
+控制命令：m_commandQueue
+FrameLease 归还：m_returnQueue + inFlightFrames
+故障恢复：restartAttempts + nextRestartTime + requiresDeviceReopen
+拒绝旧事件：recoveryGeneration + leaseGeneration
+```
+
+本次命名调整：
+
+```text
+errorGeneration       → recoveryGeneration
+  表示第几轮故障恢复，用于拒绝旧的 ProcessError/RestartCamera 命令。
+
+requiresFullRecovery  → requiresDeviceReopen
+  true 时执行 close → open → configure → DMA buffer setup，而非仅 STREAMON。
+
+restartNotBefore      → nextRestartTime
+  表示本轮最早允许下一次恢复尝试的时间。
+
+m_returnEventFd       → m_pollWakeEventFd
+notifyReturnEvent()   → wakePollThread()
+drainReturnEvent()    → drainPollWakeEvent()
+```
+
+最后一组改名尤其重要：该 eventfd 不只在 FrameLease 归还时使用，外部 `postCommand()`、停机请求也会
+使用它把阻塞在 Linux `poll()` 中的 poll 线程唤醒。旧名字会误导阅读者以为它只与 return queue 有关。
+
+删除 `lastRevents`：审查确认该字段只被写入和清零，从未参与恢复判断、日志或对外状态，因此属于死状态。
+
+同时删除 `executeCommand()` 内部多处 poll 线程唤醒自身的 `m_camCv.notify_one()` 与 eventfd 写入。
+真正需要保留唤醒的地方只有外部线程投递命令、归还 FrameLease、请求停止时：
+
+```text
+无 camera fd：poll 线程在 condition_variable 上等待，m_camCv 唤醒它
+有 camera fd：poll 线程阻塞在 Linux poll()，m_pollWakeEventFd 唤醒它
+```
+
+两种唤醒机制并非重复：condition_variable 不能中断 Linux `poll()`，eventfd 也不能替代“没有任何 fd 时”的
+condition_variable 等待。
+
+### pollOnce 控制顺序
+
+恢复检查调整为易读的三步：
+
+```text
+1. drainCommands()
+   执行上一轮或外部线程已经投递的 Start/Stop/Delete/ProcessError/Restart 命令。
+
+2. drainReturnedFrames()
+   处理下游归还的 FrameLease，QBUF 并减少 inFlightFrames。
+
+3. checkAndPostCameraRestartCommands()
+   检查旧 FrameLease 是否已全部归还、退避时间是否到期；满足时只投递恢复命令。
+```
+
+第 3 步投递的新命令不在当前位置立即执行，而是经 eventfd 唤醒后进入下一次命令处理阶段执行。这样避免在
+每一轮 `pollOnce()` 重复扫描所有相机两次；V4L2 的 DQBUF/QBUF/STREAMON/STREAMOFF 仍只在 poll 线程串行执行。
+
+首次恢复退避调整为 `0 / 1 / 2 / 5 / 10` 秒：首轮允许立即尝试恢复；连续失败后再逐步退避，避免设备确实
+离线时反复 open/configure/STREAMON 刷 CPU 和日志。
+
+### 后续防止“状态债”演变为屎山的约束
+
+后续不允许遇到边缘问题就直接新增 bool、generation 或 notify。每次修改 CamManager/Stream 状态机时必须先回答：
+
+```text
+1. 这个字段保护什么具体错误？谁写、谁读？
+2. 现有字段是否已能表达该状态？能否用明确状态枚举替代 bool 组合？
+3. 这个通知实际唤醒哪一个等待点？没有等待者时是否只是无效通知？
+4. 新状态是否有压力 demo 或最小复现验证？
+5. 命名是否让不熟悉实现的人能直接读出业务语义？
+```
+
+计划按“小步、可验证”推进：先维持现有摄像头恢复压力 demo；后续若继续扩展恢复逻辑，优先将恢复字段
+收进独立 `RecoveryState`，再考虑新增状态，而非继续把字段平铺在 `CameraRuntimeStatus`。全局 `m_lastError`
+可能被其他 camera 的成功操作清空、`delCamera()` 与 `shutdownPolling()` 并发边界需要进一步收口，这两项记录为
+后续可靠性任务，本次不借可读性整理扩大修改范围。
+
+### 本次验证
+
+```bash
+./wsl-build.sh
+./wsl-build-ipc.sh
+git diff --check
+```
+
+RK3568 非 Qt aarch64 demos 与 RV1126B `ipc_app` 均交叉构建通过。
