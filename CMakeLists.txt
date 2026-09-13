@@ -209,6 +209,19 @@ if(MCR_BUILD_DEMOS)
     )
     mcr_link_drm(camera_capture_demo)
 
+    # 使用真实 V4L2 设备验证 CamManager 的轻恢复、完整重建、以及 lease 未归还时的
+    # stop/start 与自动恢复行为；physical 参数模式可额外验证 USB 摄像头真实拔插。
+    mcr_add_executable(cam_recovery_stress_demo
+        demo/CamRecoveryStressDemo.cpp
+        src/CamManager.cpp
+        src/DmaAllocator.cpp
+        src/DmaBufferPool.cpp
+        src/FrameHub.cpp
+        src/V4L2CameraSource.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    mcr_link_media(cam_recovery_stress_demo)
+
     mcr_add_executable(frame_lease_demo demo/frame_lease/main.cpp)
 
     mcr_add_executable(rtsp_mpp_decoder_demo

@@ -5,8 +5,10 @@
 #include "MppDecoder.hpp"
 #include "V4L2CameraSource.hpp"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,6 +93,14 @@ public:
         Error
     };
 
+    // 上游已明确知道采集管线被重置时，可主动请求本路恢复。
+    // RestartStream 对应可继续复用 fd/buffer 的轻恢复；ReopenDevice 对应设备/VPSS
+    // 已断开或状态不可确定时的完整重建。两者都由 poll 线程串行执行。
+    enum class RecoveryMode {
+        RestartStream,
+        ReopenDevice,
+    };
+
     struct CameraConfig {
         std::string devicePath;
         int width = 0;
@@ -104,13 +114,31 @@ public:
         size_t bufferCapacity = 0;
     };
 
-	
+    // 只由 CamManager 的 poll 线程在 m_camChangeMutex 保护下读写。
+    // FrameLease 回调不直接访问它，而是把归还事件投递回 poll 线程处理。
+    struct CameraRuntimeStatus {
+        short lastRevents = 0;
+        uint64_t errorGeneration = 0;
+        uint64_t leaseGeneration = 1;
+        uint32_t restartAttempts = 0;
+        uint32_t inFlightFrames = 0;
+        bool startPending = false;
+        bool startQueued = false;
+        bool restartPending = false;
+        bool restartQueued = false;
+        bool requiresFullRecovery = false;
+        std::chrono::steady_clock::time_point restartNotBefore {};
+        std::chrono::steady_clock::time_point leaseWaitStarted {};
+        std::chrono::steady_clock::time_point nextLeaseWaitWarning {};
+    };
+
     struct CameraSlot {
         CameraConfig config;
         std::shared_ptr<V4L2CameraSource> source;
         CameraState state = CameraState::Created;
         std::string lastError;
 		std::unique_ptr<DecodeWorker> decodeWorker = nullptr;
+        CameraRuntimeStatus runtime {};
     };
 
     // 当前内部用 shared_ptr 持有摄像头，pollOnce() 会复制 shared_ptr 快照，
@@ -133,6 +161,7 @@ public:
     // 返回 true 表示控制命令已投递成功，不表示硬件已经完成 STREAMON/STREAMOFF。
     bool startCamera(int cameraId);
     bool stopCamera(int cameraId);
+    bool requestCameraRecovery(int cameraId, RecoveryMode mode, const std::string& reason);
     bool startAllCameras();
     void stopAllCameras();
 
@@ -152,11 +181,20 @@ private:
         StartCamera,
         StopCamera,
         DeleteCamera,
+        ProcessError,
+        RestartCamera,
     };
 
     struct Command {
         CommandType type;
         int cameraId = -1;
+        uint64_t errorGeneration = 0;
+    };
+
+    struct ReturnedFrame {
+        int cameraId = -1;
+        int bufferIndex = -1;
+        uint64_t leaseGeneration = 0;
     };
 
 	bool pollOnce(int timeoutMs = 2000);
@@ -167,7 +205,13 @@ private:
     bool postCommand(Command command);
     bool drainCommands();
     bool executeCommand(const Command& command);
-    void postReturnedFrame(int cameraId, int bufferIndex);
+    void reportCameraFault(int cameraId,
+                           const std::shared_ptr<V4L2CameraSource>& expectedSource,
+                           short revents,
+                           const std::string& message);
+    void enqueueDueRestartCommands();
+    int recoveryAwarePollTimeoutMs(int timeoutMs);
+    void postReturnedFrame(int cameraId, int bufferIndex, uint64_t leaseGeneration);
     void notifyReturnEvent();
     bool drainReturnEvent();
     bool drainReturnedFrames();
@@ -182,9 +226,10 @@ private:
     std::unordered_map<int, std::shared_ptr<FrameHub>> m_frameHubMap;
 	std::atomic_bool m_stopRequested {false};
 	std::atomic_bool m_running {false};
-	std::atomic_bool m_hasPendingCommand {false};
+    std::atomic_bool m_hasPendingCommand {false};
+    std::atomic_bool m_hasPendingReturnedFrame {false};
     std::mutex m_returnMutex;
-    std::queue<std::pair<int, int>> m_returnQueue;
+    std::queue<ReturnedFrame> m_returnQueue;
     std::mutex m_commandMutex;
     std::queue<Command> m_commandQueue;
     int m_returnEventFd = -1;

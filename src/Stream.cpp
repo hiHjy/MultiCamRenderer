@@ -209,8 +209,15 @@ private:
     void resetRecoveryLocked()
     {
         m_waitingForRecovery = false;
+        clearRecoveryParametersLocked();
+    }
+
+    // 仅清掉当前等待中的参数集，不改变“是否仍在等待 IDR”的状态。
+    void clearRecoveryParametersLocked()
+    {
         m_recoveryPackets.clear();
         m_recoveryCodec = VideoCodec::H264;
+        m_recoveryParameterSetTimestampUs = 0;
         m_recoveryHasVps = false;
         m_recoveryHasSps = false;
         m_recoveryHasPps = false;
@@ -232,13 +239,18 @@ private:
     {
         const EncodedNaluInfo info = inspectAnnexBNalu(packet.codec, packet.annexB);
         if (info.kind == EncodedNaluKind::ParameterSet) {
-            // 只保存当前一组参数集。再次看到参数集意味着编码器开始发送下一组恢复边界，
-            // 之前未等到 IDR 的残留参数不能再使用。
-            if (!m_recoveryPackets.empty() && m_recoveryCodec != packet.codec) {
-                resetRecoveryLocked();
-                m_waitingForRecovery = true;
+            // 只保存当前一组参数集。同一个 access unit 的 VPS/SPS/PPS 使用相同
+            // timestampUs；时间戳切换意味着上一组没有等到 IDR，旧参数不能再混入
+            // 新恢复边界。这样等待期内最多缓存 H264 的 SPS/PPS 或 H265 的 VPS/SPS/PPS。
+            if (!m_recoveryPackets.empty()
+                && (m_recoveryCodec != packet.codec
+                    || m_recoveryParameterSetTimestampUs != packet.timestampUs)) {
+                clearRecoveryParametersLocked();
             }
-            m_recoveryCodec = packet.codec;
+            if (m_recoveryPackets.empty()) {
+                m_recoveryCodec = packet.codec;
+                m_recoveryParameterSetTimestampUs = packet.timestampUs;
+            }
             m_recoveryHasVps = m_recoveryHasVps || info.hasVps;
             m_recoveryHasSps = m_recoveryHasSps || info.hasSps;
             m_recoveryHasPps = m_recoveryHasPps || info.hasPps;
@@ -346,6 +358,7 @@ private:
     bool m_recoveryHasVps = false;
     bool m_recoveryHasSps = false;
     bool m_recoveryHasPps = false;
+    uint64_t m_recoveryParameterSetTimestampUs = 0;
     std::deque<Packet> m_recoveryPackets;
 };
 

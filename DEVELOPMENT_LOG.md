@@ -2871,3 +2871,80 @@ live555 回调运行在事件线程，不能直接调用 MPP。`RtspPublishSink`
 ```text
 /oem/usr/bin/multicam_ipc_app.20260913-idr-request.bak
 ```
+
+### CamManager 单路故障隔离与 V4L2 自动恢复
+
+此前 `CamManager::pollOnce()` 遇到任一路 camera 的 `POLLERR/POLLHUP/POLLNVAL`、`DQBUF`
+或回收 `QBUF` 失败时会返回失败；`run()` 因而可能退出整个 poll 线程。现在将故障收敛为
+**单路状态机**，其他 camera 的采集不受影响。
+
+```text
+单路 V4L2 异常
+  → CameraSlot.state = Error，记录错误与 errorGeneration
+  → 从下一轮 poll fd 快照中排除该路
+  → 投递 ProcessError 到 CamManager poll 线程
+  → STREAMOFF，等待全部旧 FrameLease 归还
+  → 按 1 / 2 / 5 / 10 秒退避投递 RestartCamera
+  → 轻恢复：复用 fd/buffer，重新 QBUF + STREAMON
+  → 完整恢复：close → open → configure → DMA buffer setup → STREAMON
+  → 成功回到 Streaming；失败继续退避，不退出 poll 线程
+```
+
+恢复中的所有 `DQBUF/QBUF/STREAMOFF/STREAMON/open/close` 仍只由 poll 线程执行。外部线程、
+FrameLease 析构回调和故障检测都只投递命令或归还事件，避免跨线程操作同一个 V4L2 fd。
+
+每个输出的原始 camera buffer 都有 `leaseGeneration` 与 `inFlightFrames`：重启前必须等旧 lease
+全部归还，绝不为了恢复而强制释放下游仍在读取的 DMA buffer。等待超过两秒只记录 warning；恢复
+成功后 generation 自增，旧的 buffer index 不会被错误 QBUF 到新一代驱动队列。
+
+`POLLHUP/POLLNVAL` 直接请求完整重建；纯 `POLLERR` 或 DQBUF 错误先尝试轻恢复，连续失败后升级
+完整重建。设备尚未重新枚举时，`openDevice()` 失败会继续按最大 10 秒间隔重试。
+
+新增公开接口：
+
+```cpp
+CamManager::requestCameraRecovery(cameraId,
+                                  CamManager::RecoveryMode::RestartStream,
+                                  reason);
+```
+
+供已经明确知道上游 VPSS/V4L2 管线需要重置的调用方使用；接口只标记状态并投递命令，不在调用线程
+直接操作硬件。
+
+### 恢复验证 demo
+
+新增 `cam_recovery_stress_demo`。默认模式在真实 V4L2 设备上依次验证：轻恢复、完整重建、持有
+FrameLease 时不安全重启的阻止，以及 stop/start 跨代 lease 防护。
+
+```bash
+/tmp/cam_recovery_stress_demo /dev/video10 yuyv 640 480 30 1
+```
+
+RK3568 `/dev/video10` UVC 摄像头实测一轮通过，四项测试全部恢复出帧；持有旧 lease 超过两秒时
+如预期只告警，归还后才恢复。此前连续五轮模拟压力测试也全部通过。
+
+新增 `physical` 模式用于真实 USB 拔插，不注入软件故障、不设置恢复超时：
+
+```bash
+/tmp/cam_recovery_stress_demo physical /dev/video10 yuyv 640 480 30
+```
+
+该模式每两秒打印一次采集 fps。拔出后等待 CamManager 自动恢复，插回后重新出现帧率即表示恢复
+完成，`Ctrl+C` 正常退出。当前测试使用固定设备路径；若 USB 重插后内核改分配为其他 `/dev/videoX`，
+需要使用稳定的 udev symlink 或另行实现按 USB 身份重新发现，不能盲目自动选择任意 video 节点。
+
+### RTSP 压缩包恢复缓存收敛
+
+`Stream` 在压缩 NALU 队列溢出后等待“参数集 + IDR”恢复。此前等待期间参数集可能持续累计；现在
+仅保留当前 access unit 的参数集：H264 为 SPS/PPS，H265 为 VPS/SPS/PPS。参数集 timestamp 切换时
+丢弃上一组尚未等到 IDR 的残留数据，避免无界增长或混用两组编码参数。
+
+### 本次验证
+
+```bash
+./wsl-build.sh
+git diff --check
+```
+
+RK3568 非 Qt aarch64 demo 全量交叉构建通过；`cam_recovery_stress_demo` 已部署到 RK3568 并完成
+模拟恢复与真实 USB 拔插恢复验证。

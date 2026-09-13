@@ -4,7 +4,10 @@
 #include "VideoFrame.hpp"
 #include "VideoTypes.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -66,6 +69,26 @@ V4L2CameraSource::CamConfig toV4L2CameraConfig(const CamManager::CameraConfig &c
 	v4l2Config.fps = config.fps;
 	v4l2Config.format = toV4L2PixelFormat(config.format);
 	return v4l2Config;
+}
+
+std::chrono::seconds restartBackoff(uint32_t attempt) {
+	constexpr std::array<int, 4> kBackoffSeconds {1, 2, 5, 10};
+	const size_t index = attempt == 0 ? 0 : std::min<size_t>(attempt - 1, kBackoffSeconds.size() - 1);
+	return std::chrono::seconds(kBackoffSeconds[index]);
+}
+
+std::string pollEventsText(short revents) {
+	std::string result;
+	auto append = [&result](const char* name) {
+		if (!result.empty()) {
+			result += '|';
+		}
+		result += name;
+	};
+	if ((revents & POLLERR) != 0) append("POLLERR");
+	if ((revents & POLLHUP) != 0) append("POLLHUP");
+	if ((revents & POLLNVAL) != 0) append("POLLNVAL");
+	return result.empty() ? "unknown" : result;
 }
 
 } // namespace
@@ -485,6 +508,37 @@ bool CamManager::stopCamera(int cameraId) {
 	return postCommand(Command{CommandType::StopCamera, cameraId});
 }
 
+bool CamManager::requestCameraRecovery(int cameraId, RecoveryMode mode, const std::string& reason) {
+	Command command {CommandType::ProcessError, cameraId};
+	std::string message = reason.empty() ? "外部请求摄像头恢复" : reason;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		auto it = m_cameraMap.find(cameraId);
+		if (it == m_cameraMap.end() || it->second.state == CameraState::Deleting || !it->second.source) {
+			setError("cameraId 不存在、正在删除或摄像头对象为空");
+			return false;
+		}
+		if (it->second.state == CameraState::Error) {
+			setError("cameraId 正在恢复中");
+			return false;
+		}
+
+		CameraSlot& slot = it->second;
+		slot.state = CameraState::Error;
+		slot.lastError = message;
+		slot.runtime.lastRevents = 0;
+		slot.runtime.requiresFullRecovery = mode == RecoveryMode::ReopenDevice;
+		++slot.runtime.errorGeneration;
+		command.errorGeneration = slot.runtime.errorGeneration;
+	}
+
+	setError(message);
+	LOG_WARN("CamManager", "cameraId=" << cameraId << " 收到外部恢复请求 mode="
+								 << (mode == RecoveryMode::ReopenDevice ? "ReopenDevice" : "RestartStream")
+								 << " reason=" << message);
+	return postCommand(command);
+}
+
 bool CamManager::startAllCameras() {
 	std::vector<int> cameraIds;
 	{
@@ -524,11 +578,17 @@ void CamManager::stopAllCameras() {
 }
 
 bool CamManager::pollOnce(int timeoutMs) {
+	// 恢复到期后仍通过命令队列执行，确保 V4L2 状态机只有 poll 线程碰。
+	enqueueDueRestartCommands();
 	if (!drainCommands()) {
 		return false;
 	}
 
 	if (!drainReturnedFrames()) {
+		return false;
+	}
+	enqueueDueRestartCommands();
+	if (!drainCommands()) {
 		return false;
 	}
 
@@ -570,8 +630,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 
 	if (!hasCameraFd) {
 		std::unique_lock<std::mutex> lock(m_camChangeMutex);
-
-		m_camCv.wait(lock, [this] {
+		auto shouldWake = [this] {
 			for (const auto &item : m_cameraMap) {
 				const auto &camSlot = item.second;
 				const auto &camera = camSlot.source;
@@ -581,8 +640,28 @@ bool CamManager::pollOnce(int timeoutMs) {
 				}
 			}
 
-			return m_stopRequested.load() || m_hasPendingCommand.load();
-		});
+			return m_stopRequested.load() || m_hasPendingCommand.load() ||
+				m_hasPendingReturnedFrame.load();
+		};
+
+		std::chrono::steady_clock::time_point nextRestart {};
+		for (const auto& item : m_cameraMap) {
+			const CameraRuntimeStatus& runtime = item.second.runtime;
+			if (item.second.state != CameraState::Error || !runtime.restartPending ||
+				runtime.restartQueued || runtime.inFlightFrames != 0) {
+				continue;
+			}
+			if (nextRestart == std::chrono::steady_clock::time_point {} ||
+				runtime.restartNotBefore < nextRestart) {
+				nextRestart = runtime.restartNotBefore;
+			}
+		}
+
+		if (nextRestart == std::chrono::steady_clock::time_point {}) {
+			m_camCv.wait(lock, shouldWake);
+		} else {
+			m_camCv.wait_until(lock, nextRestart, shouldWake);
+		}
 
 		return true;
 	}
@@ -597,7 +676,7 @@ bool CamManager::pollOnce(int timeoutMs) {
 		decodeWorkers.push_back(nullptr);
 	}
 
-	const int ret = ::poll(fds.data(), fds.size(), timeoutMs);
+	const int ret = ::poll(fds.data(), fds.size(), recoveryAwarePollTimeoutMs(timeoutMs));
 	if (ret < 0) {
 		if (errno == EINTR) {
 			return true;
@@ -634,8 +713,11 @@ bool CamManager::pollOnce(int timeoutMs) {
 		}
 
 		if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-			setError("摄像头 fd 异常");
-			return false;
+			reportCameraFault(camera->cameraId(),
+							  camera,
+							  revents,
+							  "摄像头 fd 异常: " + pollEventsText(revents));
+			continue;
 		}
 
 		if ((revents & POLLIN) == 0) {
@@ -645,8 +727,10 @@ bool CamManager::pollOnce(int timeoutMs) {
 		V4L2CameraSource::Frame frame{};
 		if (!camera->dequeueFrame(frame)) {
 			if (!camera->lastError().empty()) {
-				setError("dequeueFrame 失败: " + camera->lastError());
-				return false;
+				reportCameraFault(camera->cameraId(),
+							  camera,
+							  0,
+							  "dequeueFrame 失败: " + camera->lastError());
 			}
 			continue;
 		}
@@ -677,16 +761,8 @@ bool CamManager::pollOnce(int timeoutMs) {
 
 		bool publishOk = true;
 		std::string publishError;
-		FramePacket packet{
-			.frame = videoFrame,
-			.lease = std::make_shared<FrameLease>(
-				[this, sourceLifetime = camera, cameraId = camera->cameraId(), bufferIndex = frame.index]() {
-					(void)sourceLifetime;
-					postReturnedFrame(cameraId, bufferIndex);
-				}),
-		};
-
 		bool stillActive = false;
+		uint64_t leaseGeneration = 0;
 		{
 			std::lock_guard<std::mutex> lock(m_camChangeMutex);
 			auto cameraIt = m_cameraMap.find(camera->cameraId());
@@ -695,7 +771,25 @@ bool CamManager::pollOnce(int timeoutMs) {
 			stillActive = cameraIt != m_cameraMap.end() && hubIt != m_frameHubMap.end() &&
 						  cameraIt->second.source == camera && hubIt->second == hub &&
 						  cameraIt->second.state == CameraState::Streaming;
+			if (stillActive) {
+				CameraRuntimeStatus& runtime = cameraIt->second.runtime;
+				++runtime.inFlightFrames;
+				leaseGeneration = runtime.leaseGeneration;
+			}
 		}
+
+		FramePacket packet{
+			.frame = videoFrame,
+			.lease = std::make_shared<FrameLease>(
+				[this,
+				 sourceLifetime = camera,
+				 cameraId = camera->cameraId(),
+				 bufferIndex = frame.index,
+				 leaseGeneration]() {
+					(void)sourceLifetime;
+					postReturnedFrame(cameraId, bufferIndex, leaseGeneration);
+				}),
+		};
 
 		if (!stillActive) {
 			LOG_INFO("CamManager", "cameraId=" << camera->cameraId() << " 已删除或已停止，跳过本帧发布");
@@ -727,8 +821,15 @@ bool CamManager::pollOnce(int timeoutMs) {
 		}
 
 		if (!publishOk) {
-			setError("publishFrame 失败: " + publishError);
-			return false;
+			reportCameraFault(camera->cameraId(),
+							  camera,
+							  0,
+							  "publishFrame 失败: " + publishError);
+			packet.lease.reset();
+			if (!drainReturnedFrames()) {
+				return false;
+			}
+			continue;
 		}
 
 		packet.lease.reset();
@@ -737,16 +838,26 @@ bool CamManager::pollOnce(int timeoutMs) {
 		}
 	}
 
-	clearError();
 	return true;
 }
 
 void CamManager::run(int timeoutMs) {
+	int consecutiveFailures = 0;
 	while (!m_stopRequested.load()) {
-		if (!pollOnce(timeoutMs)) {
-			LOG_ERROR("CamManager", "pollOnce failed: " << lastError());
+		if (pollOnce(timeoutMs)) {
+			consecutiveFailures = 0;
+			continue;
+		}
+
+		++consecutiveFailures;
+		LOG_ERROR("CamManager", "pollOnce 失败，连续次数=" << consecutiveFailures
+								 << " error=" << lastError());
+		if (consecutiveFailures >= 10) {
+			LOG_ERROR("CamManager", "pollOnce 连续失败达到上限，退出 poll 线程");
 			break;
 		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 	}
 	m_running = false;
 }
@@ -835,6 +946,109 @@ bool CamManager::postCommand(Command command) {
 	return true;
 }
 
+void CamManager::reportCameraFault(int cameraId,
+								 const std::shared_ptr<V4L2CameraSource>& expectedSource,
+								 short revents,
+								 const std::string& message) {
+	Command command {CommandType::ProcessError, cameraId};
+	bool shouldPost = false;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		auto it = m_cameraMap.find(cameraId);
+		if (it == m_cameraMap.end() || it->second.source != expectedSource ||
+			it->second.state == CameraState::Deleting || it->second.state == CameraState::Error) {
+			return;
+		}
+
+		CameraSlot& slot = it->second;
+		slot.state = CameraState::Error;
+		slot.lastError = message;
+		slot.runtime.lastRevents = revents;
+		slot.runtime.requiresFullRecovery =
+			(revents & static_cast<short>(POLLHUP | POLLNVAL)) != 0;
+		++slot.runtime.errorGeneration;
+		command.errorGeneration = slot.runtime.errorGeneration;
+		shouldPost = true;
+	}
+
+	setError(message);
+	LOG_ERROR("CamManager", "cameraId=" << cameraId << ' ' << message
+								 << "，已隔离该路并等待串行恢复");
+	if (shouldPost) {
+		(void)postCommand(command);
+	}
+}
+
+void CamManager::enqueueDueRestartCommands() {
+	std::vector<Command> dueCommands;
+	const auto now = std::chrono::steady_clock::now();
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		for (auto& item : m_cameraMap) {
+			CameraSlot& slot = item.second;
+			CameraRuntimeStatus& runtime = slot.runtime;
+			if (slot.state == CameraState::Stopped && runtime.startPending) {
+				if (runtime.inFlightFrames == 0 && !runtime.startQueued) {
+					runtime.startQueued = true;
+					dueCommands.push_back(Command {CommandType::StartCamera, item.first});
+				}
+				continue;
+			}
+
+			if (slot.state != CameraState::Error || !runtime.restartPending || runtime.restartQueued) {
+				continue;
+			}
+
+			if (runtime.inFlightFrames != 0) {
+				// 不能为恢复强制释放仍被 Sink 持有的 DMA buffer；这里只做可观测告警。
+				constexpr auto kLeaseWaitWarningAfter = std::chrono::seconds(2);
+				constexpr auto kLeaseWaitWarningInterval = std::chrono::seconds(10);
+				if (runtime.leaseWaitStarted != std::chrono::steady_clock::time_point {} &&
+					now - runtime.leaseWaitStarted >= kLeaseWaitWarningAfter &&
+					now >= runtime.nextLeaseWaitWarning) {
+					LOG_WARN("CamManager", "cameraId=" << item.first << " 等待 "
+											   << runtime.inFlightFrames
+											   << " 个 FrameLease 归还已超过 2 秒；为避免复用仍在读取的 DMA buffer，暂不强制恢复");
+					runtime.nextLeaseWaitWarning = now + kLeaseWaitWarningInterval;
+				}
+				continue;
+			}
+
+			if (now < runtime.restartNotBefore) {
+				continue;
+			}
+
+			runtime.restartQueued = true;
+			dueCommands.push_back(Command {CommandType::RestartCamera, item.first, runtime.errorGeneration});
+		}
+	}
+
+	for (const Command& command : dueCommands) {
+		(void)postCommand(command);
+	}
+}
+
+int CamManager::recoveryAwarePollTimeoutMs(int timeoutMs) {
+	int result = timeoutMs;
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> lock(m_camChangeMutex);
+	for (const auto& item : m_cameraMap) {
+		const CameraSlot& slot = item.second;
+		const CameraRuntimeStatus& runtime = slot.runtime;
+		if (slot.state != CameraState::Error || !runtime.restartPending || runtime.restartQueued ||
+			runtime.inFlightFrames != 0) {
+			continue;
+		}
+
+		const auto delay = runtime.restartNotBefore - now;
+		const int delayMs = delay <= std::chrono::steady_clock::duration::zero()
+			? 0
+			: static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(delay).count());
+		result = std::min(result, delayMs);
+	}
+	return std::max(result, 0);
+}
+
 bool CamManager::drainCommands() {
 	std::queue<Command> pending;
 	{
@@ -884,15 +1098,33 @@ bool CamManager::executeCommand(const Command& command) {
 		slot.state = CameraState::Error;
 		slot.lastError = "摄像头对象为空";
 		setError(slot.lastError);
-		return false;
+		return true;
 	}
 
 	V4L2CameraSource& camera = *slot.source;
 	switch (command.type) {
 	case CommandType::StartCamera:
+		if (slot.state == CameraState::Stopped && slot.runtime.inFlightFrames != 0) {
+			slot.runtime.startPending = true;
+			slot.runtime.startQueued = false;
+			LOG_INFO("CamManager", "cameraId=" << command.cameraId << " 等待 "
+									 << slot.runtime.inFlightFrames
+									 << " 个旧 FrameLease 归还后再启动");
+			return true;
+		}
+
 		if (slot.state == CameraState::Streaming || camera.isStreaming()) {
 			slot.state = CameraState::Streaming;
 			slot.lastError.clear();
+			slot.runtime.restartAttempts = 0;
+			slot.runtime.startPending = false;
+			slot.runtime.startQueued = false;
+			slot.runtime.restartPending = false;
+			slot.runtime.restartQueued = false;
+			slot.runtime.requiresFullRecovery = false;
+			slot.runtime.leaseWaitStarted = {};
+			slot.runtime.nextLeaseWaitWarning = {};
+			++slot.runtime.errorGeneration;
 			clearError();
 			m_camCv.notify_one();
 			return true;
@@ -901,12 +1133,36 @@ bool CamManager::executeCommand(const Command& command) {
 		if (!camera.start()) {
 			slot.state = CameraState::Error;
 			slot.lastError = "启动摄像头失败: " + camera.lastError();
+			CameraRuntimeStatus& runtime = slot.runtime;
+			runtime.startPending = false;
+			runtime.startQueued = false;
+			runtime.restartPending = true;
+			runtime.restartQueued = false;
+			runtime.requiresFullRecovery = false;
+			++runtime.errorGeneration;
+			++runtime.restartAttempts;
+			runtime.restartNotBefore = std::chrono::steady_clock::now() + restartBackoff(runtime.restartAttempts);
+			runtime.leaseWaitStarted = std::chrono::steady_clock::now();
+			runtime.nextLeaseWaitWarning = runtime.leaseWaitStarted + std::chrono::seconds(2);
 			setError(slot.lastError);
-			return false;
+			LOG_ERROR("CamManager", "cameraId=" << command.cameraId << ' ' << slot.lastError
+								 << "，将在 " << restartBackoff(runtime.restartAttempts).count()
+								 << " 秒后重试");
+			m_camCv.notify_one();
+			return true;
 		}
 
 		slot.state = CameraState::Streaming;
 		slot.lastError.clear();
+		slot.runtime.restartAttempts = 0;
+		slot.runtime.startPending = false;
+		slot.runtime.startQueued = false;
+		slot.runtime.restartPending = false;
+		slot.runtime.restartQueued = false;
+		slot.runtime.requiresFullRecovery = false;
+		slot.runtime.leaseWaitStarted = {};
+		slot.runtime.nextLeaseWaitWarning = {};
+		++slot.runtime.leaseGeneration;
 		clearError();
 		m_camCv.notify_one();
 		return true;
@@ -917,10 +1173,115 @@ bool CamManager::executeCommand(const Command& command) {
 		}
 		slot.state = CameraState::Stopped;
 		slot.lastError.clear();
+		slot.runtime.startPending = false;
+		slot.runtime.startQueued = false;
+		slot.runtime.restartPending = false;
+		slot.runtime.restartQueued = false;
+		slot.runtime.leaseWaitStarted = {};
+		slot.runtime.nextLeaseWaitWarning = {};
+		++slot.runtime.errorGeneration;
 		clearError();
 		m_camCv.notify_one();
 		notifyReturnEvent();
 		return true;
+
+	case CommandType::ProcessError: {
+		if (slot.state != CameraState::Error ||
+			command.errorGeneration != slot.runtime.errorGeneration) {
+			return true;
+		}
+
+		if (camera.isStreaming()) {
+			camera.stop();
+		}
+
+		CameraRuntimeStatus& runtime = slot.runtime;
+		runtime.restartPending = true;
+		runtime.restartQueued = false;
+		++runtime.restartAttempts;
+		const auto now = std::chrono::steady_clock::now();
+		runtime.restartNotBefore = now + restartBackoff(runtime.restartAttempts);
+		runtime.leaseWaitStarted = now;
+		runtime.nextLeaseWaitWarning = now + std::chrono::seconds(2);
+		LOG_WARN("CamManager", "cameraId=" << command.cameraId
+								 << " 已停止，等待 " << runtime.inFlightFrames
+								 << " 个 FrameLease 归还后恢复"
+								 << "，第 " << runtime.restartAttempts << " 次将在 "
+								 << restartBackoff(runtime.restartAttempts).count() << " 秒后尝试");
+		m_camCv.notify_one();
+		return true;
+	}
+
+	case CommandType::RestartCamera: {
+		CameraRuntimeStatus& runtime = slot.runtime;
+		if (slot.state != CameraState::Error || !runtime.restartPending ||
+			command.errorGeneration != runtime.errorGeneration) {
+			return true;
+		}
+
+		runtime.restartQueued = false;
+		if (runtime.inFlightFrames != 0) {
+			return true;
+		}
+
+		bool recovered = true;
+		std::string recoveryError;
+		if (runtime.requiresFullRecovery) {
+			camera.closeDevice();
+			recovered = camera.openDevice(slot.config.devicePath);
+			if (recovered) {
+				recovered = camera.configure(toV4L2CameraConfig(slot.config));
+			}
+			if (recovered) {
+				recovered = camera.setupDmaImportBuffers(slot.config.bufferCount, slot.config.dmaHeapPath);
+			}
+			if (!recovered) {
+				recoveryError = "完整重建摄像头失败: " + camera.lastError();
+			}
+		}
+
+		if (recovered && !camera.start()) {
+			recovered = false;
+			recoveryError = "恢复 STREAMON 失败: " + camera.lastError();
+		}
+
+		if (!recovered) {
+			slot.state = CameraState::Error;
+			slot.lastError = recoveryError;
+			runtime.restartPending = true;
+			++runtime.restartAttempts;
+			if (!runtime.requiresFullRecovery && runtime.restartAttempts >= 3) {
+				runtime.requiresFullRecovery = true;
+				LOG_WARN("CamManager", "cameraId=" << command.cameraId
+										 << " 轻量恢复已连续失败 " << runtime.restartAttempts
+										 << " 次，下一轮升级为完整重建");
+			}
+			runtime.restartNotBefore = std::chrono::steady_clock::now() + restartBackoff(runtime.restartAttempts);
+			setError(slot.lastError);
+			LOG_ERROR("CamManager", "cameraId=" << command.cameraId << ' ' << slot.lastError
+								 << "，将在 " << restartBackoff(runtime.restartAttempts).count()
+								 << " 秒后重试");
+			m_camCv.notify_one();
+			return true;
+		}
+
+		slot.state = CameraState::Streaming;
+		slot.lastError.clear();
+		runtime.restartAttempts = 0;
+		runtime.startPending = false;
+		runtime.startQueued = false;
+		runtime.restartPending = false;
+		runtime.restartQueued = false;
+		runtime.requiresFullRecovery = false;
+		runtime.lastRevents = 0;
+		runtime.leaseWaitStarted = {};
+		runtime.nextLeaseWaitWarning = {};
+		++runtime.leaseGeneration;
+		clearError();
+		LOG_INFO("CamManager", "cameraId=" << command.cameraId << " 摄像头恢复成功");
+		m_camCv.notify_one();
+		return true;
+	}
 
 	case CommandType::DeleteCamera:
 		return true;
@@ -930,12 +1291,14 @@ bool CamManager::executeCommand(const Command& command) {
 	return false;
 }
 
-void CamManager::postReturnedFrame(int cameraId, int bufferIndex) {
+void CamManager::postReturnedFrame(int cameraId, int bufferIndex, uint64_t leaseGeneration) {
 	{
 		std::lock_guard<std::mutex> lock(m_returnMutex);
-		m_returnQueue.emplace(cameraId, bufferIndex);
+		m_returnQueue.push(ReturnedFrame {cameraId, bufferIndex, leaseGeneration});
+		m_hasPendingReturnedFrame = true;
 	}
 
+	m_camCv.notify_one();
 	notifyReturnEvent();
 }
 
@@ -989,45 +1352,88 @@ bool CamManager::drainReturnEvent() {
 }
 
 bool CamManager::drainReturnedFrames() {
-	std::queue<std::pair<int, int>> pending;
+	std::queue<ReturnedFrame> pending;
 	{
 		std::lock_guard<std::mutex> lock(m_returnMutex);
 		pending.swap(m_returnQueue);
+		m_hasPendingReturnedFrame = !m_returnQueue.empty();
 	}
 
 	if (pending.empty()) {
 		return true;
 	}
 
-	std::lock_guard<std::mutex> lock(m_camChangeMutex);
-	while (!pending.empty()) {
-		const std::pair<int, int> item = pending.front();
-		pending.pop();
-		const int cameraId = item.first;
-		const int bufferIndex = item.second;
+	std::vector<Command> recoveryCommands;
+	std::vector<std::pair<int, std::string>> faults;
+	{
+		std::lock_guard<std::mutex> lock(m_camChangeMutex);
+		while (!pending.empty()) {
+			const ReturnedFrame item = pending.front();
+			pending.pop();
+			const int cameraId = item.cameraId;
+			const int bufferIndex = item.bufferIndex;
 
-		auto it = m_cameraMap.find(cameraId);
-		if (it == m_cameraMap.end() || !it->second.source) {
-			// 摄像头可能已经被 delCamera() 移除。
-			// 如果对应 FrameLease 捕获的 sourceLifetime 是最后一个引用，
-			// 这里跳过 QBUF，让 V4L2CameraSource 析构时关闭 fd/释放 DMA buffer。
-			// cameraId 由 CamManager 内部单调生成，不对外复用，避免旧 lease
-			// 归还事件误命中新摄像头。
-			continue;
-		}
+			auto it = m_cameraMap.find(cameraId);
+			if (it == m_cameraMap.end() || !it->second.source) {
+				// 摄像头可能已经被 delCamera() 移除。
+				// 如果对应 FrameLease 捕获的 sourceLifetime 是最后一个引用，
+				// 这里跳过 QBUF，让 V4L2CameraSource 析构时关闭 fd/释放 DMA buffer。
+				continue;
+			}
 
-		if (it->second.state != CameraState::Streaming || !it->second.source->isStreaming()) {
-			// stopCamera() 后 STREAMOFF 会重置驱动队列。
-			// 旧 FrameLease 后续释放时不再 QBUF，下一次 start() 会重新 QBUF 全部 buffer。
-			continue;
-		}
+			CameraSlot& slot = it->second;
+			CameraRuntimeStatus& runtime = slot.runtime;
+			if (item.leaseGeneration == 0) {
+				// 本帧在创建 lease 前已经 stop/delete；不能对当前代 QBUF。
+				continue;
+			}
 
-		V4L2CameraSource::Frame frame{};
-		frame.index = bufferIndex;
-		if (!it->second.source->requeueFrame(frame)) {
-			setError("requeueFrame 失败: " + it->second.source->lastError());
-			return false;
+			if (item.leaseGeneration != runtime.leaseGeneration) {
+				// 正常 stop/start 会等待旧 lease 清空，因此跨代事件代表旧控制路径或异常时序。
+				// 绝不能把旧 buffer index QBUF 到新一代驱动队列。
+				LOG_WARN("CamManager", "cameraId=" << cameraId
+									   << " 丢弃跨代 FrameLease 归还 leaseGeneration="
+									   << item.leaseGeneration << " currentGeneration="
+									   << runtime.leaseGeneration);
+				continue;
+			}
+
+			if (runtime.inFlightFrames > 0) {
+				--runtime.inFlightFrames;
+			} else {
+				LOG_WARN("CamManager", "cameraId=" << cameraId
+									   << " 收到多余的 FrameLease 归还通知，已忽略");
+			}
+
+			if (slot.state != CameraState::Streaming || !slot.source->isStreaming()) {
+				// stopCamera() 后 STREAMOFF 会重置驱动队列。
+				// 旧 FrameLease 后续释放时不再 QBUF，下一次 start() 会重新 QBUF 全部 buffer。
+				continue;
+			}
+
+			V4L2CameraSource::Frame frame{};
+			frame.index = bufferIndex;
+			if (!slot.source->requeueFrame(frame)) {
+				const std::string message = "requeueFrame 失败: " + slot.source->lastError();
+				slot.state = CameraState::Error;
+				slot.lastError = message;
+				slot.runtime.lastRevents = 0;
+				slot.runtime.requiresFullRecovery = true;
+				++slot.runtime.errorGeneration;
+				faults.emplace_back(cameraId, message);
+				recoveryCommands.push_back(
+					Command {CommandType::ProcessError, cameraId, slot.runtime.errorGeneration});
+			}
 		}
+	}
+
+	for (const auto& fault : faults) {
+		setError(fault.second);
+		LOG_ERROR("CamManager", "cameraId=" << fault.first << ' ' << fault.second
+								 << "，已隔离该路并等待串行恢复");
+	}
+	for (const Command& command : recoveryCommands) {
+		(void)postCommand(command);
 	}
 
 	return true;
