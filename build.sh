@@ -34,77 +34,78 @@ echo "OUT=$BASE/build/v4l2_probe_demo"
 RGA_INC="$BASE/third_party/rga/include"
 RGA_LIB_DIR="$BASE/third_party/rga/lib/arm32"
 RGA_LINK_FLAGS="-L$RGA_LIB_DIR -Wl,-rpath,'\$ORIGIN/../third_party/rga/lib/arm32' -lrga"
+PROJECT_INCLUDE_FLAGS="-I$BASE/include/core/common -I$BASE/include/core/cam -I$BASE/include/core/stream -I$BASE/include/core/memory -I$BASE/include/core/hw/codec -I$BASE/include/core/hw/rga -I$BASE/include/rtsp/client -I$BASE/include/rtsp/server"
 
 cat > "$BASE/compile_commands.base.json" <<EOF
 [
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/V4L2CameraSource.cpp -o $BASE/build/V4L2CameraSource.o",
-    "file": "$BASE/src/V4L2CameraSource.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/cam/V4L2CameraSource.cpp -o $BASE/build/V4L2CameraSource.o",
+    "file": "$BASE/src/core/cam/V4L2CameraSource.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/V4L2DeviceProbe.cpp -o $BASE/build/V4L2DeviceProbe.o",
-    "file": "$BASE/src/V4L2DeviceProbe.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/cam/V4L2DeviceProbe.cpp -o $BASE/build/V4L2DeviceProbe.o",
+    "file": "$BASE/src/core/cam/V4L2DeviceProbe.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/CamManager.cpp -o $BASE/build/CamManager.o",
-    "file": "$BASE/src/CamManager.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/cam/CamManager.cpp -o $BASE/build/CamManager.o",
+    "file": "$BASE/src/core/cam/CamManager.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/DmaAllocator.cpp -o $BASE/build/DmaAllocator.o",
-    "file": "$BASE/src/DmaAllocator.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/memory/DmaAllocator.cpp -o $BASE/build/DmaAllocator.o",
+    "file": "$BASE/src/core/memory/DmaAllocator.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/FrameHub.cpp -o $BASE/build/FrameHub.o",
-    "file": "$BASE/src/FrameHub.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/common/FrameHub.cpp -o $BASE/build/FrameHub.o",
+    "file": "$BASE/src/core/common/FrameHub.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/src/DmaBufferPool.cpp -o $BASE/build/DmaBufferPool.o",
-    "file": "$BASE/src/DmaBufferPool.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/src/core/memory/DmaBufferPool.cpp -o $BASE/build/DmaBufferPool.o",
+    "file": "$BASE/src/core/memory/DmaBufferPool.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/src/hw/RgaEngine.cpp -o $BASE/build/RgaEngine.o",
-    "file": "$BASE/src/hw/RgaEngine.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -I$RGA_INC -c $BASE/src/core/hw/rga/RgaEngine.cpp -o $BASE/build/RgaEngine.o",
+    "file": "$BASE/src/core/hw/rga/RgaEngine.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/camera_capture_demo.cpp -o $BASE/build/camera_capture_demo.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/camera_capture_demo.cpp -o $BASE/build/camera_capture_demo.o",
     "file": "$BASE/demo/camera_capture_demo.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/cam_manager_demo.cpp -o $BASE/build/cam_manager_demo.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/cam_manager_demo.cpp -o $BASE/build/cam_manager_demo.o",
     "file": "$BASE/demo/cam_manager_demo.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/dma_allocator_demo.cpp -o $BASE/build/dma_allocator_demo.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/dma_allocator_demo.cpp -o $BASE/build/dma_allocator_demo.o",
     "file": "$BASE/demo/dma_allocator_demo.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/test.cpp -o $BASE/build/test.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/test.cpp -o $BASE/build/test.o",
     "file": "$BASE/demo/test.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/demo/rga_test.cpp -o $BASE/build/rga_test.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -I$RGA_INC -c $BASE/demo/rga_test.cpp -o $BASE/build/rga_test.o",
     "file": "$BASE/demo/rga_test.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -c $BASE/demo/v4l2_probe_demo.cpp -o $BASE/build/v4l2_probe_demo.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/v4l2_probe_demo.cpp -o $BASE/build/v4l2_probe_demo.o",
     "file": "$BASE/demo/v4l2_probe_demo.cpp"
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra -I$BASE/include -I$RGA_INC -c $BASE/src/sink/RgaCopySink.cpp -o $BASE/build/RgaCopySink.o",
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -I$RGA_INC -c $BASE/src/sink/RgaCopySink.cpp -o $BASE/build/RgaCopySink.o",
     "file": "$BASE/src/sink/RgaCopySink.cpp"
   }
 ]
@@ -112,51 +113,51 @@ EOF
 
 set -x
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" \
-    "$BASE/src/DmaAllocator.cpp" \
-    "$BASE/src/V4L2CameraSource.cpp" \
+    $PROJECT_INCLUDE_FLAGS \
+    "$BASE/src/core/memory/DmaAllocator.cpp" \
+    "$BASE/src/core/cam/V4L2CameraSource.cpp" \
     "$BASE/demo/camera_capture_demo.cpp" \
     -o "$BASE/build/camera_capture_demo"
 "$STRIP" "$BASE/build/camera_capture_demo" || true
 
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" \
-    "$BASE/src/DmaAllocator.cpp" \
-    "$BASE/src/V4L2CameraSource.cpp" \
-    "$BASE/src/CamManager.cpp" \
-    "$BASE/src/FrameHub.cpp" \
+    $PROJECT_INCLUDE_FLAGS \
+    "$BASE/src/core/memory/DmaAllocator.cpp" \
+    "$BASE/src/core/cam/V4L2CameraSource.cpp" \
+    "$BASE/src/core/cam/CamManager.cpp" \
+    "$BASE/src/core/common/FrameHub.cpp" \
     "$BASE/demo/cam_manager_demo.cpp" \
     -o "$BASE/build/cam_manager_demo"
 "$STRIP" "$BASE/build/cam_manager_demo" || true
 
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" \
-    "$BASE/src/DmaAllocator.cpp" \
+    $PROJECT_INCLUDE_FLAGS \
+    "$BASE/src/core/memory/DmaAllocator.cpp" \
     "$BASE/demo/dma_allocator_demo.cpp" \
     -o "$BASE/build/dma_allocator_demo"
 "$STRIP" "$BASE/build/dma_allocator_demo" || true
 
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" -I"$RGA_INC" \
-    "$BASE/src/DmaAllocator.cpp" \
-    "$BASE/src/V4L2CameraSource.cpp" \
-    "$BASE/src/CamManager.cpp" \
-    "$BASE/src/FrameHub.cpp" \
-    "$BASE/src/DmaBufferPool.cpp" \
-    "$BASE/src/hw/RgaEngine.cpp" \
+    $PROJECT_INCLUDE_FLAGS -I"$RGA_INC" \
+    "$BASE/src/core/memory/DmaAllocator.cpp" \
+    "$BASE/src/core/cam/V4L2CameraSource.cpp" \
+    "$BASE/src/core/cam/CamManager.cpp" \
+    "$BASE/src/core/common/FrameHub.cpp" \
+    "$BASE/src/core/memory/DmaBufferPool.cpp" \
+    "$BASE/src/core/hw/rga/RgaEngine.cpp" \
     "$BASE/demo/test.cpp" \
     -o "$BASE/build/test" \
     $RGA_LINK_FLAGS
 "$STRIP" "$BASE/build/test" || true
 
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" -I"$RGA_INC" \
-    "$BASE/src/DmaAllocator.cpp" \
-    "$BASE/src/V4L2CameraSource.cpp" \
-    "$BASE/src/CamManager.cpp" \
-    "$BASE/src/FrameHub.cpp" \
-    "$BASE/src/DmaBufferPool.cpp" \
-    "$BASE/src/hw/RgaEngine.cpp" \
+    $PROJECT_INCLUDE_FLAGS -I"$RGA_INC" \
+    "$BASE/src/core/memory/DmaAllocator.cpp" \
+    "$BASE/src/core/cam/V4L2CameraSource.cpp" \
+    "$BASE/src/core/cam/CamManager.cpp" \
+    "$BASE/src/core/common/FrameHub.cpp" \
+    "$BASE/src/core/memory/DmaBufferPool.cpp" \
+    "$BASE/src/core/hw/rga/RgaEngine.cpp" \
     "$BASE/src/sink/RgaCopySink.cpp" \
     "$BASE/demo/rga_test.cpp" \
     -o "$BASE/build/rga_test" \
@@ -164,8 +165,8 @@ set -x
 "$STRIP" "$BASE/build/rga_test" || true
 
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
-    -I"$BASE/include" \
-    "$BASE/src/V4L2DeviceProbe.cpp" \
+    $PROJECT_INCLUDE_FLAGS \
+    "$BASE/src/core/cam/V4L2DeviceProbe.cpp" \
     "$BASE/demo/v4l2_probe_demo.cpp" \
     -o "$BASE/build/v4l2_probe_demo"
 "$STRIP" "$BASE/build/v4l2_probe_demo" || true

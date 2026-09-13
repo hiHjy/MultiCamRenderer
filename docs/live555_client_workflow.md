@@ -5,10 +5,10 @@
 对应实现：
 
 ```text
-include/Live555RtspClient.hh
-src/Live555RtspClient.cpp
-include/AnnexBSink.hh
-src/AnnexBSink.cpp
+include/rtsp/client/Live555RtspClient.hh
+src/rtsp/client/Live555RtspClient.cpp
+include/rtsp/client/AnnexBSink.hh
+src/rtsp/client/AnnexBSink.cpp
 ```
 
 ## 1. 这个封装负责什么

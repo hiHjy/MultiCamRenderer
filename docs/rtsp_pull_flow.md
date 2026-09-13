@@ -45,7 +45,7 @@ while (stream.tryGetFrame(packet)) {
 
 第二个构造参数是 `readyQueueCapacity`，当前默认也是 `2`。它只表示“已经解码、等待上层取走的裸帧”容量，不是 RTP 缓冲，也不是压缩码流缓存。
 
-`FramePacket` 定义在 `include/VideoFrame.hpp`：
+`FramePacket` 定义在 `include/frame/VideoFrame.hpp`：
 
 ```cpp
 struct FramePacket {
@@ -58,7 +58,7 @@ struct FramePacket {
 
 ## 2. RtspStream：启动接收和解码两条线程
 
-入口是 `src/RtspStream.cpp` 的 `RtspStream::start()`：
+入口是 `src/rtsp/client/RtspStream.cpp` 的 `RtspStream::start()`：
 
 ```cpp
 startDecodeWorker();
@@ -70,11 +70,11 @@ m_client->start(m_url,
 
 这里先启动 DecodeWorker，再启动 live555。这样服务端在 `PLAY` 后立即发送 RTP 时，压缩 NALU 已有消费者。
 
-`VideoCodec` 是传输层通用编码类型，`toMppCodec()` 位于 `include/MppTypes.hpp`，负责统一转换成硬件 MPP 的 `MppCodec`。业务代码不能各自再写一份 H264/H265 的转换 switch。
+`VideoCodec` 是传输层通用编码类型，`toMppCodec()` 位于 `include/codec/MppTypes.hpp`，负责统一转换成硬件 MPP 的 `MppCodec`。业务代码不能各自再写一份 H264/H265 的转换 switch。
 
 ## 3. live555 的异步 RTSP 状态机
 
-`Live555RtspClient::start()` 会新建事件线程。线程入口为 `src/Live555RtspClient.cpp` 的 `eventThreadMain()`：
+`Live555RtspClient::start()` 会新建事件线程。线程入口为 `src/rtsp/client/Live555RtspClient.cpp` 的 `eventThreadMain()`：
 
 ```cpp
 setupLive555();

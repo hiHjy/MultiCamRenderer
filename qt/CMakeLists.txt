@@ -16,24 +16,32 @@ qt_standard_project_setup()
 
 qt_add_executable(app
     main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/FrameHub.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CamManager.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/V4L2CameraSource.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaAllocator.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/DmaBufferPool.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/RgaEngine.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/VideoFrame.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppTypes.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppDecoder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MppEncoder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mpp_simple.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mpp_advance.c
-	${CMAKE_CURRENT_SOURCE_DIR}/../src/AppRuntime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/common/FrameHub.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/cam/CamManager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/cam/V4L2CameraSource.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/memory/DmaAllocator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/memory/DmaBufferPool.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/rga/RgaEngine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/common/VideoFrame.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/codec/MppTypes.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/codec/MppDecoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/codec/MppEncoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/codec/mpp_simple.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/hw/codec/mpp_advance.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../src/core/runtime/AppRuntime.cpp
 
 )
 
 target_include_directories(app PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/cam
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/stream
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/hw/codec
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/hw/rga
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/rtsp/client
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/rtsp/server
     ${CMAKE_SYSROOT}/usr/include/rga
     ${CMAKE_SYSROOT}/usr/include/rockchip
     ${CMAKE_SYSROOT}/usr/include/libdrm
