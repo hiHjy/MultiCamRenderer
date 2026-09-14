@@ -18,6 +18,9 @@ constexpr char kSubDevicePath[] = "/dev/video34";  // rkvpss_scale1
 constexpr unsigned short kRtspPort = 8554;
 constexpr int kCameraFps = 30;
 constexpr int kCameraBufferCount = 6;
+// 字体是系统运行资源，不嵌进程序或项目源码。量产 rootfs 需在此路径部署一份
+// 覆盖英文/数字的 TTF；以后要显示中文时换成支持中文的字体即可。
+constexpr char kOsdFontPath[] = "/oem/usr/share/fonts/DejaVuSans.ttf";
 
 volatile std::sig_atomic_t g_stopRequested = 0;
 
@@ -55,6 +58,16 @@ RtspPublishSink::Config makePublishConfig(const std::string& streamName,
     config.encoderConfig.fps = kCameraFps;
     config.encoderConfig.bitratePreset = MppBitratePreset::Medium;
     config.encoderConfig.gop = kCameraFps;
+
+    config.enableOsd = true;
+    config.osdConfig.fontPath = kOsdFontPath;
+    config.osdConfig.textPixelHeight = 48;
+    // 当前 main=1920x1080、sub=1280x720 都能容纳 24 + 768 的文字层。
+    // 这里是小 RGBA canvas，并非整张视频；双缓冲合计仅约 576 KiB/路。
+    config.osdConfig.overlayWidth = 768;
+    config.osdConfig.overlayHeight = 96;
+    config.osdConfig.overlayLeft = 24;
+    config.osdConfig.overlayTop = 24;
     return config;
 }
 

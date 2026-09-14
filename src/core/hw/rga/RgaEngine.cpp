@@ -81,6 +81,30 @@ bool RgaEngine::rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& 
                                             effectiveHeightStride(dst),
                                             dstFormat);
 
+    // imcvtcolor 的语义比 improcess 更直接：它只做像素格式转换，不暗含 crop、
+    // 旋转或缩放。把这条常用路径放在这里，OSD/demo 就不用散落原生 RGA 调用。
+    if (op.op == RgaOp::ConvertColor) {
+        if (hasCrop || op.rotation != RgaRotation::Rotate0 || op.mirror != RgaMirror::None ||
+            src.width != dst.width || src.height != dst.height) {
+            setError("RGA 色彩转换不支持 crop/旋转/镜像/缩放");
+            return false;
+        }
+        const IM_STATUS check = imcheck(srcBuffer, dstBuffer, {}, {});
+        if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
+            setError(std::string("RGA 色彩转换 imcheck 失败: ") + imStrError(check));
+            return false;
+        }
+        const IM_STATUS status = imcvtcolor(srcBuffer, dstBuffer, srcFormat, dstFormat);
+        if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+            setError(std::string("RGA 色彩转换失败: ") + imStrError(status));
+            return false;
+        }
+        fillMeta(src, dst);
+        dst.bytesUsed = requiredSize(dst);
+        m_lastError.clear();
+        return true;
+    }
+
     im_rect srcRect {
         srcWindow.x,
         srcWindow.y,
@@ -141,6 +165,193 @@ bool RgaEngine::copy(const VideoFrame& src, VideoFrame& dst)
 bool RgaEngine::resize(const VideoFrame& src, VideoFrame& dst)
 {
     return rga(src, dst, RgaOperation {RgaOp::Resize});
+}
+
+bool RgaEngine::convertColor(const VideoFrame& src, VideoFrame& dst)
+{
+    return rga(src, dst, RgaOperation {RgaOp::ConvertColor});
+}
+
+bool RgaEngine::composite(const VideoFrame& source,
+                          const VideoFrame& overlay,
+                          VideoFrame& destination,
+                          const RgaOperation& op)
+{
+    // OSD 第一版只走最明确、已在 RV1126B SDK alpha_yuv_demo 验证过的路径：
+    // NV12 视频源 + 预乘 alpha RGBA 小 overlay -> 独立 NV12 输出。
+    if (source.format != PixelFormat::NV12 || destination.format != PixelFormat::NV12 ||
+        overlay.format != PixelFormat::RGBA8888) {
+        setError("RGA OSD 合成仅支持 NV12 视频 + RGBA8888 overlay -> NV12 输出");
+        return false;
+    }
+    if (!validateFrame(source, "composite source") ||
+        !validateFrame(overlay, "composite overlay") ||
+        !validateFrame(destination, "composite destination")) {
+        return false;
+    }
+    if (source.dmaFd == destination.dmaFd) {
+        setError("RGA OSD 合成要求 source 与 destination 使用不同 DMA-BUF");
+        return false;
+    }
+
+    const RgaRect sourceRect = op.crop;
+    const RgaRect overlayRect = op.overlayCrop;
+    const RgaRect destinationRect = op.compositeDestination;
+    if (sourceRect.width <= 0 || sourceRect.height <= 0 ||
+        overlayRect.width <= 0 || overlayRect.height <= 0 ||
+        destinationRect.width <= 0 || destinationRect.height <= 0) {
+        setError("RGA OSD 合成需要 source/overlay/destination 三个非空矩形");
+        return false;
+    }
+    if (sourceRect.width != overlayRect.width || sourceRect.height != overlayRect.height ||
+        sourceRect.width != destinationRect.width || sourceRect.height != destinationRect.height) {
+        setError("RGA OSD 合成的 source/overlay/destination 矩形宽高必须一致");
+        return false;
+    }
+    const auto isInside = [](const RgaRect& rect, const VideoFrame& frame) {
+        return rect.x >= 0 && rect.y >= 0 &&
+               rect.x + rect.width <= frame.width &&
+               rect.y + rect.height <= frame.height;
+    };
+    if (!isInside(sourceRect, source) || !isInside(overlayRect, overlay) ||
+        !isInside(destinationRect, destination)) {
+        setError("RGA OSD 合成矩形越界");
+        return false;
+    }
+    if (!validateWindowAlignment(source, sourceRect, "composite source rect") ||
+        !validateWindowAlignment(destination, destinationRect, "composite destination rect")) {
+        return false;
+    }
+
+    RgaOperation layoutOp {};
+    if (!validateStrideAlignment(source, layoutOp, "composite source") ||
+        !validateStrideAlignment(overlay, layoutOp, "composite overlay") ||
+        !validateStrideAlignment(destination, layoutOp, "composite destination") ||
+        !validateCapacity(source, "composite source") ||
+        !validateCapacity(overlay, "composite overlay") ||
+        !validateCapacity(destination, "composite destination")) {
+        return false;
+    }
+
+    const int sourceFormat = toRgaFormat(source.format);
+    const int overlayFormat = toRgaFormat(overlay.format);
+    const int destinationFormat = toRgaFormat(destination.format);
+    if (sourceFormat < 0 || overlayFormat < 0 || destinationFormat < 0) {
+        return false;
+    }
+
+    rga_buffer_t sourceBuffer = wrapbuffer_fd_t(source.dmaFd, source.width, source.height,
+                                                 effectiveStride(source), effectiveHeightStride(source),
+                                                 sourceFormat);
+    rga_buffer_t overlayBuffer = wrapbuffer_fd_t(overlay.dmaFd, overlay.width, overlay.height,
+                                                  effectiveStride(overlay), effectiveHeightStride(overlay),
+                                                  overlayFormat);
+    rga_buffer_t destinationBuffer = wrapbuffer_fd_t(destination.dmaFd,
+                                                      destination.width,
+                                                      destination.height,
+                                                      effectiveStride(destination),
+                                                      effectiveHeightStride(destination),
+                                                      destinationFormat);
+    const im_rect sourceImRect {sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height};
+    const im_rect overlayImRect {overlayRect.x, overlayRect.y, overlayRect.width, overlayRect.height};
+    const im_rect destinationImRect {
+        destinationRect.x,
+        destinationRect.y,
+        destinationRect.width,
+        destinationRect.height,
+    };
+
+    const int usage = IM_SYNC | IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL;
+    const IM_STATUS check = imcheck_composite(sourceBuffer,
+                                               destinationBuffer,
+                                               overlayBuffer,
+                                               sourceImRect,
+                                               destinationImRect,
+                                               overlayImRect,
+                                               usage);
+    if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
+        setError(std::string("RGA OSD 合成 imcheck 失败: ") + imStrError(check));
+        return false;
+    }
+
+    const IM_STATUS status = improcess(sourceBuffer,
+                                       destinationBuffer,
+                                       overlayBuffer,
+                                       sourceImRect,
+                                       destinationImRect,
+                                       overlayImRect,
+                                       -1,
+                                       nullptr,
+                                       nullptr,
+                                       usage);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        setError(std::string("RGA OSD 合成失败: ") + imStrError(status));
+        return false;
+    }
+
+    copyMeta(source, destination);
+    destination.bytesUsed = requiredSize(destination);
+    m_lastError.clear();
+    return true;
+}
+
+bool RgaEngine::drawRectangles(VideoFrame& destination,
+                               const std::vector<RgaRect>& rectangles,
+                               const RgaOperation& op)
+{
+    if (rectangles.empty()) {
+        m_lastError.clear();
+        return true;
+    }
+    if (!validateFrame(destination, "rectangle destination") ||
+        !validateStrideAlignment(destination, op, "rectangle destination") ||
+        !validateCapacity(destination, "rectangle destination")) {
+        return false;
+    }
+    if (op.rectangleLineWidth <= 0) {
+        setError("RGA 矩形框线宽必须大于 0");
+        return false;
+    }
+
+    std::vector<im_rect> imRects;
+    imRects.reserve(rectangles.size());
+    for (const RgaRect& rectangle : rectangles) {
+        if (rectangle.width <= 0 || rectangle.height <= 0 ||
+            rectangle.x < 0 || rectangle.y < 0 ||
+            rectangle.x + rectangle.width > destination.width ||
+            rectangle.y + rectangle.height > destination.height ||
+            !validateWindowAlignment(destination, rectangle, "rectangle")) {
+            if (m_lastError.empty()) {
+                setError("RGA 矩形框越界或尺寸无效");
+            }
+            return false;
+        }
+        imRects.push_back({rectangle.x, rectangle.y, rectangle.width, rectangle.height});
+    }
+
+    const int destinationFormat = toRgaFormat(destination.format);
+    if (destinationFormat < 0) {
+        return false;
+    }
+    rga_buffer_t destinationBuffer = wrapbuffer_fd_t(destination.dmaFd,
+                                                      destination.width,
+                                                      destination.height,
+                                                      effectiveStride(destination),
+                                                      effectiveHeightStride(destination),
+                                                      destinationFormat);
+    const IM_STATUS status = imrectangleArray(destinationBuffer,
+                                               imRects.data(),
+                                               static_cast<int>(imRects.size()),
+                                               op.rectangleColor,
+                                               op.rectangleLineWidth,
+                                               1);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        setError(std::string("RGA 画矩形框失败: ") + imStrError(status));
+        return false;
+    }
+
+    m_lastError.clear();
+    return true;
 }
 
 const std::string& RgaEngine::lastError() const

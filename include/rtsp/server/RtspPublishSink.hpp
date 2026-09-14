@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MppEncoder.hpp"
+#include "OsdRenderer.hpp"
 #include "Sink.hpp"
 
 #include <condition_variable>
@@ -15,12 +16,18 @@ class Live555RtspServer;
 // 一路裸帧到 RTSP 的发布消费者。
 // onFrame() 只保存最新待编码帧；MPP 编码及 live555 入队均在专用 worker 中完成。
 // 普通模式直接借用 CamManager 的 DMA-BUF 到 sendFrame() 返回，期间 FrameLease 会保护
-// V4L2 buffer 不被提前 QBUF。AI 模式以后可在本类中改为私有 DMA pool，不影响上游接口。
+// V4L2 buffer 不被提前 QBUF。启用 OSD 时，worker 会先 RGA copy 到自己的单块 NV12
+// DMA-BUF，再叠字/画框并送 MPP；由于 sendFrame() 同步完成，这一块 buffer 可安全复用。
 class RtspPublishSink final : public Sink {
 public:
     struct Config {
         std::string streamName;
         MppEncoderConfig encoderConfig;
+
+        // 启用后，worker 在 MPP 编码前把 VPSS 的 NV12 复制到私有输出 DMA-BUF，
+        // 再叠加文字/检测框。默认关闭，保持其他 PublishSink 使用方原有的零额外 copy 行为。
+        bool enableOsd = false;
+        OsdRendererConfig osdConfig;
     };
 
     RtspPublishSink(Live555RtspServer& server, Config config);

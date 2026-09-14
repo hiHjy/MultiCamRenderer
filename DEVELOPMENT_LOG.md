@@ -2951,6 +2951,109 @@ RK3568 非 Qt aarch64 demo 全量交叉构建通过；`cam_recovery_stress_demo`
 
 ## 2026-09-14
 
+### RV1126B IPC 编码前 OSD：FreeType + RGA + MPP + RTSP
+
+本次将 OSD 作为 **IPC 推流链中 MPP 编码之前的一步** 接入，而不是作为 RTSP 客户端或
+播放器的叠加效果。这样所有 RTSP 客户端、录像文件和后续外网转发看到的是同一份已叠字码流。
+
+最终主路径：
+
+```text
+VPSS NV12 FramePacket
+  -> RtspPublishSink 编码 worker
+  -> RGA copy 到本路私有 NV12 DMA-BUF
+  -> OsdRenderer 合成小 RGBA 时间文字层
+  -> RGA 在最终 NV12 上直接画 AI 检测框（AI 接入后使用）
+  -> MPP H264/H265 编码
+  -> Live555RtspServer
+```
+
+`RtspPublishSink` 仍然只保留“最新待编码帧”这一条队列。OSD 输出不需要再建裸帧队列或
+`DmaBufferPool`：每路只有一个编码 worker，`MppEncoder::sendFrame()` 同步返回后输入 DMA-BUF
+已经不再被 MPP 使用，因此一块私有 NV12 输出 DMA-BUF 可以安全循环复用。
+
+#### 新增 `core/osd`
+
+- `FreeTypeTextRenderer`：将单行 UTF-8 文本栅格化为只在 CPU 内存存在的 `TextBitmap`。
+  第一版支持常用中英文/数字、基础 kerning；复杂文字连写若未来需要，再在字形排版层接入 HarfBuzz。
+- `OsdRenderer`：拥有两块小 RGBA DMA-BUF。`updateText()` 将新文字写入非活动 buffer，并做
+  `DMA_BUF_IOCTL_SYNC END|WRITE`；RGA 合成时读取活动 buffer。文字每秒更新一次，不会每帧由 CPU
+  重绘全屏 overlay。
+- `OsdRenderer::setRectangles()` 只保存 `std::vector<RgaRect>`，不为框单独申请 DMA-BUF。
+  `composite()` 在最终 NV12 上通过 RGA 直接画框；AI 模块未来只负责产出检测框坐标。
+
+第一版固定使用预乘 alpha RGBA 文字层：黑色半透明背景为 `RGB=0,A=160`，白字使用 `R=G=B=A`，
+对应 RGA 的 `IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL`。
+
+#### `RgaEngine` 扩展
+
+`RgaOperation` 新增 overlay 裁剪/目标矩形和统一框样式字段；`RgaEngine` 新增：
+
+```cpp
+bool convertColor(const VideoFrame& src, VideoFrame& dst);
+bool composite(const VideoFrame& source,
+               const VideoFrame& overlay,
+               VideoFrame& destination,
+               const RgaOperation& op);
+bool drawRectangles(VideoFrame& destination,
+                    const std::vector<RgaRect>& rectangles,
+                    const RgaOperation& op);
+```
+
+小 overlay 的实际 RGA 步骤不是创建全屏 RGBA 图，而是：先把完整 NV12 视频 copy 到私有输出，随后只对
+`768x96` 文字区域做三输入合成。`source` 和 `destination` 强制使用不同 DMA-BUF，避免原地读写的硬件
+语义不明确。矩形框直接写 destination。
+
+新增 `freetype_bitmap_demo`，使用 `img/1.png` 完整验证：RGBA 输入 → NV12 → 小 RGBA 时间文字合成
+→ NV12 绿色矩形框 → RGBA PNG 输出。RV1126B 板测结果正确。
+
+#### IPC 接入与字体部署
+
+`IpcApp` 的 `/main`（H265 1920x1080）和 `/sub`（H264 1280x720）都启用 OSD，文字为：
+
+```text
+main  YYYY-MM-DD HH:MM:SS
+sub   YYYY-MM-DD HH:MM:SS
+```
+
+当前两路均配置 `768x96` 的小 RGBA overlay，放置在 `(24, 24)`；双缓冲合计约 `576 KiB/路`。
+
+字体不是源码资产，运行期从以下路径读取：
+
+```text
+/oem/usr/share/fonts/DejaVuSans.ttf
+```
+
+已在当前 RV1126B 板子创建该目录并部署测试字体。后续打 SDK/根文件系统时，需将目标字体同步到同一路径；
+若 OSD 未来显示中文，应替换为覆盖中文字符的 TTF/OTF。OSD 初始化失败会明确报错并停止该路编码器，
+不会静默推送未叠字画面。
+
+#### RV1126B 构建与 clangd
+
+新增 `wsl-build-rv1126b.sh`，通过同一份根 CMakeLists 构建 `ipc_app` 和 `freetype_bitmap_demo`。
+FreeType 头文件置于 `third_party/freetype/include/`，动态库继续使用 RV1126B SDK `media_out` 中的
+`libfreetype.so`，不把 SDK 绝对路径散到源码中。
+
+`tools/update_compile_commands.sh` 现在会合并 `build/rv1126b-aarch64/compile_commands.json`。此前根目录
+数据库漏掉 RV1126B 的 IPC target，clangd 找不到 `OsdRenderer.hpp`，并连带误报
+`shared_ptr<RtspPublishSink>` 不能转换为 `shared_ptr<Sink>`；现在根数据库已有 IPC 的完整 include/
+sysroot 参数。
+
+#### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+- RV1126B `ipc_app` 和 `freetype_bitmap_demo` 均交叉构建通过。
+- RK3568 非 Qt demos 全量交叉构建通过。
+- RV1126B 上临时启动新 `ipc_app`，分别拉取 `/main`、`/sub`：两路日志均确认 OSD 初始化、私有 NV12
+  DMA-BUF 申请、RGA 启动成功。
+- 从 `/main` RTSP 码流实际抓取 PNG，确认 `main 2026-09-14 ...` 已位于编码后的画面中。
+- 板子测试完成后已恢复旧自启程序；本提交后的部署将单独替换 `/oem/usr/bin/multicam_ipc_app`。
+
 ### CamManager 恢复逻辑可读性收口
 
 上一版自动恢复已经具备正确的线程边界和压力测试，但恢复状态字段、eventfd 命名与无效唤醒混在一起，

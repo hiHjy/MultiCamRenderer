@@ -3,7 +3,43 @@
 #include "Live555RtspServer.hh"
 #include "Log.hpp"
 
+#include <chrono>
+#include <ctime>
+#include <memory>
 #include <utility>
+
+namespace {
+
+std::string formatOsdLocalTime()
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm localTime {};
+    localtime_r(&now, &localTime);
+
+    char text[32] {};
+    std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &localTime);
+    return std::string(text);
+}
+
+VideoFrame makeOsdOutputFrame(const DmaMemory& memory, const MppEncoderConfig& config)
+{
+    VideoFrame frame;
+    frame.dmaFd = memory.fd();
+    frame.va = memory.va();
+    frame.capacity = memory.size();
+    frame.width = config.width;
+    frame.height = config.height;
+    frame.stride = config.stride > 0 ? config.stride : config.width;
+    frame.heightStride = config.heightStride > 0 ? config.heightStride : config.height;
+    frame.format = PixelFormat::NV12;
+    frame.bytesUsed = RgaEngine::bufferSizeFor(frame.format,
+                                                frame.stride,
+                                                frame.heightStride,
+                                                64);
+    return frame;
+}
+
+} // namespace
 
 RtspPublishSink::RtspPublishSink(Live555RtspServer& server, Config config)
     : m_server(server),
@@ -91,6 +127,12 @@ std::string RtspPublishSink::lastError() const
 void RtspPublishSink::workerMain()
 {
     MppEncoder encoder;
+    RgaEngine rga;
+    OsdRenderer osd;
+    DmaAllocator osdOutputAllocator;
+    DmaMemory osdOutputMemory;
+    VideoFrame osdOutputFrame;
+    std::string lastOsdTime;
     encoder.setPacketCallback([this](const EncodedPacket& packet) {
         // EncodedPacket::data 仅在本回调中有效；Live555RtspServer 会立即复制 Annex-B 数据。
         return m_server.pushAnnexBFrame(m_config.streamName,
@@ -117,6 +159,50 @@ void RtspPublishSink::workerMain()
             }
             LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName << ' ' << error);
             continue;
+        }
+
+        if (m_config.enableOsd) {
+            if (!osd.initialize(m_config.osdConfig)) {
+                const std::string error = osd.lastError();
+                encoder.deinit();
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_activeRequested = false;
+                    m_acceptingFrames = false;
+                    setErrorLocked("初始化 OSD 失败: " + error);
+                }
+                LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                           << " 初始化 OSD 失败: " << error);
+                continue;
+            }
+
+            const int outputStride = m_config.encoderConfig.stride > 0
+                ? m_config.encoderConfig.stride : m_config.encoderConfig.width;
+            const int outputHeightStride = m_config.encoderConfig.heightStride > 0
+                ? m_config.encoderConfig.heightStride : m_config.encoderConfig.height;
+            const size_t outputBytes = RgaEngine::bufferSizeFor(PixelFormat::NV12,
+                                                                outputStride,
+                                                                outputHeightStride,
+                                                                64);
+            if (!osdOutputAllocator.allocate(outputBytes, osdOutputMemory)) {
+                const std::string error = osdOutputAllocator.lastError();
+                encoder.deinit();
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_activeRequested = false;
+                    m_acceptingFrames = false;
+                    setErrorLocked("申请 OSD 输出 DMA-BUF 失败: " + error);
+                }
+                LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                           << " 申请 OSD 输出 DMA-BUF 失败: " << error);
+                continue;
+            }
+            osdOutputFrame = makeOsdOutputFrame(osdOutputMemory, m_config.encoderConfig);
+            lastOsdTime.clear();
+            LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                      << " OSD 已启动，文字层="
+                                                      << m_config.osdConfig.overlayWidth << "x"
+                                                      << m_config.osdConfig.overlayHeight);
         }
 
         bool shouldEncode = false;
@@ -166,7 +252,36 @@ void RtspPublishSink::workerMain()
                                                                 << " 已请求 MPP 下一帧 IDR");
                 }
             }
-            if (!encoder.sendFrame(packet.frame)) {
+            const VideoFrame* frameToEncode = &packet.frame;
+            if (m_config.enableOsd) {
+                const std::string currentOsdTime = formatOsdLocalTime();
+                if (currentOsdTime != lastOsdTime) {
+                    if (!osd.updateText(m_config.streamName + "  " + currentOsdTime)) {
+                        const std::string error = osd.lastError();
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            setErrorLocked("更新 OSD 文字失败: " + error);
+                        }
+                        LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                                   << " 更新 OSD 文字失败: " << error);
+                        continue;
+                    }
+                    lastOsdTime = currentOsdTime;
+                }
+                if (!osd.composite(packet.frame, osdOutputFrame, rga)) {
+                    const std::string error = osd.lastError();
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        setErrorLocked("OSD 合成失败: " + error);
+                    }
+                    LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                               << " OSD 合成失败: " << error);
+                    continue;
+                }
+                frameToEncode = &osdOutputFrame;
+            }
+
+            if (!encoder.sendFrame(*frameToEncode)) {
                 const std::string error = encoder.lastError();
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
@@ -177,6 +292,10 @@ void RtspPublishSink::workerMain()
         }
 
         encoder.deinit();
+        // 下一次有客户端时重新申请，避免无人观看时保留不必要的 OSD DMA 内存。
+        osdOutputMemory.reset();
+        osdOutputFrame = {};
+        lastOsdTime.clear();
         LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName << " 编码器已停止");
     }
 }
