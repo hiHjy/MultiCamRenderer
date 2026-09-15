@@ -200,20 +200,10 @@ int main(int argc, char** argv)
 
     MppEncoderConfig config {};
     config.codec = parseCodec(codecText);
-    config.width = width;
-    config.height = height;
-    config.stride = stride;
-    config.heightStride = heightStride;
-    config.inputFormat = PixelFormat::NV12;
     config.fps = fps;
     config.bitratePreset = bitratePreset;
     config.bitrate = bitrate;
     config.gop = 15;
-
-    if (!encoder.init(config)) {
-        std::cerr << "初始化编码器失败: " << encoder.lastError() << "\n";
-        return 1;
-    }
 
     VideoFrame frame {};
     frame.dmaFd = inputMemory.fd();
@@ -225,6 +215,17 @@ int main(int argc, char** argv)
     frame.stride = stride;
     frame.heightStride = heightStride;
     frame.format = PixelFormat::NV12;
+
+    config.width = frame.width;
+    config.height = frame.height;
+    config.stride = videoFrameEffectiveStride(frame);
+    config.heightStride = videoFrameEffectiveHeightStride(frame);
+    config.inputFormat = frame.format;
+
+    if (!encoder.init(config)) {
+        std::cerr << "初始化编码器失败: " << encoder.lastError() << "\n";
+        return 1;
+    }
 
     for (int i = 0; i < frameCount; ++i) {
         if (i == requestKeyFrameIndex) {

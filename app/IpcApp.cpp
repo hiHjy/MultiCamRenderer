@@ -43,18 +43,11 @@ CamManager::CameraConfig makeCameraConfig(const char* devicePath, int width, int
 }
 
 RtspPublishSink::Config makePublishConfig(const std::string& streamName,
-                                          VideoCodec codec,
-                                          int width,
-                                          int height)
+                                          VideoCodec codec)
 {
     RtspPublishSink::Config config {};
     config.streamName = streamName;
     config.encoderConfig.codec = toMppCodec(codec);
-    config.encoderConfig.width = width;
-    config.encoderConfig.height = height;
-    config.encoderConfig.stride = width;
-    config.encoderConfig.heightStride = height;
-    config.encoderConfig.inputFormat = PixelFormat::NV12;
     config.encoderConfig.fps = kCameraFps;
     config.encoderConfig.bitratePreset = MppBitratePreset::Medium;
     config.encoderConfig.gop = kCameraFps;
@@ -127,9 +120,9 @@ int main()
     }
 
     const auto mainPublishSink = std::make_shared<RtspPublishSink>(
-        rtspServer, makePublishConfig("main", VideoCodec::H265, 1920, 1080));
+        rtspServer, makePublishConfig("main", VideoCodec::H265));
     const auto subPublishSink = std::make_shared<RtspPublishSink>(
-        rtspServer, makePublishConfig("sub", VideoCodec::H264, 1280, 720));
+        rtspServer, makePublishConfig("sub", VideoCodec::H264));
 
     if (!cameraManager.addFrameSink(mainCameraId, mainPublishSink) ||
         !cameraManager.addFrameSink(subCameraId, subPublishSink)) {

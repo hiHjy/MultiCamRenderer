@@ -3149,3 +3149,68 @@ git diff --check
 ```
 
 RK3568 非 Qt aarch64 demos 与 RV1126B `ipc_app` 均交叉构建通过。
+
+## 2026-09-15
+
+### MPP 编码输入 layout 的职责收口
+
+此前 `IpcApp::makePublishConfig()` 同时填写了编码策略和输入图像 layout：
+
+```text
+codec / fps / bitrate / GOP
++ width / height / stride / heightStride / inputFormat
+```
+
+后半部分不应由最上层 IPC 应用猜测。特别是 `stride` 取决于 VPSS/V4L2 的实际协商和硬件对齐，
+例如 1920 宽图像在某些来源上可能使用 2304 stride。项目统一遵守的原则仍是：
+
+```text
+谁生产真实图像，谁填写真实 layout；
+谁最靠近首帧，谁把 layout 交给硬件模块。
+```
+
+本次职责划分调整为：
+
+```text
+IpcApp
+  → 只填写 codec / fps / bitratePreset / gop（编码策略）
+
+RtspPublishSink
+  → 收到本轮第一张真实 VPSS VideoFrame
+  → 复制策略配置到 activeEncoderConfig
+  → 填写 width / height / stride / heightStride / inputFormat
+  → 调用 MppEncoder::init(activeEncoderConfig)
+
+MppEncoder
+  → 将完整 config 转为 MPP prep:* 配置
+  → 后续 sendFrame() 校验所有帧的 layout 不变后再送 DMA fd + timestamp
+```
+
+`MppEncoderConfig` 保留 layout 字段是必要的：编码器不像解码器能从 H264/H265 码流参数集获取
+图像布局，DMA fd 本身也不携带宽高、stride、NV12/RGBA 等元信息。MPP 在首次
+`encode_put_frame()` 前必须已经收到：
+
+```text
+prep:width / prep:height / prep:hor_stride / prep:ver_stride / prep:format
+```
+
+但这些字段不再由 `IpcApp` 对外配置；`RtspPublishSink` 每次 active 编码周期都生成新的局部
+`activeEncoderConfig`，因此不会把上一次会话的 layout 残留到下一次。
+
+### 本次验证
+
+```bash
+./wsl-build.sh
+./wsl-build-rv1126b.sh
+```
+
+两套交叉构建均通过。RV1126B `192.168.1.6` 使用临时 `ipc_app` 分别拉取 `/main` 与 `/sub`：
+
+```text
+main H265: 1920x1080, stride=1920x1080, bitrate=5054400, gop=30
+sub  H264: 1280x720,  stride=1280x720, bitrate=3456000, gop=30
+```
+
+日志确认每路均先由首帧补齐 MPP prep 配置，随后 MPP 初始化及 ffmpeg UDP 拉流成功。
+测试结束后已停止临时程序并恢复板端 `/oem/usr/bin/multicam_ipc_app` 旧自启版本；本次提交不覆盖
+板端正式二进制。

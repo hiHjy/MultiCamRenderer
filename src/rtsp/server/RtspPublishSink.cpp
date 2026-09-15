@@ -21,22 +21,31 @@ std::string formatOsdLocalTime()
     return std::string(text);
 }
 
-VideoFrame makeOsdOutputFrame(const DmaMemory& memory, const MppEncoderConfig& config)
+VideoFrame makeOsdOutputFrame(const DmaMemory& memory, const VideoFrame& source)
 {
     VideoFrame frame;
     frame.dmaFd = memory.fd();
     frame.va = memory.va();
     frame.capacity = memory.size();
-    frame.width = config.width;
-    frame.height = config.height;
-    frame.stride = config.stride > 0 ? config.stride : config.width;
-    frame.heightStride = config.heightStride > 0 ? config.heightStride : config.height;
+    frame.width = source.width;
+    frame.height = source.height;
+    frame.stride = videoFrameEffectiveStride(source);
+    frame.heightStride = videoFrameEffectiveHeightStride(source);
     frame.format = PixelFormat::NV12;
     frame.bytesUsed = RgaEngine::bufferSizeFor(frame.format,
                                                 frame.stride,
                                                 frame.heightStride,
                                                 64);
     return frame;
+}
+
+void fillEncoderInputLayout(MppEncoderConfig& config, const VideoFrame& frame)
+{
+    config.width = frame.width;
+    config.height = frame.height;
+    config.stride = videoFrameEffectiveStride(frame);
+    config.heightStride = videoFrameEffectiveHeightStride(frame);
+    config.inputFormat = frame.format;
 }
 
 } // namespace
@@ -149,22 +158,9 @@ void RtspPublishSink::workerMain()
                 break;
         }
 
-        if (!encoder.init(m_config.encoderConfig)) {
-            const std::string error = encoder.lastError();
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_activeRequested = false;
-                m_acceptingFrames = false;
-                setErrorLocked("初始化 MPP 编码器失败: " + error);
-            }
-            LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName << ' ' << error);
-            continue;
-        }
-
         if (m_config.enableOsd) {
             if (!osd.initialize(m_config.osdConfig)) {
                 const std::string error = osd.lastError();
-                encoder.deinit();
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     m_activeRequested = false;
@@ -175,32 +171,9 @@ void RtspPublishSink::workerMain()
                                                            << " 初始化 OSD 失败: " << error);
                 continue;
             }
-
-            const int outputStride = m_config.encoderConfig.stride > 0
-                ? m_config.encoderConfig.stride : m_config.encoderConfig.width;
-            const int outputHeightStride = m_config.encoderConfig.heightStride > 0
-                ? m_config.encoderConfig.heightStride : m_config.encoderConfig.height;
-            const size_t outputBytes = RgaEngine::bufferSizeFor(PixelFormat::NV12,
-                                                                outputStride,
-                                                                outputHeightStride,
-                                                                64);
-            if (!osdOutputAllocator.allocate(outputBytes, osdOutputMemory)) {
-                const std::string error = osdOutputAllocator.lastError();
-                encoder.deinit();
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    m_activeRequested = false;
-                    m_acceptingFrames = false;
-                    setErrorLocked("申请 OSD 输出 DMA-BUF 失败: " + error);
-                }
-                LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
-                                                           << " 申请 OSD 输出 DMA-BUF 失败: " << error);
-                continue;
-            }
-            osdOutputFrame = makeOsdOutputFrame(osdOutputMemory, m_config.encoderConfig);
             lastOsdTime.clear();
             LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
-                                                      << " OSD 已启动，文字层="
+                                                      << " OSD 已启动，等待第一张 VPSS 帧确定输出 layout，文字层="
                                                       << m_config.osdConfig.overlayWidth << "x"
                                                       << m_config.osdConfig.overlayHeight);
         }
@@ -214,9 +187,13 @@ void RtspPublishSink::workerMain()
                 m_lastError.clear();
         }
         if (shouldEncode) {
-            LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName << " 编码器已启动");
+            LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                      << " 已开始接收裸帧，收到第一张后初始化编码器");
         }
 
+        bool encoderInitialized = false;
+        // m_config 是启动期策略；每次 active 周期根据真实首帧生成本次 MPP prep 配置。
+        MppEncoderConfig activeEncoderConfig = m_config.encoderConfig;
         while (shouldEncode) {
             FramePacket packet;
             bool requestKeyFrame = false;
@@ -239,21 +216,38 @@ void RtspPublishSink::workerMain()
                 m_keyFrameRequested = false;
             }
 
-            // 当前 mpp_simple 封装会在 sendFrame() 内取回编码包后才返回；packet 的 lease
-            // 因而会一直保护输入 dmaFd 到 MPP 使用完成。
-            if (requestKeyFrame) {
-                if (!encoder.requestKeyFrame()) {
-                    // 强制 IDR 失败不应阻断普通编码；编码器的周期 IDR 仍能让客户端恢复。
-                    LOG_WARN("RtspPublishSink", "stream=" << m_config.streamName
-                                                                << " 请求下一帧 IDR 失败: "
-                                                                << encoder.lastError());
-                } else {
-                    LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
-                                                                << " 已请求 MPP 下一帧 IDR");
-                }
-            }
             const VideoFrame* frameToEncode = &packet.frame;
             if (m_config.enableOsd) {
+                // 私有 NV12 输出 buffer 的 layout 必须与实际 VPSS 输入一致，因此不能从
+                // 配置猜宽高/stride，收到第一张图像后才创建。
+                if (!osdOutputMemory.valid()) {
+                    const int outputStride = videoFrameEffectiveStride(packet.frame);
+                    const int outputHeightStride = videoFrameEffectiveHeightStride(packet.frame);
+                    const size_t outputBytes = RgaEngine::bufferSizeFor(PixelFormat::NV12,
+                                                                        outputStride,
+                                                                        outputHeightStride,
+                                                                        64);
+                    if (!osdOutputAllocator.allocate(outputBytes, osdOutputMemory)) {
+                        const std::string error = osdOutputAllocator.lastError();
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            m_activeRequested = false;
+                            m_acceptingFrames = false;
+                            setErrorLocked("申请 OSD 输出 DMA-BUF 失败: " + error);
+                        }
+                        LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                                   << " 申请 OSD 输出 DMA-BUF 失败: " << error);
+                        shouldEncode = false;
+                        continue;
+                    }
+                    osdOutputFrame = makeOsdOutputFrame(osdOutputMemory, packet.frame);
+                    LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                              << " OSD 输出 layout="
+                                                              << osdOutputFrame.width << "x" << osdOutputFrame.height
+                                                              << " stride=" << osdOutputFrame.stride << "x"
+                                                              << osdOutputFrame.heightStride);
+                }
+
                 const std::string currentOsdTime = formatOsdLocalTime();
                 if (currentOsdTime != lastOsdTime) {
                     if (!osd.updateText(m_config.streamName + "  " + currentOsdTime)) {
@@ -279,6 +273,42 @@ void RtspPublishSink::workerMain()
                     continue;
                 }
                 frameToEncode = &osdOutputFrame;
+            }
+
+            // 当前 mpp_simple 封装会在 sendFrame() 内取回编码包后才返回；packet 的 lease
+            // 因而会一直保护输入 dmaFd 到 MPP 使用完成。MPP 初始化也必须取真实输入帧
+            // 的 layout；编码器新建后的第一张图像天然从 IDR 序列开始。
+            if (!encoderInitialized) {
+                fillEncoderInputLayout(activeEncoderConfig, *frameToEncode);
+                if (!encoder.init(activeEncoderConfig)) {
+                    const std::string error = encoder.lastError();
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_activeRequested = false;
+                        m_acceptingFrames = false;
+                        setErrorLocked("初始化 MPP 编码器失败: " + error);
+                    }
+                    LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName << ' ' << error);
+                    shouldEncode = false;
+                    continue;
+                }
+                encoderInitialized = true;
+                // 本次 setActive() 刚建立的编码器首帧不用额外请求 IDR；请求合并标志到此
+                // 已没有意义，清掉即可。后续新客户端才会走 requestKeyFrame()。
+                requestKeyFrame = false;
+                LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName << " 已按第一张真实帧补齐 MPP prep 配置并初始化编码器");
+            }
+
+            if (requestKeyFrame) {
+                if (!encoder.requestKeyFrame()) {
+                    // 强制 IDR 失败不应阻断普通编码；编码器的周期 IDR 仍能让客户端恢复。
+                    LOG_WARN("RtspPublishSink", "stream=" << m_config.streamName
+                                                                << " 请求下一帧 IDR 失败: "
+                                                                << encoder.lastError());
+                } else {
+                    LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                                << " 已请求 MPP 下一帧 IDR");
+                }
             }
 
             if (!encoder.sendFrame(*frameToEncode)) {

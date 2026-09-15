@@ -37,7 +37,8 @@ public:
     RtspPublishSink& operator=(const RtspPublishSink&) = delete;
 
     // 可由 live555 的客户端活动回调调用；函数只更新 worker 状态，不阻塞 RTSP 事件线程。
-    // active=true 时 worker 初始化编码器，第一张接收的图像从新的编码序列开始；
+    // active=true 时 worker 开始接收裸帧，并以第一张真实图像初始化编码器；
+    // 第一张接收的图像从新的编码序列开始。
     // active=false 时立即丢弃待编码帧并 deinit 编码器。
     void setActive(bool active);
 
