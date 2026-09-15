@@ -3276,3 +3276,26 @@ CPU 写 RGBA 与 DMA cache sync 只发生在文字更新时（当前时钟为每
 随后补充 `OsdAnchor`：除 `Absolute` 的 `left/top` 外，`TopRight` 等锚点使用 `edgeOffsetX/Y`。这使
 `RtspPublishSink` 创建对象时不需要预先取得 VPSS 帧尺寸；`OsdRenderer` 在首次合成时按真实视频宽高和当前
 文字宽度计算最终位置。RV1126B demo 已用右上角的加长 `"... UTC"` 时间文本验证，右边保持 24 像素间距。
+
+### OSD 按分辨率自适应缩放
+
+OSD 配置统一以 `OsdRendererConfig::designWidth/designHeight` 表示设计分辨率，IPC 当前明确设为
+`1920x1080`。`OsdTextObject` 的字号、绝对坐标、锚点边距和 padding 都是设计像素；首次
+`composite()` 得到实际 VPSS `VideoFrame` 后，`OsdRenderer` 取：
+
+```text
+scale = min(videoWidth / designWidth, videoHeight / designHeight)
+```
+
+并换算成真实像素。这样 1080p 保留 48px 字和 24px 边距，1280x720 自动使用约 32px 字和 16px 边距。
+分辨率运行中变化时，已有的 layout 重建路径会重新打开相应字号的 FreeType face、重建 bitmap 和条带；正常
+30fps 路径只做一次比例/字号比较，不会反复加载字体。
+
+AI 检测框的 `RgaRect` 坐标保持“当前视频帧真实坐标”，不由 OSD 二次缩放；只有其 `lineWidth` 作为视觉样式
+按同一比例缩放。条带对象的合并阈值也按比例缩放，确保 720p 与 1080p 保持相同布局语义。
+
+RV1126B `192.168.1.6` 实测通过：
+
+- 输入 `1280x720`：文字、背景、右上锚点边距和框线均为 1080p 的约 2/3，输出正常。
+- 输入 `1920x1080`：维持设计尺寸，输出正常。
+- 两次均经过 PNG RGBA -> RGA NV12 -> OSD -> RGA RGBA 的真实硬件路径；检测框仍按既定规则覆盖文字。

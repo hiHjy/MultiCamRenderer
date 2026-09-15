@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <utility>
 
@@ -27,6 +28,9 @@ struct OsdRenderer::TextObjectRuntime {
     FreeTypeTextRenderer textRenderer;
     TextBitmap bitmap;
     RgaRect placement;
+    int pixelPaddingX = 0;
+    int pixelPaddingY = 0;
+    unsigned renderedTextPixelHeight = 0;
     size_t bandIndex = 0;
     bool hasBand = false;
     bool placementDirty = true;
@@ -37,8 +41,8 @@ OsdRenderer::~OsdRenderer() = default;
 
 bool OsdRenderer::initialize(const OsdRendererConfig& config)
 {
-    if (config.fontPath.empty()) {
-        setError("OSD 配置无效：字体路径为空");
+    if (config.fontPath.empty() || config.designWidth <= 0 || config.designHeight <= 0) {
+        setError("OSD 配置无效：字体路径或设计分辨率不合法");
         return false;
     }
 
@@ -73,7 +77,10 @@ bool OsdRenderer::addTextObject(OsdTextObject object)
 
     auto runtime = std::make_unique<TextObjectRuntime>();
     runtime->object = std::move(object);
-    if (!openTextRendererLocked(*runtime) || !renderTextLocked(*runtime)) {
+    // addTextObject() 时还没有 VideoFrame，先按设计字号渲染；首次 composite() 会根据
+    // 实际视频尺寸切到对应像素字号。1080p 默认正好无需再次打开字体。
+    if (!openTextRendererLocked(*runtime, runtime->object.textPixelHeight) ||
+        !renderTextLocked(*runtime)) {
         return false;
     }
 
@@ -109,7 +116,7 @@ bool OsdRenderer::updateTextObject(OsdTextObject object)
     const bool textChanged = previous.text != object.text;
     const bool fontChanged = previous.textPixelHeight != object.textPixelHeight;
     runtime.object = std::move(object);
-    if (fontChanged && !openTextRendererLocked(runtime)) {
+    if (fontChanged && !openTextRendererLocked(runtime, runtime.object.textPixelHeight)) {
         return false;
     }
     if ((textChanged || fontChanged) && !renderTextLocked(runtime)) {
@@ -194,7 +201,8 @@ bool OsdRenderer::composite(const VideoFrame& source, VideoFrame& destination)
     if (!m_rectangles.rectangles.empty()) {
         RgaOperation operation;
         operation.rectangleColor = toRgaColor(m_rectangles.color);
-        operation.rectangleLineWidth = m_rectangles.lineWidth;
+        // 检测框坐标已是当前视频坐标，不能缩放；但线宽是视觉样式，按 OSD 设计比例缩放。
+        operation.rectangleLineWidth = std::max(1, scaleDesignPixelsLocked(m_rectangles.lineWidth, source));
         if (!m_rga.drawRectangles(destination, m_rectangles.rectangles, operation)) {
             setError("OSD 画检测框失败: " + m_rga.lastError());
             return false;
@@ -266,13 +274,14 @@ bool OsdRenderer::validateTextObject(const OsdTextObject& object)
     return true;
 }
 
-bool OsdRenderer::openTextRendererLocked(TextObjectRuntime& runtime)
+bool OsdRenderer::openTextRendererLocked(TextObjectRuntime& runtime, unsigned pixelHeight)
 {
-    if (!runtime.textRenderer.open(m_config.fontPath, runtime.object.textPixelHeight)) {
+    if (!runtime.textRenderer.open(m_config.fontPath, pixelHeight)) {
         setError("OSD 打开字体失败 id=" + runtime.object.id + ": " +
                  runtime.textRenderer.lastError());
         return false;
     }
+    runtime.renderedTextPixelHeight = pixelHeight;
     return true;
 }
 
@@ -286,39 +295,72 @@ bool OsdRenderer::renderTextLocked(TextObjectRuntime& runtime)
     return true;
 }
 
+double OsdRenderer::scaleForSourceLocked(const VideoFrame& source) const
+{
+    const double widthScale = static_cast<double>(source.width) / m_config.designWidth;
+    const double heightScale = static_cast<double>(source.height) / m_config.designHeight;
+    return std::min(widthScale, heightScale);
+}
+
+int OsdRenderer::scaleDesignPixelsLocked(int designPixels, const VideoFrame& source) const
+{
+    return static_cast<int>(std::lround(designPixels * scaleForSourceLocked(source)));
+}
+
+bool OsdRenderer::ensureTextBitmapForSourceLocked(TextObjectRuntime& runtime,
+                                                   const VideoFrame& source)
+{
+    const int scaledHeight = scaleDesignPixelsLocked(
+        static_cast<int>(runtime.object.textPixelHeight), source);
+    const unsigned pixelHeight = static_cast<unsigned>(std::max(1, scaledHeight));
+    if (runtime.bitmap.valid() && runtime.renderedTextPixelHeight == pixelHeight) {
+        return true;
+    }
+
+    // 只有首次看到非设计分辨率、或运行中视频尺寸跨越字号边界时才重开字体；正常 30fps
+    // 路径只做一次整数比较。时钟更新会复用这份 face，直接 renderText() 即可。
+    if (!openTextRendererLocked(runtime, pixelHeight) || !renderTextLocked(runtime)) {
+        return false;
+    }
+    runtime.placementDirty = true;
+    return true;
+}
+
 bool OsdRenderer::calculatePlacementLocked(TextObjectRuntime& runtime,
                                            const VideoFrame& source,
                                            RgaRect& placement)
 {
-    if (!runtime.bitmap.valid()) {
-        setError("OSD 文字 bitmap 无效 id=" + runtime.object.id);
+    if (!ensureTextBitmapForSourceLocked(runtime, source)) {
         return false;
     }
 
-    // NV12 的合成目标必须偶数对齐。文字对象的 left/top 可以是普通像素坐标，实际 RGA
-    // 目标向左/上取偶数；文字内容与背景随之整体移动至这个硬件可接受的位置。
-    placement.width = alignUp(runtime.bitmap.width + runtime.object.paddingX * 2, 16);
-    placement.height = alignUp(runtime.bitmap.height + runtime.object.paddingY * 2, 2);
-    int left = runtime.object.left;
-    int top = runtime.object.top;
+    runtime.pixelPaddingX = std::max(0, scaleDesignPixelsLocked(runtime.object.paddingX, source));
+    runtime.pixelPaddingY = std::max(0, scaleDesignPixelsLocked(runtime.object.paddingY, source));
+
+    // NV12 的合成目标必须偶数对齐。对象配置的坐标、边距和 padding 都是设计像素，
+    // 先按实际视频尺寸换算，再向左/上取偶数满足 YUV420 chroma 对齐。
+    placement.width = alignUp(runtime.bitmap.width + runtime.pixelPaddingX * 2, 16);
+    placement.height = alignUp(runtime.bitmap.height + runtime.pixelPaddingY * 2, 2);
+    int left = scaleDesignPixelsLocked(runtime.object.left, source);
+    int top = scaleDesignPixelsLocked(runtime.object.top, source);
     switch (runtime.object.anchor) {
     case OsdAnchor::Absolute:
         break;
     case OsdAnchor::TopLeft:
-        left = runtime.object.edgeOffsetX;
-        top = runtime.object.edgeOffsetY;
+        left = scaleDesignPixelsLocked(runtime.object.edgeOffsetX, source);
+        top = scaleDesignPixelsLocked(runtime.object.edgeOffsetY, source);
         break;
     case OsdAnchor::TopRight:
-        left = source.width - runtime.object.edgeOffsetX - placement.width;
-        top = runtime.object.edgeOffsetY;
+        left = source.width - scaleDesignPixelsLocked(runtime.object.edgeOffsetX, source) - placement.width;
+        top = scaleDesignPixelsLocked(runtime.object.edgeOffsetY, source);
         break;
     case OsdAnchor::BottomLeft:
-        left = runtime.object.edgeOffsetX;
-        top = source.height - runtime.object.edgeOffsetY - placement.height;
+        left = scaleDesignPixelsLocked(runtime.object.edgeOffsetX, source);
+        top = source.height - scaleDesignPixelsLocked(runtime.object.edgeOffsetY, source) - placement.height;
         break;
     case OsdAnchor::BottomRight:
-        left = source.width - runtime.object.edgeOffsetX - placement.width;
-        top = source.height - runtime.object.edgeOffsetY - placement.height;
+        left = source.width - scaleDesignPixelsLocked(runtime.object.edgeOffsetX, source) - placement.width;
+        top = source.height - scaleDesignPixelsLocked(runtime.object.edgeOffsetY, source) - placement.height;
         break;
     }
     placement.x = alignDown(left, 2);
@@ -366,11 +408,14 @@ bool OsdRenderer::rebuildBandLayoutLocked(const VideoFrame& source)
         return left.order < right.order;
     });
 
+    // 条带合并间距也是设计像素：720p 时 16px 设计间距约为 11px，保持与 1080p
+    // 一致的布局判断，而不是因为分辨率降低意外合并更多文字。
+    const int bandJoinGapPixels = std::max(0, scaleDesignPixelsLocked(kBandJoinGapPixels, source));
     std::vector<OverlayBand> bands;
     for (const LayoutItem& item : items) {
         const int itemBottom = item.placement.y + item.placement.height;
         if (bands.empty() || item.placement.y > bands.back().top + bands.back().height +
-                                                  kBandJoinGapPixels) {
+                                                  bandJoinGapPixels) {
             OverlayBand band;
             band.top = item.placement.y;
             band.height = item.placement.height;
@@ -509,8 +554,8 @@ bool OsdRenderer::renderBandLocked(OverlayBand& band, const VideoFrame& source)
                     static_cast<unsigned>(coverage) * runtime.object.textColor.alpha / 255U);
                 putRgba(pixels,
                         band.frame.stride,
-                        originX + runtime.object.paddingX + x,
-                        originY + runtime.object.paddingY + y,
+                        originX + runtime.pixelPaddingX + x,
+                        originY + runtime.pixelPaddingY + y,
                         runtime.object.textColor.red,
                         runtime.object.textColor.green,
                         runtime.object.textColor.blue,

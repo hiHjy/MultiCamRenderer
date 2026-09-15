@@ -54,6 +54,10 @@ RtspPublishSink::Config makePublishConfig(const std::string& streamName,
 
     config.enableOsd = true;
     config.osdConfig.fontPath = kOsdFontPath;
+    // IPC 的 OSD 样式以主码流 1080p 设计；OsdRenderer 会按实际 VPSS 帧比例自动缩放，
+    // 因而 sub 720p 使用约 2/3 的字号、边距、padding 与检测框线宽。
+    config.osdConfig.designWidth = 1920;
+    config.osdConfig.designHeight = 1080;
     return config;
 }
 

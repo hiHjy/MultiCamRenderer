@@ -29,7 +29,9 @@ enum class OsdAnchor {
     BottomRight,
 };
 
-// 一条可独立更新、独立定位的文字 OSD。
+// 一条可独立更新、独立定位的文字 OSD。除 AI 框坐标外，本结构的所有尺寸/坐标都是
+// OsdRendererConfig::designWidth/designHeight 下的“设计像素”；OsdRenderer 会在首次
+// composite() 得到实际视频尺寸后按比例换算。
 struct OsdTextObject {
     // 全局唯一 id；add/update 均通过它识别对象。
     std::string id;
@@ -58,11 +60,19 @@ struct OsdTextObject {
 struct OsdRectangles {
     std::vector<RgaRect> rectangles;
     RgbaColor color {0, 255, 0, 255}; // 默认不透明绿色。
+    // 线宽是设计像素，会随视频分辨率按比例换算。rectangles 本身必须是 AI 映射回
+    // 当前视频帧后的实际坐标，因此不自动缩放。
     int lineWidth = 4;
 };
 
 struct OsdRendererConfig {
     std::string fontPath;
+
+    // OSD 对象配置时使用的设计分辨率。默认以 1080p UI 设计：在 1280x720 输入上
+    // 所有文字/边距/padding/框线宽约缩为 2/3；实际比例取宽高比例中的较小值，
+    // 避免非同比例视频让 OSD 超出可见区域。
+    int designWidth = 1920;
+    int designHeight = 1080;
 };
 
 // OSD 的职责是“管理文字对象的小 RGBA 图层并调度 RGA”，不是拥有视频输出池：
@@ -129,8 +139,12 @@ private:
     static int alignDown(int value, int alignment);
 
     bool validateTextObject(const OsdTextObject& object);
-    bool openTextRendererLocked(TextObjectRuntime& runtime);
+    bool openTextRendererLocked(TextObjectRuntime& runtime, unsigned pixelHeight);
     bool renderTextLocked(TextObjectRuntime& runtime);
+    double scaleForSourceLocked(const VideoFrame& source) const;
+    int scaleDesignPixelsLocked(int designPixels, const VideoFrame& source) const;
+    bool ensureTextBitmapForSourceLocked(TextObjectRuntime& runtime,
+                                         const VideoFrame& source);
     bool calculatePlacementLocked(TextObjectRuntime& runtime,
                                   const VideoFrame& source,
                                   RgaRect& placement);

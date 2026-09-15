@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -225,6 +226,8 @@ int main(int argc, char* argv[])
     OsdRenderer osd;
     OsdRendererConfig config;
     config.fontPath = fontPath;
+    const double designScale = std::min(static_cast<double>(rgaWidth) / config.designWidth,
+                                        static_cast<double>(rgaHeight) / config.designHeight);
     OsdTextObject cameraNameObject;
     cameraNameObject.id = "cameraName";
     cameraNameObject.text = "CAM-01";
@@ -246,8 +249,10 @@ int main(int argc, char* argv[])
     OsdTextObject centerObject;
     centerObject.id = "centerStatus";
     centerObject.text = "DETECTION";
-    centerObject.left = std::max(24, rgaWidth / 2 - 130);
-    centerObject.top = std::max(160, rgaHeight / 2 - 40);
+    // OsdTextObject 的 left/top 是设计像素。反算成设计坐标后，任意输入图片尺寸下
+    // 都会落在当前图片的中心附近，继续验证它与下面的实际 AI 框重叠。
+    centerObject.left = static_cast<int>(std::lround(std::max(24, rgaWidth / 2 - 130) / designScale));
+    centerObject.top = static_cast<int>(std::lround(std::max(160, rgaHeight / 2 - 40) / designScale));
     centerObject.textPixelHeight = kTextPixelHeight;
     centerObject.textColor = {255, 96, 96, 255};
     if (!osd.initialize(config) ||
