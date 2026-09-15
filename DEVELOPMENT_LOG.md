@@ -2976,14 +2976,14 @@ VPSS NV12 FramePacket
 
 - `FreeTypeTextRenderer`：将单行 UTF-8 文本栅格化为只在 CPU 内存存在的 `TextBitmap`。
   第一版支持常用中英文/数字、基础 kerning；复杂文字连写若未来需要，再在字形排版层接入 HarfBuzz。
-- `OsdRenderer`：拥有两块小 RGBA DMA-BUF。`updateText()` 将新文字写入非活动 buffer，并做
-  `DMA_BUF_IOCTL_SYNC END|WRITE`；RGA 合成时读取活动 buffer。文字每秒更新一次，不会每帧由 CPU
-  重绘全屏 overlay。
+- `OsdRenderer`：初版为单张小 RGBA 文字层；随后在 2026-09-15 重构为多个独立文字对象，并按纵向位置
+  合并为若干全宽小 RGBA 条带（详见该日日志）。CPU 重绘只发生在文字内容或样式变化时，不会每帧重绘
+  全屏 overlay。
 - `OsdRenderer::setRectangles()` 只保存 `std::vector<RgaRect>`，不为框单独申请 DMA-BUF。
   `composite()` 在最终 NV12 上通过 RGA 直接画框；AI 模块未来只负责产出检测框坐标。
 
-第一版固定使用预乘 alpha RGBA 文字层：黑色半透明背景为 `RGB=0,A=160`，白字使用 `R=G=B=A`，
-对应 RGA 的 `IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL`。
+第一版使用普通（非预乘）alpha RGBA 文字层：黑色半透明背景为 `RGB=0,A=160`，白字为
+`RGB=255,A=FreeType 覆盖率`；RGA 使用 `IM_ALPHA_BLEND_DST_OVER` 在合成时按 alpha 混合。
 
 #### `RgaEngine` 扩展
 
@@ -3214,3 +3214,59 @@ sub  H264: 1280x720,  stride=1280x720, bitrate=3456000, gop=30
 日志确认每路均先由首帧补齐 MPP prep 配置，随后 MPP 初始化及 ffmpeg UDP 拉流成功。
 测试结束后已停止临时程序并恢复板端 `/oem/usr/bin/multicam_ipc_app` 旧自启版本；本次提交不覆盖
 板端正式二进制。
+
+### OSD 文字对象、条带合成与检测框层级
+
+OSD 外部接口使用多个 `OsdTextObject`。每个对象以唯一 `id` 识别，`left/top` 是相对视频可见区域左上角的
+绝对像素坐标，`paddingX/paddingY` 是文字到自身半透明背景边缘的间隔。`RgbaColor` 使用普通直观的
+`{red, green, blue, alpha}`；FreeType 的 coverage 仅乘到 alpha，RGB 不预乘，RGA 以
+`IM_ALPHA_BLEND_DST_OVER` 做普通 alpha 混合。
+
+为兼容 RV1126B 当前 RGA 驱动的 RGBA 非零横向 crop 问题，条带的 x 固定为 0、宽固定为整张视频宽；但高度
+只覆盖文字所在的最小纵向范围。首次 `composite()`（或对象的 `top`、纵向 padding、字号变化后）会按对象的
+纵向区间自动分组：重叠或相距不超过 16 像素的对象共用一条带，相隔很远的对象各自一条。文字内容/颜色等普通
+更新只将所属条带标脏并重绘该条带，不重新分组、不重新申请 DMA-BUF。
+
+每帧路径为：
+
+```text
+VPSS NV12 --RGA copy--> 私有 NV12 输出
+每个 RGBA 文字条带 --RGA composite--> 该输出的对应纵向区域
+AI 矩形列表 --RGA drawRectangles--> 同一输出
+MPP 编码
+```
+
+因此文字和检测框重叠时，检测框永远在最上层：框线会压在文字及其背景上。这是当前确定且可预期的图层规则。
+`RgaEngine` 不调用 `imcheck`；封装已在提交 RGA 前完成自身的 frame、矩形、stride 与容量校验，随后直接提交
+RGA 操作，避免额外 SDK 校验落入热路径。
+
+### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+- 两套交叉构建通过。
+- RV1126B `192.168.1.6` 上运行 `freetype_bitmap_demo`，输入 `img/1.png`（1090x783）后成功生成
+  `osd_time.png`。
+- 输出图确认：左上黄色 `CAM-01` 和白色时间属于同一顶部条带；中部 `DETECTION` 属于另一条带；绿色检测框
+  的上边线故意横穿 `DETECTION`，验证“框最后画、覆盖文字”的规则。
+
+### OSD 热路径复核
+
+本次在提交前额外检查了条带更新的性能与状态正确性，并修正两项问题：
+
+- 时间字符串更新不再重复 `FT_New_Face()` 打开字体。只有 `textPixelHeight` 变化才重新打开字体；普通文字变化
+  仅调用 `renderText()` 重建 CPU `TextBitmap`。
+- 文字长度、`left` 或 `paddingX` 变化时，不再错误沿用旧的对象矩形。该对象会在所属条带下次重绘前重新计算横向
+  placement；只有 `top`、纵向 padding、字号或 bitmap 高度变化才重新分组。
+
+常态 IPC OSD 的成本为：每帧一次 NV12 底图 copy、每个纵向条带一次 RGA composite、最后一次 RGA 框绘制。
+CPU 写 RGBA 与 DMA cache sync 只发生在文字更新时（当前时钟为每秒一次），没有每帧字体加载、DMA-BUF 申请或
+对象分组。若未来将很多文字放到相距很远的纵向位置，会相应增加条带和 RGA composite 次数；顶部/底部等少量
+条带是推荐布局。
+
+再次在 RV1126B 运行 demo，并模拟将时间更新为更长的 `"... UTC"` 文本，确认同条带内对象重算 placement 后
+没有裁剪或错位；`imcheck` 已从项目 RGA 封装的所有热路径中完全移除。

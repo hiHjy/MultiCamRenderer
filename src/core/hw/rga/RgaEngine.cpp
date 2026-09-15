@@ -89,11 +89,6 @@ bool RgaEngine::rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& 
             setError("RGA 色彩转换不支持 crop/旋转/镜像/缩放");
             return false;
         }
-        const IM_STATUS check = imcheck(srcBuffer, dstBuffer, {}, {});
-        if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
-            setError(std::string("RGA 色彩转换 imcheck 失败: ") + imStrError(check));
-            return false;
-        }
         const IM_STATUS status = imcvtcolor(srcBuffer, dstBuffer, srcFormat, dstFormat);
         if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
             setError(std::string("RGA 色彩转换失败: ") + imStrError(status));
@@ -126,14 +121,6 @@ bool RgaEngine::rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& 
     rga_buffer_t patBuffer {};
 
     const int usage = IM_SYNC | transformUsage(op);
-    IM_STATUS check = imcheck(srcBuffer, dstBuffer, srcRect, dstRect, usage);
-    if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
-        std::ostringstream oss;
-        oss << "RGA imcheck 失败: " << imStrError(check);
-        setError(oss.str());
-        return false;
-    }
-
     IM_STATUS status = improcess(srcBuffer,
                                  dstBuffer,
                                  patBuffer,
@@ -177,8 +164,8 @@ bool RgaEngine::composite(const VideoFrame& source,
                           VideoFrame& destination,
                           const RgaOperation& op)
 {
-    // OSD 第一版只走最明确、已在 RV1126B SDK alpha_yuv_demo 验证过的路径：
-    // NV12 视频源 + 预乘 alpha RGBA 小 overlay -> 独立 NV12 输出。
+    // OSD 只走已在 RV1126B SDK alpha_yuv_demo 验证过的路径：
+    // NV12 视频源 + 普通 alpha RGBA 小 overlay -> 独立 NV12 输出。
     if (source.format != PixelFormat::NV12 || destination.format != PixelFormat::NV12 ||
         overlay.format != PixelFormat::RGBA8888) {
         setError("RGA OSD 合成仅支持 NV12 视频 + RGBA8888 overlay -> NV12 输出");
@@ -261,19 +248,8 @@ bool RgaEngine::composite(const VideoFrame& source,
         destinationRect.height,
     };
 
-    const int usage = IM_SYNC | IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL;
-    const IM_STATUS check = imcheck_composite(sourceBuffer,
-                                               destinationBuffer,
-                                               overlayBuffer,
-                                               sourceImRect,
-                                               destinationImRect,
-                                               overlayImRect,
-                                               usage);
-    if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
-        setError(std::string("RGA OSD 合成 imcheck 失败: ") + imStrError(check));
-        return false;
-    }
-
+    // overlay 是普通 RGBA，RGA 在合成时按 alpha 对 RGB 做乘法；不能加 PRE_MUL。
+    const int usage = IM_SYNC | IM_ALPHA_BLEND_DST_OVER;
     const IM_STATUS status = improcess(sourceBuffer,
                                        destinationBuffer,
                                        overlayBuffer,

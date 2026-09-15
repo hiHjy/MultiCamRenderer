@@ -84,7 +84,7 @@ public:
     bool resize(const VideoFrame& src, VideoFrame& dst);
     bool convertColor(const VideoFrame& src, VideoFrame& dst);
 
-    // 在已经填好视频底图的 destination 上，合成一块预乘 alpha 的 RGBA overlay。
+    // 在已经填好视频底图的 destination 上，合成一块普通（非预乘）alpha 的 RGBA overlay。
     // 调用者通常先 copy(source, destination)，再调本函数；本函数只写
     // compositeDestination 那一小块，不会复制其余视频区域。
     bool composite(const VideoFrame& source,

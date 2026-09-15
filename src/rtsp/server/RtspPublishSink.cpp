@@ -136,7 +136,6 @@ std::string RtspPublishSink::lastError() const
 void RtspPublishSink::workerMain()
 {
     MppEncoder encoder;
-    RgaEngine rga;
     OsdRenderer osd;
     DmaAllocator osdOutputAllocator;
     DmaMemory osdOutputMemory;
@@ -158,6 +157,7 @@ void RtspPublishSink::workerMain()
                 break;
         }
 
+        OsdTextObject timeTextObject;
         if (m_config.enableOsd) {
             if (!osd.initialize(m_config.osdConfig)) {
                 const std::string error = osd.lastError();
@@ -171,11 +171,38 @@ void RtspPublishSink::workerMain()
                                                            << " 初始化 OSD 失败: " << error);
                 continue;
             }
-            lastOsdTime.clear();
+
+            const std::string currentOsdTime = formatOsdLocalTime();
+            OsdTextObject streamNameText;
+            streamNameText.id = "streamName";
+            streamNameText.text = m_config.streamName;
+            streamNameText.left = 24;
+            streamNameText.top = 24;
+            streamNameText.textColor = {255, 165, 0, 255};
+
+            timeTextObject.id = "time";
+            timeTextObject.text = currentOsdTime;
+            // 第一版 IPC OSD 使用直接坐标。两条文字纵向相邻，会自动归入同一条顶部条带；
+            // 后面要把时间摆到任意位置，只改这里的 left/top，不需要改 OSD 内部逻辑。
+            timeTextObject.left = 24;
+            timeTextObject.top = 96;
+
+            if (!osd.addTextObject(std::move(streamNameText)) ||
+                !osd.addTextObject(timeTextObject)) {
+                const std::string error = osd.lastError();
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_activeRequested = false;
+                    m_acceptingFrames = false;
+                    setErrorLocked("创建 OSD 文字对象失败: " + error);
+                }
+                LOG_ERROR("RtspPublishSink", "stream=" << m_config.streamName
+                                                           << " 创建 OSD 文字对象失败: " << error);
+                continue;
+            }
+            lastOsdTime = currentOsdTime;
             LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
-                                                      << " OSD 已启动，等待第一张 VPSS 帧确定输出 layout，文字层="
-                                                      << m_config.osdConfig.overlayWidth << "x"
-                                                      << m_config.osdConfig.overlayHeight);
+                                                      << " OSD 已启动，文字对象=streamName,time");
         }
 
         bool shouldEncode = false;
@@ -250,7 +277,8 @@ void RtspPublishSink::workerMain()
 
                 const std::string currentOsdTime = formatOsdLocalTime();
                 if (currentOsdTime != lastOsdTime) {
-                    if (!osd.updateText(m_config.streamName + "  " + currentOsdTime)) {
+                    timeTextObject.text = currentOsdTime;
+                    if (!osd.updateTextObject(timeTextObject)) {
                         const std::string error = osd.lastError();
                         {
                             std::lock_guard<std::mutex> lock(m_mutex);
@@ -262,7 +290,7 @@ void RtspPublishSink::workerMain()
                     }
                     lastOsdTime = currentOsdTime;
                 }
-                if (!osd.composite(packet.frame, osdOutputFrame, rga)) {
+                if (!osd.composite(packet.frame, osdOutputFrame)) {
                     const std::string error = osd.lastError();
                     {
                         std::lock_guard<std::mutex> lock(m_mutex);

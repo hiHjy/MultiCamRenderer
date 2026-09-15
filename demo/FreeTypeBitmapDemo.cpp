@@ -9,7 +9,7 @@
 //   -> RGA NV12 -> RGBA -> osd_time.png
 //
 // OsdRenderer 内部会：
-//   1. FreeType 把当前时间写入“小 RGBA DMA-BUF”双缓冲；
+//   1. FreeType 把文字写入按纵向范围分组的“小 RGBA DMA-BUF 条带”；
 //   2. RGA copy 原始 NV12 到独立输出 NV12；
 //   3. RGA 将小 RGBA 文字层贴到输出；
 //   4. RGA 在输出 NV12 上直接画一只模拟检测框。
@@ -117,7 +117,7 @@ std::string formatCurrentLocalTime()
 
     char text[32] {};
     std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &localTime);
-    return "CAM-01  " + std::string(text);
+    return std::string(text);
 }
 
 VideoFrame makeFrame(const DmaMemory& memory,
@@ -225,24 +225,58 @@ int main(int argc, char* argv[])
     OsdRenderer osd;
     OsdRendererConfig config;
     config.fontPath = fontPath;
-    config.textPixelHeight = kTextPixelHeight;
-    config.overlayWidth = 768;
-    config.overlayHeight = 96;
-    config.overlayLeft = 24;
-    config.overlayTop = 24;
-    if (!osd.initialize(config) || !osd.updateText(timeText)) {
+    OsdTextObject cameraNameObject;
+    cameraNameObject.id = "cameraName";
+    cameraNameObject.text = "CAM-01";
+    cameraNameObject.textColor = {255, 220, 64, 255};
+    cameraNameObject.left = 24;
+    cameraNameObject.top = 24;
+    cameraNameObject.textPixelHeight = kTextPixelHeight;
+
+    OsdTextObject timeObject;
+    timeObject.id = "time";
+    timeObject.text = timeText;
+    // 与 cameraName 同一纵向范围，验证两对象会被合入一条顶部 RGBA 条带。
+    timeObject.left = std::max(24, std::min(360, rgaWidth - 480));
+    timeObject.top = 24;
+    timeObject.textPixelHeight = kTextPixelHeight;
+    timeObject.textColor = {255, 255, 255, 255};
+
+    OsdTextObject centerObject;
+    centerObject.id = "centerStatus";
+    centerObject.text = "DETECTION";
+    centerObject.left = std::max(24, rgaWidth / 2 - 130);
+    centerObject.top = std::max(160, rgaHeight / 2 - 40);
+    centerObject.textPixelHeight = kTextPixelHeight;
+    centerObject.textColor = {255, 96, 96, 255};
+    if (!osd.initialize(config) ||
+        !osd.addTextObject(std::move(cameraNameObject)) ||
+        !osd.addTextObject(timeObject) ||
+        !osd.addTextObject(std::move(centerObject))) {
+        std::cerr << osd.lastError() << '\n';
+        return 1;
+    }
+
+    // 模拟实际 IPC 每秒更新时钟：文字宽度变化，但对象仍处在原顶部条带内。
+    // 这条更新会重新栅格化字形、只重绘 time 所属条带，不会重开字体或重新分组。
+    timeObject.text += " UTC";
+    if (!osd.updateTextObject(timeObject)) {
         std::cerr << osd.lastError() << '\n';
         return 1;
     }
 
     // 模拟一条 AI 检测结果。它只是坐标列表，OsdRenderer 在最终 NV12 输出上直接画。
     OsdRectangles simulatedDetection;
-    simulatedDetection.rectangles.push_back({rgaWidth / 2 - 160, 180, 320, 360});
-    simulatedDetection.color = 0xFF00FF00;
+    // 故意压住中间文字：框最后画，因此最终 PNG 中绿色框线会覆盖文字/半透明背景。
+    simulatedDetection.rectangles.push_back({rgaWidth / 2 - 180,
+                                              std::max(140, rgaHeight / 2),
+                                              360,
+                                              120});
+    simulatedDetection.color = {0, 255, 0, 255};
     simulatedDetection.lineWidth = 4;
     osd.setRectangles(std::move(simulatedDetection));
 
-    if (!osd.composite(sourceNv12Frame, outputNv12Frame, rga)) {
+    if (!osd.composite(sourceNv12Frame, outputNv12Frame)) {
         std::cerr << osd.lastError() << '\n';
         return 1;
     }
@@ -267,7 +301,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::cout << "OSD 已完成：小 RGBA 时间文字 + NV12 检测框，输出: "
+    std::cout << "OSD 已完成：多条 RGBA 文字条带 + 与文字重叠的 NV12 检测框，输出: "
               << kOutputFileName << '\n';
     return 0;
 }

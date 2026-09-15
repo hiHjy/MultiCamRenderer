@@ -54,13 +54,6 @@ RtspPublishSink::Config makePublishConfig(const std::string& streamName,
 
     config.enableOsd = true;
     config.osdConfig.fontPath = kOsdFontPath;
-    config.osdConfig.textPixelHeight = 48;
-    // 当前 main=1920x1080、sub=1280x720 都能容纳 24 + 768 的文字层。
-    // 这里是小 RGBA canvas，并非整张视频；双缓冲合计仅约 576 KiB/路。
-    config.osdConfig.overlayWidth = 768;
-    config.osdConfig.overlayHeight = 96;
-    config.osdConfig.overlayLeft = 24;
-    config.osdConfig.overlayTop = 24;
     return config;
 }
 
