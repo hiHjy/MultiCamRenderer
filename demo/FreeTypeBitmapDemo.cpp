@@ -236,9 +236,10 @@ int main(int argc, char* argv[])
     OsdTextObject timeObject;
     timeObject.id = "time";
     timeObject.text = timeText;
-    // 与 cameraName 同一纵向范围，验证两对象会被合入一条顶部 RGBA 条带。
-    timeObject.left = std::max(24, std::min(360, rgaWidth - 480));
-    timeObject.top = 24;
+    // 验证上层不需要知道图片宽度：OsdRenderer 用实际 VideoFrame/bitmap 尺寸计算右上位置。
+    timeObject.anchor = OsdAnchor::TopRight;
+    timeObject.edgeOffsetX = 24;
+    timeObject.edgeOffsetY = 24;
     timeObject.textPixelHeight = kTextPixelHeight;
     timeObject.textColor = {255, 255, 255, 255};
 

@@ -116,9 +116,11 @@ bool OsdRenderer::updateTextObject(OsdTextObject object)
         return false;
     }
 
-    // 每条带始终覆盖视频全宽。只有纵向范围变化才需要重新分组；left、文字宽度、
+    // 每条带始终覆盖视频全宽。只有纵向范围变化才需要重新分组；横向位置、文字宽度、
     // 颜色和背景只会让当前条带重绘。
-    const bool layoutChanged = previous.top != runtime.object.top ||
+    const bool layoutChanged = previous.anchor != runtime.object.anchor ||
+                               previous.top != runtime.object.top ||
+                               previous.edgeOffsetY != runtime.object.edgeOffsetY ||
                                previous.paddingY != runtime.object.paddingY ||
                                previous.textPixelHeight != runtime.object.textPixelHeight ||
                                oldBitmapHeight != runtime.bitmap.height;
@@ -126,9 +128,10 @@ bool OsdRenderer::updateTextObject(OsdTextObject object)
         runtime.placementDirty = true;
         m_bandLayoutDirty = true;
     } else {
-        // 文字宽度、left 或 paddingX 虽然不影响条带的纵向分组，但会改变它在所属
+        // 文字宽度、横向位置或 paddingX 虽然不影响条带的纵向分组，但会改变它在所属
         // 条带里的实际矩形；下一次重绘该条带前重新计算一次即可。
         runtime.placementDirty = textChanged || previous.left != runtime.object.left ||
+                                 previous.edgeOffsetX != runtime.object.edgeOffsetX ||
                                  previous.paddingX != runtime.object.paddingX;
         markObjectBandDirtyLocked(runtime);
     }
@@ -255,8 +258,9 @@ int OsdRenderer::alignDown(int value, int alignment)
 bool OsdRenderer::validateTextObject(const OsdTextObject& object)
 {
     if (object.id.empty() || object.text.empty() || object.textPixelHeight == 0 ||
-        object.left < 0 || object.top < 0 || object.paddingX < 0 || object.paddingY < 0) {
-        setError("OSD 文字对象配置无效：id/文字/字号/left/top/padding 不合法");
+        object.left < 0 || object.top < 0 || object.edgeOffsetX < 0 || object.edgeOffsetY < 0 ||
+        object.paddingX < 0 || object.paddingY < 0) {
+        setError("OSD 文字对象配置无效：id/文字/字号/坐标/padding 不合法");
         return false;
     }
     return true;
@@ -293,10 +297,32 @@ bool OsdRenderer::calculatePlacementLocked(TextObjectRuntime& runtime,
 
     // NV12 的合成目标必须偶数对齐。文字对象的 left/top 可以是普通像素坐标，实际 RGA
     // 目标向左/上取偶数；文字内容与背景随之整体移动至这个硬件可接受的位置。
-    placement.x = alignDown(runtime.object.left, 2);
-    placement.y = alignDown(runtime.object.top, 2);
     placement.width = alignUp(runtime.bitmap.width + runtime.object.paddingX * 2, 16);
     placement.height = alignUp(runtime.bitmap.height + runtime.object.paddingY * 2, 2);
+    int left = runtime.object.left;
+    int top = runtime.object.top;
+    switch (runtime.object.anchor) {
+    case OsdAnchor::Absolute:
+        break;
+    case OsdAnchor::TopLeft:
+        left = runtime.object.edgeOffsetX;
+        top = runtime.object.edgeOffsetY;
+        break;
+    case OsdAnchor::TopRight:
+        left = source.width - runtime.object.edgeOffsetX - placement.width;
+        top = runtime.object.edgeOffsetY;
+        break;
+    case OsdAnchor::BottomLeft:
+        left = runtime.object.edgeOffsetX;
+        top = source.height - runtime.object.edgeOffsetY - placement.height;
+        break;
+    case OsdAnchor::BottomRight:
+        left = source.width - runtime.object.edgeOffsetX - placement.width;
+        top = source.height - runtime.object.edgeOffsetY - placement.height;
+        break;
+    }
+    placement.x = alignDown(left, 2);
+    placement.y = alignDown(top, 2);
     if (placement.width <= 0 || placement.height <= 0 || placement.x < 0 || placement.y < 0 ||
         placement.x + placement.width > source.width ||
         placement.y + placement.height > source.height) {

@@ -182,10 +182,11 @@ void RtspPublishSink::workerMain()
 
             timeTextObject.id = "time";
             timeTextObject.text = currentOsdTime;
-            // 第一版 IPC OSD 使用直接坐标。两条文字纵向相邻，会自动归入同一条顶部条带；
-            // 后面要把时间摆到任意位置，只改这里的 left/top，不需要改 OSD 内部逻辑。
-            timeTextObject.left = 24;
-            timeTextObject.top = 96;
+            // 这里还没有 VideoFrame；右上定位由 OsdRenderer 在首次 composite() 取得
+            // 实际视频宽高与文字宽度后计算，分辨率变化时也会自动保持右上角。
+            timeTextObject.anchor = OsdAnchor::TopRight;
+            timeTextObject.edgeOffsetX = 24;
+            timeTextObject.edgeOffsetY = 24;
 
             if (!osd.addTextObject(std::move(streamNameText)) ||
                 !osd.addTextObject(timeTextObject)) {

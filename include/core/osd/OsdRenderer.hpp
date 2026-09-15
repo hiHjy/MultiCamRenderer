@@ -19,16 +19,32 @@ struct RgbaColor {
     uint8_t alpha = 255;
 };
 
+// Absolute 使用 OsdTextObject::left/top；其余值使用 edgeOffsetX/edgeOffsetY，
+// 由 OsdRenderer 在拿到视频尺寸和文字 bitmap 尺寸后计算最终坐标。
+enum class OsdAnchor {
+    Absolute,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+};
+
 // 一条可独立更新、独立定位的文字 OSD。
 struct OsdTextObject {
     // 全局唯一 id；add/update 均通过它识别对象。
     std::string id;
     std::string text;
 
-    // 文字背景框相对视频可见区域左上角的绝对坐标，单位像素。
+    // Absolute 模式：文字背景框相对视频可见区域左上角的绝对坐标，单位像素。
     // left/top 不是 stride 坐标；它们始终以 VideoFrame::width/height 为基准。
     int left = 24;
     int top = 24;
+
+    // 边缘锚点模式：例如 TopRight + {24, 24} 表示距右边、上边各 24 像素。
+    // 上层不需要知道视频宽高；最终 left/top 由 OsdRenderer 在 composite() 中计算。
+    OsdAnchor anchor = OsdAnchor::Absolute;
+    int edgeOffsetX = 24;
+    int edgeOffsetY = 24;
 
     unsigned textPixelHeight = 48;
     int paddingX = 16;

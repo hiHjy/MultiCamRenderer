@@ -3217,8 +3217,10 @@ sub  H264: 1280x720,  stride=1280x720, bitrate=3456000, gop=30
 
 ### OSD 文字对象、条带合成与检测框层级
 
-OSD 外部接口使用多个 `OsdTextObject`。每个对象以唯一 `id` 识别，`left/top` 是相对视频可见区域左上角的
-绝对像素坐标，`paddingX/paddingY` 是文字到自身半透明背景边缘的间隔。`RgbaColor` 使用普通直观的
+OSD 外部接口使用多个 `OsdTextObject`。每个对象以唯一 `id` 识别；`anchor=Absolute` 时使用相对视频可见区域
+左上角的绝对 `left/top`，`TopRight` 等边缘锚点则使用 `edgeOffsetX/Y`。边缘锚点的最终坐标由
+`OsdRenderer` 在 `composite()` 获取实际视频和文字 bitmap 尺寸后计算，所以上层不必预先知道分辨率。
+`paddingX/paddingY` 是文字到自身半透明背景边缘的间隔。`RgbaColor` 使用普通直观的
 `{red, green, blue, alpha}`；FreeType 的 coverage 仅乘到 alpha，RGB 不预乘，RGA 以
 `IM_ALPHA_BLEND_DST_OVER` 做普通 alpha 混合。
 
@@ -3270,3 +3272,7 @@ CPU 写 RGBA 与 DMA cache sync 只发生在文字更新时（当前时钟为每
 
 再次在 RV1126B 运行 demo，并模拟将时间更新为更长的 `"... UTC"` 文本，确认同条带内对象重算 placement 后
 没有裁剪或错位；`imcheck` 已从项目 RGA 封装的所有热路径中完全移除。
+
+随后补充 `OsdAnchor`：除 `Absolute` 的 `left/top` 外，`TopRight` 等锚点使用 `edgeOffsetX/Y`。这使
+`RtspPublishSink` 创建对象时不需要预先取得 VPSS 帧尺寸；`OsdRenderer` 在首次合成时按真实视频宽高和当前
+文字宽度计算最终位置。RV1126B demo 已用右上角的加长 `"... UTC"` 时间文本验证，右边保持 24 像素间距。
