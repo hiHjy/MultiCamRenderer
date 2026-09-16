@@ -79,7 +79,8 @@ struct MppEncoder::Impl {
         const int gop = cfg.gop > 0 ? cfg.gop : fps;
 
         LOG_INFO("MppEncoder", "初始化 MPP 编码器 codec=" << mppCodecName(cfg.codec)
-                                 << " input=NV12 " << cfg.width << "x" << cfg.height
+                                 << " input=NV12 "
+                                 << cfg.width << "x" << cfg.height
                                  << " stride=" << stride << "x" << heightStride
                                  << " fps=" << fps
                                  << " bitratePreset=" << bitratePresetName(cfg.bitratePreset)
@@ -189,6 +190,10 @@ private:
             setError("MppEncoder 第一版只支持 H264/H265");
             return false;
         }
+        if (toMppCoding(cfg.codec) == MPP_VIDEO_CodingUnused) {
+            setError("MppEncoder 编码类型无法映射到 MPP");
+            return false;
+        }
         if (cfg.inputFormat != PixelFormat::NV12) {
             setError("MppEncoder 第一版只接受 NV12，其他格式请先用 RGA 转换");
             return false;
@@ -205,9 +210,8 @@ private:
             setError("MppEncoder heightStride 不能小于 height");
             return false;
         }
-        if (toMppCoding(cfg.codec) == MPP_VIDEO_CodingUnused ||
-            toMppFrameFormat(cfg.inputFormat) == MPP_FMT_BUTT) {
-            setError("MppEncoder 配置无法映射到 MPP");
+        if (toMppFrameFormat(cfg.inputFormat) == MPP_FMT_BUTT) {
+            setError("MppEncoder 输入格式无法映射到 MPP");
             return false;
         }
         return true;
@@ -219,15 +223,15 @@ private:
             setError("MppEncoder 输入帧 dmaFd 无效");
             return false;
         }
-        if (frame.format != PixelFormat::NV12) {
-            setError("MppEncoder 输入帧必须是 NV12");
+        if (frame.format != config.inputFormat) {
+            setError("MppEncoder 输入帧格式和初始化配置不一致");
             return false;
         }
         if (frame.width != config.width || frame.height != config.height ||
             videoFrameEffectiveStride(frame) != (config.stride > 0 ? config.stride : config.width) ||
             videoFrameEffectiveHeightStride(frame) != (config.heightStride > 0 ? config.heightStride : config.height)) {
             std::ostringstream oss;
-            oss << "MppEncoder 输入帧几何和初始化配置不一致: frame="
+            oss << "MppEncoder 输入帧 layout 和初始化配置不一致: frame="
                 << frame.width << "x" << frame.height
                 << " stride=" << videoFrameEffectiveStride(frame) << "x"
                 << videoFrameEffectiveHeightStride(frame)

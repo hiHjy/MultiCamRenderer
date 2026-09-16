@@ -9,7 +9,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,6 +16,7 @@
 #include <unordered_map>
 
 class AnnexBFrameQueue;
+class RtspPublishSink;
 
 // 一个端口上的多路 RTSP 发布服务。
 // 调用方先 addStream() 注册所有 URL，再调用一次 start()；运行中不支持增删 URL。
@@ -26,13 +26,6 @@ public:
     struct StreamConfig {
         std::string streamName;
         VideoCodec codec = VideoCodec::H264;
-        // 仅在已 PLAY 客户端数发生 0->1 或 1->0 变化时调用。
-        // 回调运行在 live555 事件线程；应只投递轻量控制命令，不能阻塞。
-        std::function<void(bool active)> onClientActiveChanged;
-        // 仅在已有客户端播放时，又有一个新客户端完成 PLAY 时调用。
-        // 典型用途是请求编码器下一帧 IDR，让新客户端立即获得可解码边界。
-        // 回调运行在 live555 事件线程；不得直接操作 MPP。
-        std::function<void()> onAdditionalClientStarted;
     };
 
     Live555RtspServer();
@@ -42,7 +35,8 @@ public:
     Live555RtspServer& operator=(const Live555RtspServer&) = delete;
 
     // 仅允许 start() 前调用。streamName 同时作为 RTSP URL path，例如 "main" -> /main。
-    bool addStream(const StreamConfig& config);
+    // Server 对 publishSink 只保留弱引用；IpcApp 仍负责持有 Sink 的实际生命周期。
+    bool addStream(const StreamConfig& config, const std::shared_ptr<RtspPublishSink>& publishSink);
 
     // 用户名和密码按端口生效，所有已注册 URL 共用。
     bool start(unsigned short rtspPort, const std::string& username, const std::string& password);
@@ -64,9 +58,10 @@ public:
 private:
     // 每个 URL 的运行时状态。它不拥有 ServerMediaSession；session 由 m_server 接管。
     struct RtspPublishStream {
-        explicit RtspPublishStream(StreamConfig streamConfig);
+        RtspPublishStream(StreamConfig streamConfig, std::weak_ptr<RtspPublishSink> streamPublishSink);
 
         StreamConfig config;
+        std::weak_ptr<RtspPublishSink> publishSink;
         std::shared_ptr<AnnexBFrameQueue> frameQueue;
         mutable std::mutex clientStateMutex;
         unsigned activeClientCount = 0;

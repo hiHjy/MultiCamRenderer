@@ -5,6 +5,9 @@ project(MultiCamRenderer LANGUAGES C CXX)
 option(MCR_BUILD_DEMOS "构建非 Qt 的 demo 与 DRM demo" ON)
 option(MCR_BUILD_QT "构建 Qt 应用与 Qt/RGA demo" OFF)
 option(MCR_BUILD_IPC_APP "构建 RV1126B IPC 双路 RTSP 应用" OFF)
+# FreeType 目前只用于 OSD 的独立学习 demo。它依赖 RV1126B media_out 提供的动态库，
+# 因此不默认开启，避免没有 FreeType 的 RK3568 sysroot 受到影响。
+option(MCR_BUILD_FREETYPE_BITMAP_DEMO "构建 FreeType 字形 bitmap demo" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -33,6 +36,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/memory"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/codec"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -119,6 +123,47 @@ function(mcr_link_live555 target)
     )
 endfunction()
 
+# FreeType 的头文件固定随项目放在 third_party；动态库随 RV1126B SDK 的 media_out 发布。
+# 以后 core/osd 接入时仍复用这个函数，不把 SDK 路径散落到业务 CMake 中。
+function(mcr_link_freetype target)
+    set(mcr_freetype_include_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/freetype/include")
+    if(NOT EXISTS "${mcr_freetype_include_dir}/ft2build.h")
+        message(FATAL_ERROR "缺少项目内 FreeType 头文件: ${mcr_freetype_include_dir}/ft2build.h")
+    endif()
+
+    if(MCR_MEDIA_ROOT)
+        set(mcr_freetype_library "${MCR_MEDIA_ROOT}/lib/libfreetype.so")
+        if(NOT EXISTS "${mcr_freetype_library}")
+            message(FATAL_ERROR "MCR_MEDIA_ROOT 缺少 FreeType 动态库: ${mcr_freetype_library}")
+        endif()
+    else()
+        # 保留非 RV1126B 平台的可用性；当前 RK3568 sysroot 没有该库，所以仅在显式
+        # 开启此 demo 时才会走到这里并清晰报错。
+        find_library(mcr_freetype_library NAMES freetype REQUIRED)
+    endif()
+
+    target_include_directories(${target} PRIVATE "${mcr_freetype_include_dir}")
+    target_link_libraries(${target} PRIVATE "${mcr_freetype_library}")
+endfunction()
+
+function(mcr_link_png target)
+    if(MCR_MEDIA_ROOT)
+        set(mcr_png_library "${MCR_MEDIA_ROOT}/lib/libpng.so")
+        set(mcr_zlib_library "${MCR_MEDIA_ROOT}/lib/libz.so")
+        if(NOT EXISTS "${mcr_png_library}")
+            message(FATAL_ERROR "MCR_MEDIA_ROOT 缺少 libpng 动态库: ${mcr_png_library}")
+        endif()
+        if(NOT EXISTS "${mcr_zlib_library}")
+            message(FATAL_ERROR "MCR_MEDIA_ROOT 缺少 libz 动态库: ${mcr_zlib_library}")
+        endif()
+    else()
+        find_library(mcr_png_library NAMES png png16 REQUIRED)
+        find_library(mcr_zlib_library NAMES z REQUIRED)
+    endif()
+    # libpng 的 SDK 动态库没有把 zlib 作为可自动传递的链接依赖，显式写出。
+    target_link_libraries(${target} PRIVATE "${mcr_png_library}" "${mcr_zlib_library}")
+endfunction()
+
 # 项目自己的 RTSP 发布服务。一个 Server 可在同一 live555 event-loop 中注册多路
 # ServerMediaSession，不会为每一路复制端口或事件线程。
 set(MCR_RTSP_SERVER_SOURCES
@@ -136,6 +181,9 @@ target_include_directories(mcr_rtsp_server
         "${MCR_LIVE555_ROOT}/include/groupsock"
         "${MCR_LIVE555_ROOT}/include/BasicUsageEnvironment"
         "${MCR_LIVE555_ROOT}/include/UsageEnvironment"
+        "${MCR_MPP_INCLUDE_DIR}"
+        "${MCR_RGA_INCLUDE_DIR}"
+        "${MCR_MEDIA_COMMON_INCLUDE_DIR}"
 )
 target_compile_options(mcr_rtsp_server PRIVATE -Wall -Wextra)
 mcr_link_live555(mcr_rtsp_server)
@@ -172,12 +220,16 @@ if(MCR_BUILD_IPC_APP)
         src/core/memory/DmaBufferPool.cpp
         src/core/common/FrameHub.cpp
         src/core/cam/V4L2CameraSource.cpp
+        src/core/osd/FreeTypeTextRenderer.cpp
+        src/core/osd/OsdRenderer.cpp
         src/core/hw/codec/MppEncoder.cpp
+        src/core/hw/rga/RgaEngine.cpp
         ${MCR_MPP_DECODER_SOURCES}
     )
     target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
     target_include_directories(ipc_app PRIVATE "${MCR_RKAIQ_INCLUDE_DIR}")
     target_link_libraries(ipc_app PRIVATE "${MCR_RKAIQ_LIBRARY}")
+    mcr_link_freetype(ipc_app)
     mcr_link_media(ipc_app)
     mcr_link_live555(ipc_app)
     # RV1126B 量产 rootfs 将 Rockchip 媒体运行库部署在此目录；交叉 SDK 中的
@@ -330,6 +382,28 @@ if(MCR_BUILD_DEMOS)
     )
     mcr_link_media(rtsp_drm_sink_demo)
     mcr_link_live555(rtsp_drm_sink_demo)
+endif()
+
+if(MCR_BUILD_FREETYPE_BITMAP_DEMO)
+    # 独立验证 OSD 的完整路径：FreeType 小 RGBA DMA-BUF -> RGA 合成/画框 -> PNG。
+    # 后续 RtspPublishSink 只复用 core/osd，不再散落原生 RGA 调用。
+    mcr_add_executable(freetype_bitmap_demo
+        demo/FreeTypeBitmapDemo.cpp
+        src/core/osd/FreeTypeTextRenderer.cpp
+        src/core/osd/OsdRenderer.cpp
+        src/core/common/VideoFrame.cpp
+        src/core/memory/DmaAllocator.cpp
+        src/core/hw/rga/RgaEngine.cpp
+    )
+    mcr_link_freetype(freetype_bitmap_demo)
+    mcr_link_png(freetype_bitmap_demo)
+    mcr_link_media(freetype_bitmap_demo)
+    if(MCR_MEDIA_ROOT)
+        set_target_properties(freetype_bitmap_demo PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "/oem/usr/lib"
+        )
+    endif()
 endif()
 
 if(MCR_BUILD_QT)

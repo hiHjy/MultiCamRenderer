@@ -2951,6 +2951,109 @@ RK3568 非 Qt aarch64 demo 全量交叉构建通过；`cam_recovery_stress_demo`
 
 ## 2026-09-14
 
+### RV1126B IPC 编码前 OSD：FreeType + RGA + MPP + RTSP
+
+本次将 OSD 作为 **IPC 推流链中 MPP 编码之前的一步** 接入，而不是作为 RTSP 客户端或
+播放器的叠加效果。这样所有 RTSP 客户端、录像文件和后续外网转发看到的是同一份已叠字码流。
+
+最终主路径：
+
+```text
+VPSS NV12 FramePacket
+  -> RtspPublishSink 编码 worker
+  -> RGA copy 到本路私有 NV12 DMA-BUF
+  -> OsdRenderer 合成小 RGBA 时间文字层
+  -> RGA 在最终 NV12 上直接画 AI 检测框（AI 接入后使用）
+  -> MPP H264/H265 编码
+  -> Live555RtspServer
+```
+
+`RtspPublishSink` 仍然只保留“最新待编码帧”这一条队列。OSD 输出不需要再建裸帧队列或
+`DmaBufferPool`：每路只有一个编码 worker，`MppEncoder::sendFrame()` 同步返回后输入 DMA-BUF
+已经不再被 MPP 使用，因此一块私有 NV12 输出 DMA-BUF 可以安全循环复用。
+
+#### 新增 `core/osd`
+
+- `FreeTypeTextRenderer`：将单行 UTF-8 文本栅格化为只在 CPU 内存存在的 `TextBitmap`。
+  第一版支持常用中英文/数字、基础 kerning；复杂文字连写若未来需要，再在字形排版层接入 HarfBuzz。
+- `OsdRenderer`：初版为单张小 RGBA 文字层；随后在 2026-09-15 重构为多个独立文字对象，并按纵向位置
+  合并为若干全宽小 RGBA 条带（详见该日日志）。CPU 重绘只发生在文字内容或样式变化时，不会每帧重绘
+  全屏 overlay。
+- `OsdRenderer::setRectangles()` 只保存 `std::vector<RgaRect>`，不为框单独申请 DMA-BUF。
+  `composite()` 在最终 NV12 上通过 RGA 直接画框；AI 模块未来只负责产出检测框坐标。
+
+第一版使用普通（非预乘）alpha RGBA 文字层：黑色半透明背景为 `RGB=0,A=160`，白字为
+`RGB=255,A=FreeType 覆盖率`；RGA 使用 `IM_ALPHA_BLEND_DST_OVER` 在合成时按 alpha 混合。
+
+#### `RgaEngine` 扩展
+
+`RgaOperation` 新增 overlay 裁剪/目标矩形和统一框样式字段；`RgaEngine` 新增：
+
+```cpp
+bool convertColor(const VideoFrame& src, VideoFrame& dst);
+bool composite(const VideoFrame& source,
+               const VideoFrame& overlay,
+               VideoFrame& destination,
+               const RgaOperation& op);
+bool drawRectangles(VideoFrame& destination,
+                    const std::vector<RgaRect>& rectangles,
+                    const RgaOperation& op);
+```
+
+小 overlay 的实际 RGA 步骤不是创建全屏 RGBA 图，而是：先把完整 NV12 视频 copy 到私有输出，随后只对
+`768x96` 文字区域做三输入合成。`source` 和 `destination` 强制使用不同 DMA-BUF，避免原地读写的硬件
+语义不明确。矩形框直接写 destination。
+
+新增 `freetype_bitmap_demo`，使用 `img/1.png` 完整验证：RGBA 输入 → NV12 → 小 RGBA 时间文字合成
+→ NV12 绿色矩形框 → RGBA PNG 输出。RV1126B 板测结果正确。
+
+#### IPC 接入与字体部署
+
+`IpcApp` 的 `/main`（H265 1920x1080）和 `/sub`（H264 1280x720）都启用 OSD，文字为：
+
+```text
+main  YYYY-MM-DD HH:MM:SS
+sub   YYYY-MM-DD HH:MM:SS
+```
+
+当前两路均配置 `768x96` 的小 RGBA overlay，放置在 `(24, 24)`；双缓冲合计约 `576 KiB/路`。
+
+字体不是源码资产，运行期从以下路径读取：
+
+```text
+/oem/usr/share/fonts/DejaVuSans.ttf
+```
+
+已在当前 RV1126B 板子创建该目录并部署测试字体。后续打 SDK/根文件系统时，需将目标字体同步到同一路径；
+若 OSD 未来显示中文，应替换为覆盖中文字符的 TTF/OTF。OSD 初始化失败会明确报错并停止该路编码器，
+不会静默推送未叠字画面。
+
+#### RV1126B 构建与 clangd
+
+新增 `wsl-build-rv1126b.sh`，通过同一份根 CMakeLists 构建 `ipc_app` 和 `freetype_bitmap_demo`。
+FreeType 头文件置于 `third_party/freetype/include/`，动态库继续使用 RV1126B SDK `media_out` 中的
+`libfreetype.so`，不把 SDK 绝对路径散到源码中。
+
+`tools/update_compile_commands.sh` 现在会合并 `build/rv1126b-aarch64/compile_commands.json`。此前根目录
+数据库漏掉 RV1126B 的 IPC target，clangd 找不到 `OsdRenderer.hpp`，并连带误报
+`shared_ptr<RtspPublishSink>` 不能转换为 `shared_ptr<Sink>`；现在根数据库已有 IPC 的完整 include/
+sysroot 参数。
+
+#### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+- RV1126B `ipc_app` 和 `freetype_bitmap_demo` 均交叉构建通过。
+- RK3568 非 Qt demos 全量交叉构建通过。
+- RV1126B 上临时启动新 `ipc_app`，分别拉取 `/main`、`/sub`：两路日志均确认 OSD 初始化、私有 NV12
+  DMA-BUF 申请、RGA 启动成功。
+- 从 `/main` RTSP 码流实际抓取 PNG，确认 `main 2026-09-14 ...` 已位于编码后的画面中。
+- 板子测试完成后已恢复旧自启程序；本提交后的部署将单独替换 `/oem/usr/bin/multicam_ipc_app`。
+
 ### CamManager 恢复逻辑可读性收口
 
 上一版自动恢复已经具备正确的线程边界和压力测试，但恢复状态字段、eventfd 命名与无效唤醒混在一起，
@@ -3046,3 +3149,231 @@ git diff --check
 ```
 
 RK3568 非 Qt aarch64 demos 与 RV1126B `ipc_app` 均交叉构建通过。
+
+## 2026-09-15
+
+### MPP 编码输入 layout 的职责收口
+
+此前 `IpcApp::makePublishConfig()` 同时填写了编码策略和输入图像 layout：
+
+```text
+codec / fps / bitrate / GOP
++ width / height / stride / heightStride / inputFormat
+```
+
+后半部分不应由最上层 IPC 应用猜测。特别是 `stride` 取决于 VPSS/V4L2 的实际协商和硬件对齐，
+例如 1920 宽图像在某些来源上可能使用 2304 stride。项目统一遵守的原则仍是：
+
+```text
+谁生产真实图像，谁填写真实 layout；
+谁最靠近首帧，谁把 layout 交给硬件模块。
+```
+
+本次职责划分调整为：
+
+```text
+IpcApp
+  → 只填写 codec / fps / bitratePreset / gop（编码策略）
+
+RtspPublishSink
+  → 收到本轮第一张真实 VPSS VideoFrame
+  → 复制策略配置到 activeEncoderConfig
+  → 填写 width / height / stride / heightStride / inputFormat
+  → 调用 MppEncoder::init(activeEncoderConfig)
+
+MppEncoder
+  → 将完整 config 转为 MPP prep:* 配置
+  → 后续 sendFrame() 校验所有帧的 layout 不变后再送 DMA fd + timestamp
+```
+
+`MppEncoderConfig` 保留 layout 字段是必要的：编码器不像解码器能从 H264/H265 码流参数集获取
+图像布局，DMA fd 本身也不携带宽高、stride、NV12/RGBA 等元信息。MPP 在首次
+`encode_put_frame()` 前必须已经收到：
+
+```text
+prep:width / prep:height / prep:hor_stride / prep:ver_stride / prep:format
+```
+
+但这些字段不再由 `IpcApp` 对外配置；`RtspPublishSink` 每次 active 编码周期都生成新的局部
+`activeEncoderConfig`，因此不会把上一次会话的 layout 残留到下一次。
+
+### 本次验证
+
+```bash
+./wsl-build.sh
+./wsl-build-rv1126b.sh
+```
+
+两套交叉构建均通过。RV1126B `192.168.1.6` 使用临时 `ipc_app` 分别拉取 `/main` 与 `/sub`：
+
+```text
+main H265: 1920x1080, stride=1920x1080, bitrate=5054400, gop=30
+sub  H264: 1280x720,  stride=1280x720, bitrate=3456000, gop=30
+```
+
+日志确认每路均先由首帧补齐 MPP prep 配置，随后 MPP 初始化及 ffmpeg UDP 拉流成功。
+测试结束后已停止临时程序并恢复板端 `/oem/usr/bin/multicam_ipc_app` 旧自启版本；本次提交不覆盖
+板端正式二进制。
+
+### OSD 文字对象、条带合成与检测框层级
+
+OSD 外部接口使用多个 `OsdTextObject`。每个对象以唯一 `id` 识别；`anchor=Absolute` 时使用相对视频可见区域
+左上角的绝对 `left/top`，`TopRight` 等边缘锚点则使用 `edgeOffsetX/Y`。边缘锚点的最终坐标由
+`OsdRenderer` 在 `composite()` 获取实际视频和文字 bitmap 尺寸后计算，所以上层不必预先知道分辨率。
+`paddingX/paddingY` 是文字到自身半透明背景边缘的间隔。`RgbaColor` 使用普通直观的
+`{red, green, blue, alpha}`；FreeType 的 coverage 仅乘到 alpha，RGB 不预乘，RGA 以
+`IM_ALPHA_BLEND_DST_OVER` 做普通 alpha 混合。
+
+为兼容 RV1126B 当前 RGA 驱动的 RGBA 非零横向 crop 问题，条带的 x 固定为 0、宽固定为整张视频宽；但高度
+只覆盖文字所在的最小纵向范围。首次 `composite()`（或对象的 `top`、纵向 padding、字号变化后）会按对象的
+纵向区间自动分组：重叠或相距不超过 16 像素的对象共用一条带，相隔很远的对象各自一条。文字内容/颜色等普通
+更新只将所属条带标脏并重绘该条带，不重新分组、不重新申请 DMA-BUF。
+
+每帧路径为：
+
+```text
+VPSS NV12 --RGA copy--> 私有 NV12 输出
+每个 RGBA 文字条带 --RGA composite--> 该输出的对应纵向区域
+AI 矩形列表 --RGA drawRectangles--> 同一输出
+MPP 编码
+```
+
+因此文字和检测框重叠时，检测框永远在最上层：框线会压在文字及其背景上。这是当前确定且可预期的图层规则。
+`RgaEngine` 不调用 `imcheck`；封装已在提交 RGA 前完成自身的 frame、矩形、stride 与容量校验，随后直接提交
+RGA 操作，避免额外 SDK 校验落入热路径。
+
+### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+- 两套交叉构建通过。
+- RV1126B `192.168.1.6` 上运行 `freetype_bitmap_demo`，输入 `img/1.png`（1090x783）后成功生成
+  `osd_time.png`。
+- 输出图确认：左上黄色 `CAM-01` 和白色时间属于同一顶部条带；中部 `DETECTION` 属于另一条带；绿色检测框
+  的上边线故意横穿 `DETECTION`，验证“框最后画、覆盖文字”的规则。
+
+### OSD 热路径复核
+
+本次在提交前额外检查了条带更新的性能与状态正确性，并修正两项问题：
+
+- 时间字符串更新不再重复 `FT_New_Face()` 打开字体。只有 `textPixelHeight` 变化才重新打开字体；普通文字变化
+  仅调用 `renderText()` 重建 CPU `TextBitmap`。
+- 文字长度、`left` 或 `paddingX` 变化时，不再错误沿用旧的对象矩形。该对象会在所属条带下次重绘前重新计算横向
+  placement；只有 `top`、纵向 padding、字号或 bitmap 高度变化才重新分组。
+
+常态 IPC OSD 的成本为：每帧一次 NV12 底图 copy、每个纵向条带一次 RGA composite、最后一次 RGA 框绘制。
+CPU 写 RGBA 与 DMA cache sync 只发生在文字更新时（当前时钟为每秒一次），没有每帧字体加载、DMA-BUF 申请或
+对象分组。若未来将很多文字放到相距很远的纵向位置，会相应增加条带和 RGA composite 次数；顶部/底部等少量
+条带是推荐布局。
+
+再次在 RV1126B 运行 demo，并模拟将时间更新为更长的 `"... UTC"` 文本，确认同条带内对象重算 placement 后
+没有裁剪或错位；`imcheck` 已从项目 RGA 封装的所有热路径中完全移除。
+
+随后补充 `OsdAnchor`：除 `Absolute` 的 `left/top` 外，`TopRight` 等锚点使用 `edgeOffsetX/Y`。这使
+`RtspPublishSink` 创建对象时不需要预先取得 VPSS 帧尺寸；`OsdRenderer` 在首次合成时按真实视频宽高和当前
+文字宽度计算最终位置。RV1126B demo 已用右上角的加长 `"... UTC"` 时间文本验证，右边保持 24 像素间距。
+
+### OSD 按分辨率自适应缩放
+
+OSD 配置统一以 `OsdRendererConfig::designWidth/designHeight` 表示设计分辨率，IPC 当前明确设为
+`1920x1080`。`OsdTextObject` 的字号、绝对坐标、锚点边距和 padding 都是设计像素；首次
+`composite()` 得到实际 VPSS `VideoFrame` 后，`OsdRenderer` 取：
+
+```text
+scale = min(videoWidth / designWidth, videoHeight / designHeight)
+```
+
+并换算成真实像素。这样 1080p 保留 48px 字和 24px 边距，1280x720 自动使用约 32px 字和 16px 边距。
+分辨率运行中变化时，已有的 layout 重建路径会重新打开相应字号的 FreeType face、重建 bitmap 和条带；正常
+30fps 路径只做一次比例/字号比较，不会反复加载字体。
+
+AI 检测框的 `RgaRect` 坐标保持“当前视频帧真实坐标”，不由 OSD 二次缩放；只有其 `lineWidth` 作为视觉样式
+按同一比例缩放。条带对象的合并阈值也按比例缩放，确保 720p 与 1080p 保持相同布局语义。
+
+RV1126B `192.168.1.6` 实测通过：
+
+- 输入 `1280x720`：文字、背景、右上锚点边距和框线均为 1080p 的约 2/3，输出正常。
+- 输入 `1920x1080`：维持设计尺寸，输出正常。
+- 两次均经过 PNG RGBA -> RGA NV12 -> OSD -> RGA RGBA 的真实硬件路径；检测框仍按既定规则覆盖文字。
+
+## 2026-09-16
+
+### RTSP 播放事件收口到 PublishSink
+
+此前 `IpcApp` 在每个 `StreamConfig` 中配置两段 lambda：一段处理首/末客户端的编码器启停，
+另一段处理后来客户端的 IDR 请求。这使应用层知道了本应属于推流模块的固定策略，且 main/sub
+重复配置同一份行为。
+
+本次将 `StreamConfig` 收回为纯 RTSP 描述：
+
+```text
+streamName + codec
+```
+
+`Live555RtspServer::addStream()` 直接接收该路 `shared_ptr<RtspPublishSink>`，但 Server 内部仅保存
+`weak_ptr<RtspPublishSink>`；实际 Sink 仍由 `IpcApp` 持有，避免 Server/Sink 形成循环引用。
+Server 在 live555 线程维护每路已 PLAY 客户端数，并只将三种有业务意义的边界事件交给 Sink：
+
+```text
+0 -> 1       FirstClientStarted
+N -> N + 1   AdditionalClientStarted
+1 -> 0       LastClientStopped
+```
+
+`RtspPublishSink::onClientPlaybackEvent()` 统一处理这些策略：首客户端 `setActive(true)`，后来客户端
+合并一次 `requestKeyFrame()`，最后客户端 `setActive(false)`。事件处理只修改 worker 控制标志；OSD、
+MPP 控制和编码仍只在 Sink 的 worker 线程串行执行。`Live555RtspServer::cleanupLive555()` 对仍有活动
+客户端的流补发 `LastClientStopped`，所以应用退出路径不再需要手工逐路 `setActive(false)`。
+
+最初为隔离编译依赖引入过通用 Observer 接口；复核后发现当前项目唯一的接收者就是
+`RtspPublishSink`，这层抽象增加了阅读成本而没有实际收益，因此没有保留。Server 明确依赖自己的
+发布 Sink 更符合当前 IPC 推流服务的职责。相应地，`mcr_rtsp_server` 明确加入 MPP/RGA 的头文件搜索路径，
+最终媒体动态库仍由 `ipc_app` 统一链接。
+
+同时按应用代码可读性要求，`IpcApp.cpp` 中的相机、编码、RTSP 三类配置均直接写在 `main()`，删除了
+仅供这一处调用的 `makeCameraConfig()`、`makePublishConfig()`、`makeRtspStreamConfig()` 工厂函数。
+
+### RV1126B 实机回归
+
+在 RV1126B `192.168.1.6` 上，先停止原 `/oem/usr/bin/multicam_ipc_app`，确认 8554 已释放，再将本次
+构建的 `build/rv1126b-aarch64/ipc_app` 复制为 `/tmp/multicam_ipc_app_chain_test` 单独启动。测试顺序为：
+
+```text
+1. ffmpeg UDP 拉 rtsp://192.168.1.6:8554/main
+2. 2 秒后追加第二个 /main 客户端
+3. 同时拉 rtsp://192.168.1.6:8554/sub
+4. 三路各持续 8 秒，输出到 null muxer
+```
+
+结果：三个 ffmpeg 均退出码 0；首个 `/main` 收到 241 帧、追加 `/main` 收到 240 帧、`/sub` 收到 246 帧，
+均约 30fps。板端日志确认：
+
+```text
+首个 main/sub 客户端 -> FirstClientStarted -> 编码器按首张真实 VPSS 帧初始化
+追加 main 客户端     -> AdditionalClientStarted -> worker 请求 MPP 下一帧 IDR
+最后 main 客户端离开 -> LastClientStopped -> 清队列、MPP deinit
+程序收到 SIGTERM     -> 剩余 sub 流 LastClientStopped -> MPP deinit
+```
+
+追加 H265 `/main` 客户端的启动窗口中，ffmpeg 曾报告少量 `PPS id out of range` 与一次
+`Could not find ref with POC 28`，随后持续正常出帧并跑满测试时长。原因是新客户端接入共享实时源到
+请求 IDR 真正输出之间，仍可能先收到极少量无参考边界的 P/B 帧；本次的 IDR 请求已使其快速恢复，
+但这不应被记录为“新客户端零解码告警”。后续若产品要求新客户端绝对无启动告警，需要进一步研究
+live555 对新 RTP sink 的首包门控，而不是在应用层重复请求 IDR。
+
+测试结束后已优雅停止并删除 `/tmp` 临时二进制，重新启动 `/oem/usr/bin/multicam_ipc_app`；最终确认板端
+仅保留一个正式应用进程并监听 TCP 8554，本次提交不覆盖 `/oem` 正式程序。
+
+### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+RV1126B `ipc_app` 与 RK3568 非 Qt 目标均交叉构建通过。

@@ -3,7 +3,9 @@
 #include "VideoFrame.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 enum class RgaOp {
     Auto,
@@ -39,6 +41,16 @@ struct RgaOperation {
     RgaMirror mirror = RgaMirror::None;
     RgaRect crop {};
 
+    // composite() 时，crop 是从视频源读取的区域；这两个矩形描述 RGBA overlay
+    // 取哪一块、以及合成到输出视频的哪个位置。三个矩形的宽高必须一致。
+    // 空矩形表示调用方没有提供完整的合成参数。
+    RgaRect overlayCrop {};
+    RgaRect compositeDestination {};
+
+    // drawRectangles() 时共用的一组框样式。颜色使用 0xAARRGGBB。
+    uint32_t rectangleColor = 0xFF00FF00;
+    int rectangleLineWidth = 4;
+
     // 本次 RGA 操作使用的输出行 pitch 对齐，单位是字节。
     // 0 表示关闭自动对齐；默认 16 字节是 RGA 路径里比较保守的运行布局。
     // 注意：这个只影响 dst 的自动 stride；显式传入的 dst.stride 会被保留并校验。
@@ -70,6 +82,21 @@ public:
     bool rga(const VideoFrame& src, VideoFrame& dst, const RgaOperation& op = {});
     bool copy(const VideoFrame& src, VideoFrame& dst);
     bool resize(const VideoFrame& src, VideoFrame& dst);
+    bool convertColor(const VideoFrame& src, VideoFrame& dst);
+
+    // 在已经填好视频底图的 destination 上，合成一块普通（非预乘）alpha 的 RGBA overlay。
+    // 调用者通常先 copy(source, destination)，再调本函数；本函数只写
+    // compositeDestination 那一小块，不会复制其余视频区域。
+    bool composite(const VideoFrame& source,
+                   const VideoFrame& overlay,
+                   VideoFrame& destination,
+                   const RgaOperation& op);
+
+    // 直接在 DMA-BUF 图像上画一组同色、同线宽的矩形框。当前 OSD 只需要
+    // NV12 输出帧；以后如果硬件验证通过，也可以自然扩展到其他 RGA 格式。
+    bool drawRectangles(VideoFrame& destination,
+                        const std::vector<RgaRect>& rectangles,
+                        const RgaOperation& op = {});
 
     // 按图像 layout 计算 DMA-BUF 容量。默认 64 字节 pitch 对齐用于 pool 预留容量，
     // 目的是让 pool capacity 大于等于 RGA 实际访问量，而不是强迫 RGA 每次都用 64 字节 pitch。

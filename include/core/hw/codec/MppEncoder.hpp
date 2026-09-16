@@ -29,11 +29,15 @@ enum class MppBitratePreset {
 
 struct MppEncoderConfig {
     MppCodec codec = MppCodec::H264;
+    // MPP 的 prep 配置。编码器无法从 dmaFd 推断图像 layout，因此 init() 前必须填好。
+    // IpcApp 不直接填写它们；RtspPublishSink 收到首帧后用真实 VideoFrame 补齐。
     int width = 0;
     int height = 0;
     int stride = 0;
     int heightStride = 0;
     PixelFormat inputFormat = PixelFormat::NV12;
+    // 编码策略帧率，不是每帧显示时间。它用于 MPP CBR/VBR 的码率控制模型和默认 GOP；
+    // 每帧的实际播放时间仍由 VideoFrame::timestampUs 传入。
     int fps = 30;
     // 当 bitrate <= 0 时按档位自动计算：
     //   base = width * height * fps / 8
@@ -61,6 +65,8 @@ public:
     MppEncoder(MppEncoder&&) = delete;
     MppEncoder& operator=(MppEncoder&&) = delete;
 
+    // config 必须包含完整的 MPP prep layout。MPP init 后不能逐帧换宽高/stride/格式；
+    // 后续 sendFrame() 会校验输入保持与 config 一致，发生变化时由上层 deinit 后重建。
     bool init(const MppEncoderConfig& config);
     void deinit();
 

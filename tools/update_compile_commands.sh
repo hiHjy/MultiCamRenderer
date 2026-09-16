@@ -11,11 +11,13 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     cmake_build_dirs=(
         "$ROOT_DIR/build/wsl-aarch64-qt"
         "$ROOT_DIR/build/wsl-aarch64"
+        "$ROOT_DIR/build/rv1126b-aarch64"
     )
 else
     cmake_build_dirs=(
         "$ROOT_DIR/build/wsl-aarch64"
         "$ROOT_DIR/build/wsl-aarch64-qt"
+        "$ROOT_DIR/build/rv1126b-aarch64"
     )
 fi
 
