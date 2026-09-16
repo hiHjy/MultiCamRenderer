@@ -99,6 +99,27 @@ void RtspPublishSink::requestKeyFrame()
     m_keyFrameRequested = true;
 }
 
+void RtspPublishSink::onClientPlaybackEvent(RtspClientPlaybackEvent event)
+{
+    switch (event) {
+    case RtspClientPlaybackEvent::FirstClientStarted:
+        setActive(true);
+        LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                   << " 首个客户端开始播放，启动编码");
+        break;
+    case RtspClientPlaybackEvent::AdditionalClientStarted:
+        requestKeyFrame();
+        LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                   << " 新客户端加入，已请求下一帧 IDR");
+        break;
+    case RtspClientPlaybackEvent::LastClientStopped:
+        setActive(false);
+        LOG_INFO("RtspPublishSink", "stream=" << m_config.streamName
+                                                   << " 最后客户端离开，停止编码并丢弃裸帧");
+        break;
+    }
+}
+
 void RtspPublishSink::onFrame(FramePacket packet)
 {
     {

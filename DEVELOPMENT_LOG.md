@@ -3299,3 +3299,81 @@ RV1126B `192.168.1.6` 实测通过：
 - 输入 `1280x720`：文字、背景、右上锚点边距和框线均为 1080p 的约 2/3，输出正常。
 - 输入 `1920x1080`：维持设计尺寸，输出正常。
 - 两次均经过 PNG RGBA -> RGA NV12 -> OSD -> RGA RGBA 的真实硬件路径；检测框仍按既定规则覆盖文字。
+
+## 2026-09-16
+
+### RTSP 播放事件收口到 PublishSink
+
+此前 `IpcApp` 在每个 `StreamConfig` 中配置两段 lambda：一段处理首/末客户端的编码器启停，
+另一段处理后来客户端的 IDR 请求。这使应用层知道了本应属于推流模块的固定策略，且 main/sub
+重复配置同一份行为。
+
+本次将 `StreamConfig` 收回为纯 RTSP 描述：
+
+```text
+streamName + codec
+```
+
+`Live555RtspServer::addStream()` 直接接收该路 `shared_ptr<RtspPublishSink>`，但 Server 内部仅保存
+`weak_ptr<RtspPublishSink>`；实际 Sink 仍由 `IpcApp` 持有，避免 Server/Sink 形成循环引用。
+Server 在 live555 线程维护每路已 PLAY 客户端数，并只将三种有业务意义的边界事件交给 Sink：
+
+```text
+0 -> 1       FirstClientStarted
+N -> N + 1   AdditionalClientStarted
+1 -> 0       LastClientStopped
+```
+
+`RtspPublishSink::onClientPlaybackEvent()` 统一处理这些策略：首客户端 `setActive(true)`，后来客户端
+合并一次 `requestKeyFrame()`，最后客户端 `setActive(false)`。事件处理只修改 worker 控制标志；OSD、
+MPP 控制和编码仍只在 Sink 的 worker 线程串行执行。`Live555RtspServer::cleanupLive555()` 对仍有活动
+客户端的流补发 `LastClientStopped`，所以应用退出路径不再需要手工逐路 `setActive(false)`。
+
+最初为隔离编译依赖引入过通用 Observer 接口；复核后发现当前项目唯一的接收者就是
+`RtspPublishSink`，这层抽象增加了阅读成本而没有实际收益，因此没有保留。Server 明确依赖自己的
+发布 Sink 更符合当前 IPC 推流服务的职责。相应地，`mcr_rtsp_server` 明确加入 MPP/RGA 的头文件搜索路径，
+最终媒体动态库仍由 `ipc_app` 统一链接。
+
+同时按应用代码可读性要求，`IpcApp.cpp` 中的相机、编码、RTSP 三类配置均直接写在 `main()`，删除了
+仅供这一处调用的 `makeCameraConfig()`、`makePublishConfig()`、`makeRtspStreamConfig()` 工厂函数。
+
+### RV1126B 实机回归
+
+在 RV1126B `192.168.1.6` 上，先停止原 `/oem/usr/bin/multicam_ipc_app`，确认 8554 已释放，再将本次
+构建的 `build/rv1126b-aarch64/ipc_app` 复制为 `/tmp/multicam_ipc_app_chain_test` 单独启动。测试顺序为：
+
+```text
+1. ffmpeg UDP 拉 rtsp://192.168.1.6:8554/main
+2. 2 秒后追加第二个 /main 客户端
+3. 同时拉 rtsp://192.168.1.6:8554/sub
+4. 三路各持续 8 秒，输出到 null muxer
+```
+
+结果：三个 ffmpeg 均退出码 0；首个 `/main` 收到 241 帧、追加 `/main` 收到 240 帧、`/sub` 收到 246 帧，
+均约 30fps。板端日志确认：
+
+```text
+首个 main/sub 客户端 -> FirstClientStarted -> 编码器按首张真实 VPSS 帧初始化
+追加 main 客户端     -> AdditionalClientStarted -> worker 请求 MPP 下一帧 IDR
+最后 main 客户端离开 -> LastClientStopped -> 清队列、MPP deinit
+程序收到 SIGTERM     -> 剩余 sub 流 LastClientStopped -> MPP deinit
+```
+
+追加 H265 `/main` 客户端的启动窗口中，ffmpeg 曾报告少量 `PPS id out of range` 与一次
+`Could not find ref with POC 28`，随后持续正常出帧并跑满测试时长。原因是新客户端接入共享实时源到
+请求 IDR 真正输出之间，仍可能先收到极少量无参考边界的 P/B 帧；本次的 IDR 请求已使其快速恢复，
+但这不应被记录为“新客户端零解码告警”。后续若产品要求新客户端绝对无启动告警，需要进一步研究
+live555 对新 RTP sink 的首包门控，而不是在应用层重复请求 IDR。
+
+测试结束后已优雅停止并删除 `/tmp` 临时二进制，重新启动 `/oem/usr/bin/multicam_ipc_app`；最终确认板端
+仅保留一个正式应用进程并监听 TCP 8554，本次提交不覆盖 `/oem` 正式程序。
+
+### 本次验证
+
+```bash
+./wsl-build-rv1126b.sh
+./wsl-build.sh
+git diff --check
+```
+
+RV1126B `ipc_app` 与 RK3568 非 Qt 目标均交叉构建通过。

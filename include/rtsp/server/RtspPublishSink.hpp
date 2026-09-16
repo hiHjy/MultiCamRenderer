@@ -13,6 +13,14 @@
 
 class Live555RtspServer;
 
+// Server 已在 live555 线程完成客户端数更新后，交给 PublishSink 的边界事件。
+// Sink 只置 worker 控制标志，绝不在 live555 线程直接调用 MPP。
+enum class RtspClientPlaybackEvent {
+    FirstClientStarted,      // 已 PLAY 客户端数：0 -> 1
+    AdditionalClientStarted, // 已 PLAY 客户端数：N -> N + 1，N >= 1
+    LastClientStopped,       // 已 PLAY 客户端数：1 -> 0
+};
+
 // 一路裸帧到 RTSP 的发布消费者。
 // onFrame() 只保存最新待编码帧；MPP 编码及 live555 入队均在专用 worker 中完成。
 // 普通模式直接借用 CamManager 的 DMA-BUF 到 sendFrame() 返回，期间 FrameLease 会保护
@@ -45,6 +53,10 @@ public:
     // 请求编码 worker 在下一次 sendFrame() 前强制 IDR。可由 live555 事件线程调用；
     // 多次请求合并为一次，绝不在调用线程直接操作 MPP。
     void requestKeyFrame();
+
+    // 首个客户端启动编码，后来客户端请求下一帧 IDR，最后一个客户端离开时停止编码。
+    // 应用层无需重复配置这些固定推流策略。
+    void onClientPlaybackEvent(RtspClientPlaybackEvent event);
 
     void onFrame(FramePacket packet) override;
 

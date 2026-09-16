@@ -2,9 +2,11 @@
 
 #include "AnnexBFrameQueue.hh"
 #include "Log.hpp"
+#include "RtspPublishSink.hpp"
 #include "VideoSubsession.hh"
 
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -32,8 +34,11 @@ const char* codecName(VideoCodec codec)
 
 } // namespace
 
-Live555RtspServer::RtspPublishStream::RtspPublishStream(StreamConfig streamConfig)
+Live555RtspServer::RtspPublishStream::RtspPublishStream(
+    StreamConfig streamConfig,
+    std::weak_ptr<RtspPublishSink> streamPublishSink)
     : config(std::move(streamConfig)),
+      publishSink(std::move(streamPublishSink)),
       frameQueue(std::make_shared<AnnexBFrameQueue>())
 {
 }
@@ -45,7 +50,8 @@ Live555RtspServer::~Live555RtspServer()
     stop();
 }
 
-bool Live555RtspServer::addStream(const StreamConfig& config)
+bool Live555RtspServer::addStream(const StreamConfig& config,
+                                  const std::shared_ptr<RtspPublishSink>& publishSink)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_running.load()) {
@@ -60,8 +66,12 @@ bool Live555RtspServer::addStream(const StreamConfig& config)
         setErrorLocked("重复的 RTSP streamName: " + config.streamName);
         return false;
     }
+    if (publishSink == nullptr) {
+        setErrorLocked("RTSP stream 缺少 RtspPublishSink: " + config.streamName);
+        return false;
+    }
 
-    m_streamMap.emplace(config.streamName, std::make_shared<RtspPublishStream>(config));
+    m_streamMap.emplace(config.streamName, std::make_shared<RtspPublishStream>(config, publishSink));
     return true;
 }
 
@@ -311,38 +321,51 @@ void Live555RtspServer::cleanupLive555()
     delete m_scheduler;
     m_scheduler = nullptr;
 
+    std::vector<std::shared_ptr<RtspPublishSink>> sinksToStop;
     for (const auto& entry : m_streamMap) {
         const PublishStreamPtr& stream = entry.second;
-        std::lock_guard<std::mutex> clientLock(stream->clientStateMutex);
-        stream->activeClientCount = 0;
-        stream->frameQueue->clear();
+        bool hadActiveClient = false;
+        {
+            std::lock_guard<std::mutex> clientLock(stream->clientStateMutex);
+            hadActiveClient = stream->activeClientCount != 0;
+            stream->activeClientCount = 0;
+            stream->frameQueue->clear();
+        }
+        if (hadActiveClient) {
+            if (const std::shared_ptr<RtspPublishSink> sink = stream->publishSink.lock())
+                sinksToStop.push_back(sink);
+        }
     }
+
+    // Server 停止时 live555 未必会逐个回调 deleteStream()；统一补发最后客户端离开事件，
+    // 确保编码 worker 必定停下来。不能持有 clientStateMutex 调用外部代码。
+    for (const std::shared_ptr<RtspPublishSink>& sink : sinksToStop)
+        sink->onClientPlaybackEvent(RtspClientPlaybackEvent::LastClientStopped);
 }
 
 void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& stream, bool started)
 {
-    bool activeChanged = false;
-    bool active = false;
-    bool additionalClientStarted = false;
+    bool shouldNotifySink = false;
+    RtspClientPlaybackEvent playbackEvent = RtspClientPlaybackEvent::FirstClientStarted;
     unsigned activeClientCount = 0;
     {
         std::lock_guard<std::mutex> lock(stream->clientStateMutex);
         if (started) {
             ++stream->activeClientCount;
-            activeChanged = stream->activeClientCount == 1;
-            active = true;
-            // 首个客户端会启动新的编码器，首帧天然从 IDR 开始；只有后来加入的
-            // 客户端才需要额外请求下一帧 IDR。
-            additionalClientStarted = !activeChanged;
+            shouldNotifySink = true;
+            playbackEvent = stream->activeClientCount == 1
+                ? RtspClientPlaybackEvent::FirstClientStarted
+                : RtspClientPlaybackEvent::AdditionalClientStarted;
         } else {
             if (stream->activeClientCount == 0)
                 return;
 
             --stream->activeClientCount;
-            activeChanged = stream->activeClientCount == 0;
-            active = false;
-            if (activeChanged)
+            if (stream->activeClientCount == 0) {
                 stream->frameQueue->clear();
+                shouldNotifySink = true;
+                playbackEvent = RtspClientPlaybackEvent::LastClientStopped;
+            }
         }
         activeClientCount = stream->activeClientCount;
     }
@@ -351,14 +374,12 @@ void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& str
                                                  << " active clients=" << activeClientCount
                                                  << (!started && activeClientCount == 0 ? " (queue cleared)" : ""));
 
-    // 不能持有 clientStateMutex 调用外部代码；IpcApp 会在该回调中投递相机/编码器启停命令。
-    if (activeChanged && stream->config.onClientActiveChanged)
-        stream->config.onClientActiveChanged(active);
-
-    // 不能在 live555 线程直接调用 MPP。IpcApp 的回调只会向 PublishSink 投递一个
-    // “下一帧 IDR”标志，真正的 MPP_ENC_SET_IDR_FRAME 由编码 worker 串行执行。
-    if (additionalClientStarted && stream->config.onAdditionalClientStarted)
-        stream->config.onAdditionalClientStarted();
+    // 不能持有 clientStateMutex 调用外部代码。Sink 只置 worker 标志，MPP 操作仍由
+    // PublishSink 的编码 worker 串行执行。
+    if (shouldNotifySink) {
+        if (const std::shared_ptr<RtspPublishSink> sink = stream->publishSink.lock())
+            sink->onClientPlaybackEvent(playbackEvent);
+    }
 }
 
 Live555RtspServer::PublishStreamPtr Live555RtspServer::findStream(const std::string& streamName) const

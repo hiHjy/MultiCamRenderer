@@ -181,6 +181,9 @@ target_include_directories(mcr_rtsp_server
         "${MCR_LIVE555_ROOT}/include/groupsock"
         "${MCR_LIVE555_ROOT}/include/BasicUsageEnvironment"
         "${MCR_LIVE555_ROOT}/include/UsageEnvironment"
+        "${MCR_MPP_INCLUDE_DIR}"
+        "${MCR_RGA_INCLUDE_DIR}"
+        "${MCR_MEDIA_COMMON_INCLUDE_DIR}"
 )
 target_compile_options(mcr_rtsp_server PRIVATE -Wall -Wextra)
 mcr_link_live555(mcr_rtsp_server)
