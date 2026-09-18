@@ -37,6 +37,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/codec"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -62,6 +63,12 @@ if(MCR_MEDIA_ROOT)
     set(MCR_RGA_LIBRARY "${MCR_MEDIA_ROOT}/lib/librga.so")
     set(MCR_DRM_LIBRARY "${MCR_MEDIA_ROOT}/lib/libdrm.so")
     set(MCR_RKAIQ_LIBRARY "${MCR_MEDIA_ROOT}/lib/librkaiq.so")
+    set(MCR_ALSA_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include")
+    set(MCR_ALSA_LIBRARY "${MCR_MEDIA_ROOT}/root/usr/lib/libasound.so.2.0.0")
+    if(NOT EXISTS "${MCR_ALSA_INCLUDE_DIR}/alsa/asoundlib.h" OR
+       NOT EXISTS "${MCR_ALSA_LIBRARY}")
+        message(FATAL_ERROR "MCR_MEDIA_ROOT 缺少 ALSA 开发文件或动态库")
+    endif()
 else()
     set(MCR_MPP_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/rockchip")
     set(MCR_DRM_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/libdrm")
@@ -70,7 +77,30 @@ else()
     find_library(MCR_MPP_LIBRARY NAMES rockchip_mpp REQUIRED)
     find_library(MCR_RGA_LIBRARY NAMES rga REQUIRED)
     find_library(MCR_DRM_LIBRARY NAMES drm REQUIRED)
+    set(MCR_ALSA_INCLUDE_DIR "${MCR_SYSROOT}/usr/include")
+    find_library(MCR_ALSA_LIBRARY NAMES asound REQUIRED)
 endif()
+
+# Opus 与 WebRTC APM 都以"头文件 + 预编译静态库"的形式入库（同 third_party/live555）。
+# 源码在 ~/third_party-src/ 下，用 tools/build-third-party.sh 重新生成。
+set(MCR_THIRD_PARTY_ARCH "${MCR_LIVE555_TARGET}" CACHE STRING "第三方预编译库的目标板（rk3568 / rv1126b）")
+set_property(CACHE MCR_THIRD_PARTY_ARCH PROPERTY STRINGS rk3568 rv1126b)
+
+set(MCR_OPUS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/include")
+set(MCR_OPUS_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libopus.a")
+set(MCR_WEBRTC_APM_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/include")
+set(MCR_WEBRTC_APM_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libmcr_webrtc_apm.a")
+
+foreach(mcr_prebuilt IN ITEMS "${MCR_OPUS_LIBRARY}" "${MCR_WEBRTC_APM_LIBRARY}")
+    if(NOT EXISTS "${mcr_prebuilt}")
+        message(FATAL_ERROR
+            "缺少预编译库 ${mcr_prebuilt}\n"
+            "请先运行 tools/build-third-party.sh 生成。")
+    endif()
+endforeach()
 
 foreach(live555_library IN ITEMS liveMedia groupsock BasicUsageEnvironment UsageEnvironment)
     if(NOT EXISTS "${MCR_LIVE555_LIBRARY_DIR}/lib${live555_library}.a")
@@ -109,6 +139,30 @@ function(mcr_link_drm target)
         "${MCR_DRM_LIBRARY}"
         Threads::Threads
     )
+endfunction()
+
+function(mcr_link_alsa target)
+    target_include_directories(${target} PRIVATE "${MCR_ALSA_INCLUDE_DIR}")
+    target_link_libraries(${target} PRIVATE "${MCR_ALSA_LIBRARY}" Threads::Threads)
+endfunction()
+
+# Opus 与 WebRTC APM 的预编译静态库。用法同 mcr_link_live555 / mcr_link_freetype：
+# third_party 下只放头文件和库，链接细节收在这里。
+function(mcr_link_audio_deps target)
+    target_include_directories(${target} PRIVATE
+        "${MCR_OPUS_INCLUDE_DIR}"
+        "${MCR_WEBRTC_APM_INCLUDE_DIR}"
+    )
+    target_link_libraries(${target} PRIVATE
+        "${MCR_WEBRTC_APM_LIBRARY}"
+        "${MCR_OPUS_LIBRARY}"
+        Threads::Threads
+        m
+        rt
+    )
+    # WebRTC 2.1 / Abseil 要求 C++17；RK3568 的 GCC 10.4 默认还是 C++14，
+    # 不显式声明会在 std::optional 上成片报错。
+    target_compile_features(${target} PRIVATE cxx_std_17)
 endfunction()
 
 function(mcr_link_live555 target)
@@ -210,6 +264,30 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
 
+# C 层的通用音频输入链：ALSA PCM 采集 -> 可替换编码器接口。当前实现 Opus，后续
+# G.711/AAC 只需要新增 AudioEncoderOps，不需要把采集线程或 RTSP 逻辑绑定到具体编码器。
+add_library(mcr_audio_core STATIC
+    src/core/audio/AudioCapture.c
+    src/core/audio/AudioApm.cpp
+    src/core/audio/AudioCodec.c
+    src/core/audio/OpusEncoder.c
+    src/core/audio/AudioInputManager.c
+    src/core/audio/AudioDecoder.c
+    src/core/audio/OpusDecoder.c
+    src/core/audio/AudioPlayback.c
+    src/core/audio/AudioPacketFile.c
+)
+target_include_directories(mcr_audio_core
+    PUBLIC ${MCR_PROJECT_INCLUDE_DIRS}
+    PRIVATE "${MCR_ALSA_INCLUDE_DIR}"
+)
+target_compile_options(mcr_audio_core PRIVATE -Wall -Wextra)
+mcr_link_audio_deps(mcr_audio_core)
+target_link_libraries(mcr_audio_core PUBLIC
+    "${MCR_ALSA_LIBRARY}"
+    Threads::Threads
+)
+
 if(MCR_BUILD_IPC_APP)
     mcr_add_executable(ipc_app
         app/IpcApp.cpp
@@ -241,6 +319,43 @@ if(MCR_BUILD_IPC_APP)
 endif()
 
 if(MCR_BUILD_DEMOS)
+    # 不需要摄像头、MPP 或 RTSP：用于板端验证自动发现 ALSA 采集设备、PCM 时钟和
+    # 20ms Opus 编码包。按 Ctrl+C 正常 flush/释放设备。
+    mcr_add_executable(audio_capture_opus_demo demo/AudioCaptureOpusDemo.c)
+    target_link_libraries(audio_capture_opus_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_capture_opus_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 采集 -> APM(AGC) -> 写 WAV，不经过 Opus。用于直接听/量 AGC 处理后的效果，
+    # 例如判断板端麦克风电平偏低时 AGC 究竟能补回多少 dB。
+    mcr_add_executable(audio_capture_apm_pcm_demo demo/AudioCaptureApmPcmDemo.c)
+    target_link_libraries(audio_capture_apm_pcm_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_capture_apm_pcm_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 读取 audio_capture_opus_demo 写出的 packet 文件，完成 Opus -> PCM -> ALSA 播放闭环。
+    mcr_add_executable(audio_opus_playback_demo demo/AudioOpusPlaybackDemo.c)
+    target_link_libraries(audio_opus_playback_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_opus_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖 ALSA 设备的 WebRTC AGC 自检：用固定低电平 PCM 验证处理后的实际增益。
+    mcr_add_executable(audio_apm_gain_demo demo/AudioApmGainDemo.c)
+    target_link_libraries(audio_apm_gain_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_apm_gain_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 板端诊断工具：不修改 mixer，只列出 codec 实际提供的采集/播放控件与当前值。
+    mcr_add_executable(audio_mixer_inspect_demo demo/AudioMixerInspectDemo.c)
+    mcr_link_alsa(audio_mixer_inspect_demo)
+    set_target_properties(audio_mixer_inspect_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
     mcr_add_executable(mpp_decoder_demo
         demo/mpp_decoder_demo.cpp
         src/core/memory/DmaAllocator.cpp
