@@ -8,17 +8,33 @@ extern "C" {
 #endif
 
 /*
- * WebRTC APM 的 C 边界（webrtc-audio-processing 2.1，只启用 AGC2）。
+ * WebRTC APM 的 C 边界（webrtc-audio-processing 2.1，提供 AEC3 / AGC2 / 降噪 / 高通）。
  *
  * 音频核心目前仍以 C 为主；这里不让 WebRTC 的 C++ 类型泄露到采集、编码或以后
  * 的 RTSP 模块。一个 AudioApm 对应一路麦克风上行流，只能由该路采集线程调用。
  *
  * 关于 AGC2：2.x 用 gain_controller2 取代了老的 AGC1（gain_controller1）。
- * AGC2 由"自适应数字增益 + 固定数字增益 + limiter"三级组成，能对电平远低于
+ * 启用时，AGC2 由"自适应数字增益 + 固定数字增益 + limiter"三级组成，能对电平远低于
  * 正常范围的采集信号做几十 dB 的提升，而不是像 AGC1 那样把接近噪声底的输入
  * 判定成噪声后拒绝推增益。因此这里只暴露 AGC2 的参数。
  */
 typedef struct AudioApmConfig {
+    /*
+     * APM 总开关。0 时不创建 WebRTC AudioProcessing，麦克风 PCM 原样交给编码器；
+     * 下方的 AEC/AGC/降噪/高通等子开关全部不生效。默认 0：监控 RTSP 音频优先
+     * 保留原始环境声，避免语音降噪或高通擅自改变声音。
+     *
+     * 对讲开始时由 AudioCaptureManager 以 AEC3 模式显式打开；也可用于板端 A/B 对比。
+     */
+    int enableAudioProcessing;
+
+    /* 启用 WebRTC 内建 AEC3。开启后必须持续送入与采集格式一致的 10ms playback
+       reference PCM；没有参考帧时采集仍可继续，只是该段无法消除扬声器回声。 */
+    int enableEchoCancellation;
+    /* playback reference 被 APM 接收，到对应回声被麦克风采到的估计延迟，单位 ms。
+       0 表示尚未标定；真正接入通话时应根据播放队列与设备延迟填写。 */
+    int aecStreamDelayMs;
+
     /* 自适应数字增益开关：自动把信号拉到合适电平，上限 maxGainDb。 */
     int enableAdaptiveDigitalGain;
     /* 自适应增益上限（dB）。AGC2 内部限制为 [0, 50]。 */
@@ -31,7 +47,7 @@ typedef struct AudioApmConfig {
     int headroomDb;
     /* 自适应增益的输出噪声上限（dBFS，负数）：抑制安静时把底噪一起推上来。 */
     int maxOutputNoiseLevelDbfs;
-    /* 固定数字增益（dB）：在自适应之前施加的已知增益，用于补硬件侧的固定衰减，
+    /* 固定数字增益（dB）：在自适应之后、limiter 之前施加的已知增益，用于补硬件侧的固定衰减，
        AGC 只能慢慢收敛，这一级是立刻生效的。 */
     int fixedDigitalGainDb;
 
@@ -82,8 +98,11 @@ int audio_apm_process_capture(AudioApm *apm,
                               AudioPcmFrame *output);
 
 /*
- * 为未来回声消除预留：播放到本地扬声器前的 PCM 应送入这里作为 reverse stream。
- * 当前 AGC-only 阶段不启用 AEC，因此该函数只是校验/接收，尚未被播放链调用。
+ * 送入将要播放到本地扬声器的 reference PCM，供 AEC3 建立远端参考。
+ *
+ * 只能在 AudioApm 所属的采集线程调用；外部播放线程应向 AudioCaptureManager 的
+ * reference queue 投递，而不能直接调用本函数。frame 必须与 capture 格式一致，且
+ * 帧数为 10ms 的整数倍。AEC 未启用时返回 -ENOTSUP。
  */
 int audio_apm_process_reverse(AudioApm *apm, const AudioPcmFrame *frame);
 void audio_apm_get_statistics(const AudioApm *apm, AudioApmStatistics *statistics);

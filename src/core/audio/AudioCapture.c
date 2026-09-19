@@ -129,7 +129,7 @@ void audio_capture_config_init(AudioCaptureConfig *config) {
     config->requestedSampleRate = 48000;
     config->requestedChannels = 1;
     config->requestedFormat = AUDIO_SAMPLE_FORMAT_S16_LE;
-    config->requestedPeriodFrames = 960;
+    config->requestedPeriodFrames = 480;
 }
 
 void audio_capture_set_callback(AudioCapture *capture, AudioPcmCallback callback, void *userData) {

@@ -3377,3 +3377,353 @@ git diff --check
 ```
 
 RV1126B `ipc_app` 与 RK3568 非 Qt 目标均交叉构建通过。
+
+## 2026-09-19
+
+### 音频模块已知问题汇总
+
+音频模块（`src/core/audio/` 与 `demo/audio_*`）在 `feature/audio-core` 上完成了 WebRTC APM 2.1
+（AGC2）接入和两块板子的实机调音，可用的配置结论已经写在 `docs/audio_astats_and_apm_notes.md`。
+这里只集中记录**目前仍未解决**的问题，避免后面重复排查。
+
+> 这几个问题同时收口在项目根目录的 `KNOWN_ISSUES.md`，并会随修复情况更新；本节是当天排查过程的
+> 快照，两者不一致时以 `KNOWN_ISSUES.md` 为准。
+
+#### 1. RV1126B 播放通路只支持双声道（驱动层限制，应用层不迁就）
+
+现象：RV1126B 上任何**单声道**播放都是静音，双声道正常。板端实测：
+
+```text
+aplay -D plughw:0,0 -v generated.wav                  -> channels : 1    静音
+aplay -D plughw:0,0 -v generated-long-48k-stereo.wav  -> channels : 2    有声
+speaker-test -D plughw:0,0 -c 1 -t sine -f 1000 -l 1  -> 静音
+speaker-test -D plughw:0,0 -c 2 -t sine -f 1000 -l 1  -> 有声
+```
+
+同一个 `generated.wav` 在 RK3568 上播放正常，所以不是文件本身或 ALSA 工具的问题。
+
+根因定位到 SDK 驱动（`sysdrv/source/kernel/sound/soc/`）：
+
+| 文件 | 角色 | 声道声明 |
+| --- | --- | --- |
+| `codecs/rk3506_codec.c` | 麦克风 ADC（`audio_codec` / `audio_codec_pmu`） | **只有 `.capture` 1~2ch，没有 `.playback`** |
+| `codecs/rk_dsm.c` | 喇叭功放（`acdcdig_dsm`） | `.playback` **2~2** |
+| `rockchip/rockchip_sai.c` | CPU DAI（`sai2`，TDM 控制器） | `.playback` 1~512 |
+
+这条 `multicodecs` 链路上唯一能出声的 DAI 是 DSM 功放，而它物理上就是双声道时隙。
+
+但 **DSM 的 2 声道约束没有传到 ALSA 层**。板端 `hw:0,0` 报的是：
+
+```text
+CHANNELS: [1 512]
+```
+
+512 来自 `rockchip_sai.c:1407`（SAI 的 TDM 能力），ASoC 没能把它和 DSM 的 2~2 求成交集。
+后果是 ALSA 的 plug 层认为单声道属于「设备原生支持」，**不做 upmix**，单声道样本被原样送进驱动。
+而 `rk_dsm_hw_params()` 从头到尾没有读过 `params_channels()`，它只按采样率配时钟、按格式配位宽，
+I2S 接收固定按双时隙配置 —— 单声道数据进了双时隙帧，结果是静音。
+
+**结论与决定：** 这是驱动/机器驱动的缺陷，不是应用该绕的坑。**不在 `AudioPlayback` 里加
+「一律请求双声道」这类迁就逻辑**，`audio_playback_config_init()` 保持 1 声道默认值，
+`audio_playback_open_auto()` 依旧按调用方请求的声道数协商。后续要么等 Rockchip 修（让 DSM 的
+声道约束正确暴露，或在 `rk_dsm_hw_params()` 里按 `params_channels()` 配置），要么在板级 ALSA
+配置（`asound.conf` 的 plug 层）里显式约束，而不是改应用。
+
+> 曾经在 `AudioPlayback.c` 里试过「优先请求双声道」，已回退。
+
+#### 2. RK3568 播放 XRUN 风暴（未定位）
+
+`audio_opus_playback_demo` 在 RK3568 上播放 4.94 秒的 Opus 文件：
+
+```text
+247 个包 / 246 次 XRUN / 829ms 跑完        （正常应约 4940ms）
+```
+
+XRUN 是 ALSA 的缓冲区跑穿。播放方向是 underrun：DMA 把缓冲里的数据读完了，应用还没送来新的；
+采集方向是 overrun：应用取得太慢，新数据覆盖旧数据。两个方向都返回 `-EPIPE`（`-32`）。
+
+写入循环里的调试输出呈**严格奇偶交替**：
+
+```text
+write#0 ret=960  state=RUNNING
+write#1 ret=-32  state=XRUN
+write#2 ret=960  state=RUNNING
+write#3 ret=-32  state=XRUN
+```
+
+之所以是「跑完」而不是「卡住」，是因为现有代码在 `-EPIPE` 分支里调 `snd_pcm_prepare()` 把缓冲区
+整个清空后立刻重试，缓冲永远填不满，`snd_pcm_writei` 也就永远不阻塞。
+
+已排除的因素：同一块板、同一组 ALSA 参数（period 960 / buffer 3840）下，最小测试程序 `alsapb`
+走 `plughw:1,0` 是 **0 XRUN / 5000.2ms**，走 `default` 是 2 XRUN / 4970ms。设备和参数都没问题，
+问题出在 demo 的播放路径里，但具体是哪一处还没查到就暂停了。
+
+**待办：** 用同一份 Opus 文件跑 `alsapb` 复现，再逐步收敛到 `AudioPlayback` / `AudioDecoder`
+的具体分支。
+
+#### 3. RV1126B 的 codec 控件会被关流和上电流程重置
+
+每次采集/播放结束后，ACodec 的数字增益和开关会被复位，实测掉 **17dB**：
+
+```text
+Digital Gain       -> 0     (-95dB)
+PGA Gain           -> 16    （原本 31）
+ADC Switch         -> off
+DAC Digital Volume -> 0     （静音）
+```
+
+板端脚本（`/root/audio-test/apm-listen.sh`）每轮开录前都重设一遍。这不是麦克风或硬件问题，
+早期「麦克风偏置没打开」的结论已经被推翻。
+
+#### 4. 底噪问题不能靠调增益解决
+
+板端实测：`fixedDigitalGainDb = 30` 时各项指标都变好（峰值 -6.3 dBFS、零削顶），但再往上到 40
+就过载削顶。关键在于**补电平的同时底噪同步放大**，听感是「响但糊」。
+
+最终采用**不加增益 + 降噪 High + 高通**，听感明显优于原始采集。详见
+`docs/audio_astats_and_apm_notes.md`。
+
+#### 5. `Power Amplifier` 控件会让 amixer / alsactl 直接 abort
+
+DSM 的 `Power Amplifier` 是 `SOC_ENUM_EXT`，读 TLV 时返回 `EINVAL`，`amixer` 和 `alsactl` 会直接
+中止。为此单独写了 `ctldump`（只做 `SNDRV_CTL_IOCTL_ELEM_*` 的裸调用）供板端列控件和读写。
+另外这个开关是 DAPM 托管的，写进去会立刻被拉回 `off`，只在播放期间为 `on`。
+
+#### 附：一个还没解释的现象
+
+`speaker-test` 打印的 `Time per period` 和理论周期时长对不上：单声道 period 4096 帧在 48kHz 下
+应该是 85.3ms，实测报 **1.408s**；双声道 period 2048 帧应该是 42.7ms，实测报 **5.888s**。两个数都
+远大于理论值，但双声道确实听得到正常声音。这可能是 `speaker-test` 自身的计时口径问题，也可能是
+驱动侧时钟或周期上报有偏差，**尚未查证**，先记在这里。
+
+### 本次验证
+
+试改「优先请求双声道」时交叉构建通过；按要求回退后重新构建，仍然通过：
+
+```bash
+git checkout -- src/core/audio/AudioPlayback.c          # 回退迁就逻辑
+cmake --build build/rv1126b-aarch64 \
+      --target audio_opus_playback_demo audio_capture_apm_pcm_demo
+```
+
+`git status` 现在只剩 `include/core/audio/AudioCapture.h`（注释补充）和未跟踪的
+`docs/audio_astats_and_apm_notes.md`。
+
+### RV1126B 单声道播放无声：定位与 ALSA 规避（2026-09-19）
+
+这一问题的现象很明确：RV1126B 可以正常采集 48 kHz 单声道 PCM，录出的
+`test_c1.wav` 在 Windows 上播放也有声音；但板端直接播放同一份单声道 WAV 没有声音。把内容转成
+双声道后，板端立即可以正常播放。因此问题不在 Opus、APM、录音数据或应用层 PCM 队列，而在板端的
+ALSA 硬件播放通道约束。
+
+复现命令：
+
+```bash
+arecord -D default -f S16_LE -c 1 -r 48000 -d 5 -t wav test_c1.wav
+aplay test_c1.wav                     # 原始系统：无声
+```
+
+#### 1. 驱动侧事实
+
+SDK 中实际有相关源码；不是没有 RV1126B 音频驱动源码：
+
+```text
+sysdrv/source/kernel/sound/soc/codecs/rk_dsm.c
+sysdrv/source/kernel/sound/soc/codecs/rk3506_codec.c
+sysdrv/source/kernel/sound/soc/rockchip/rockchip_sai.c
+sysdrv/source/kernel/sound/soc/rockchip/rockchip_multicodecs.c
+```
+
+板端声卡是 `rockchiprv1126b`，machine driver 是 `rk-multicodecs`。DSM codec 的 playback
+DAI 明确声明为 `channels_min = 2`、`channels_max = 2`，即模拟输出硬件本质上是双声道；但
+machine driver / SAI 的运行时能力把通道范围暴露得过宽，原生单声道可以一路走到硬件路径，结果没有
+正确复制到左右声道，表现为静音。采集通道正常，不代表播放单声道也正确。
+
+`rk_dsm_hw_params()` 只配置采样率、采样格式和固定双 slot，并未按 `params_channels()` 建立正确的
+播放通道约束；`rk-multicodecs` 也没有补这一约束。这是 BSP 驱动能力描述与实际硬件能力不一致的问题。
+
+可选的内核长期修复是只对 playback 的 `.startup` 增加 ALSA channels min/max = 2 约束，让原生
+`hw:0,0` 直接拒绝 mono；但该修复本身不会把 mono 自动扩成 stereo，仍需要 ALSA plug 或应用做路由。
+它需要重编内核和刷固件，当前不作为恢复声音的前提。
+
+#### 2. 最终采用：板级 ALSA plug 自动 mono -> stereo
+
+不修改通用 `AudioPlayback`，也不要求所有调用者伪造双声道。应用仍可以按真实音频内容请求 mono；板级
+`default` PCM 使用 ALSA `plug` 在输出端把 mono 复制到左右两个硬件通道，stereo 则保持双声道原样输出。
+
+配置已放入 RV1126B SDK：
+
+```text
+/home/hjy/2026-07-18/rv1126b_linux_ipc_xiaoyu/project/app/etc/asound.conf
+```
+
+内容如下：
+
+```conf
+pcm.!default {
+    type plug
+    slave {
+        pcm "hw:0,0"
+        channels 2
+    }
+    route_policy duplicate
+}
+```
+
+选择 `/etc/asound.conf`，而不是改 `/usr/share/alsa/alsa.conf`：主 ALSA 配置会自动 include
+`/etc/asound.conf`，SDK 的 `project/app/etc/` 又会随 rootfs 打包到目标机 `/etc/`。当前运行板也已安装
+同一份配置；后续构建整体固件时会自然带上，无需再手工处理。
+
+#### 3. 验证结果
+
+在带该配置的环境下执行 `aplay -v test_c1.wav`，ALSA 明确打印路由表：
+
+```text
+Transformation table:
+0 <- 0
+1 <- 0
+```
+
+即单声道输入的第 0 路被复制到硬件左、右声道；实听恢复正常。双声道素材走 2ch 硬件路径也已验证有声。
+这证明它是可撤销、低风险的板级兼容层处理，不是把问题掩盖在 Opus 或应用代码中。
+
+#### 4. 与 APM 调试的边界
+
+此前两天还同时进行了 APM 2.1（AGC2）与底噪调试。当前策略是不启用自适应数字增益，保留高等级降噪和
+高通；原因是低信噪比下单纯拉高增益会同时放大底噪，不能解决听感问题。该工作与本节的 mono 无声是两个
+独立问题：前者影响录音响度和噪声，后者是播放端通道路由错误。详细参数与 astats 数据见
+`docs/audio_astats_and_apm_notes.md`。
+
+#### 5. 后续事项
+
+- `KNOWN_ISSUES.md` 的 RV1126B 单声道 playback 条目仍保留为 BSP 驱动缺陷；状态应理解为“驱动未修、
+  板级 ALSA 配置已完成可靠规避”。
+- 若后续维护 BSP 内核，可给 `rk-multicodecs` playback 加双声道硬约束，避免原生 `hw:0,0` 被错误地当成
+  支持单声道；届时仍保留 `default` plug，保证通用应用的 mono 兼容性。
+- codec 控件在设备 power transition 后会重置（数字增益、PGA、ADC/DAC 开关），这与本问题独立，采集测试
+  脚本仍需在每轮开始前重设必要控件。
+
+### 音频核心链路、AEC3 与 PlaybackManager 落地（2026-09-19）
+
+本次把之前归档中的 ALSA/Opus 原型收敛为项目内的 `core/audio` 基座。原则是：C 层保留可独立板测的
+设备与编解码能力；以后 RTSP、WebRTC 与 App 只通过薄 C++ 封装使用，不把 ALSA 或 WebRTC C++ 类型泄露到
+业务层。
+
+#### 1. 上下行职责收敛
+
+上行管理器原名 `AudioInputManager`，已更名为 `AudioCaptureManager`，避免 input 语义不清。它的常态数据流为：
+
+```text
+AudioCapture (ALSA, 48kHz/mono/S16_LE, 10ms)
+    -> [可选] AudioApm
+    -> AudioEncoder（当前 Opus，后续可扩展 G.711/AAC）
+    -> AudioEncodedPacket callback
+```
+
+下行新增 `AudioPlaybackManager`，它是业务/网络层唯一入口；`AudioPlayback` 仍只是同步写 ALSA 的底层工具，
+不对外承担线程或队列职责：
+
+```text
+有序编码音频包
+    -> AudioPlaybackManager::enqueue_packet()
+    -> 有界编码包队列
+    -> 唯一播放线程
+    -> AudioDecoder（当前 Opus）
+    -> 10ms PCM reference + AudioPlayback/ALSA
+```
+
+`AudioPlaybackManager` 不处理 RTP 乱序、PLC 或 jitter buffer；这些属于将来的 RTSP/WebRTC 通话接收层。
+它默认只留 8 个 20ms Opus 包，满时淘汰最旧包以控制实时延迟。
+
+#### 2. ALSA 启动 XRUN 与解决
+
+首次板测使用 10ms period、40ms ALSA 环形缓冲时出现连续 XRUN。原因不是 Opus 解码丢包：声卡在收到第一段
+10ms PCM 后立即按硬件时钟消耗样本；如果后续 `snd_pcm_writei()` 稍晚，缓冲见底即发生 underrun (`-EPIPE`)。
+声卡不会等待下一包，因为等待会停止硬件播放时钟。
+
+最终 PlaybackManager 采用两层本地保护：
+
+```text
+ALSA hardware buffer: 8 x 10ms = 80ms
+首次出声前预填：  3 x 20ms Opus = 约 60ms
+```
+
+这只是声卡启动与调度余量，不是网络 jitter buffer，也不做网络包重排。RV1126B 实测同一份 5.88 秒录音：
+
+```text
+入队 294 包 / 解码 294 包 / 播放 282240 PCM frames
+队列淘汰 0 / ALSA 写失败 0 / XRUN 0
+```
+
+新增 `demo/AudioPlaybackManagerDemo.c`，会按 packet 文件中的相对 PTS 节奏入队，能测试真实的播放线程与
+短队列；旧 `audio_opus_playback_demo` 保留为直接解码播放诊断工具。
+
+#### 3. WebRTC APM 与 AEC3 的运行期边界
+
+`AudioApm` 保持 C ABI，但内部使用 webrtc-audio-processing 2.1。总开关为：
+
+```c
+AudioApmConfig::enableAudioProcessing
+```
+
+默认值改为 **0**。监控 RTSP 音频的目标是保留环境声，默认不应使用语音降噪、高通或增益：
+
+```text
+RTSP 监控默认：采集 -> 原始 PCM -> Opus -> RTSP
+```
+
+通话开始时调用：
+
+```c
+audio_capture_manager_request_echo_cancellation(&captureManager, 1);
+```
+
+采集线程会在下一个 10ms 安全边界重建为 `AEC3 + 高通 + 降噪`；播放线程不直接操作 APM，而是把即将写 ALSA
+的每个 10ms PCM 复制给 `AudioCaptureManager` 的 reference queue。通话结束传 `0`，恢复为原始 PCM 直通。
+真正通话接入前仍需依据播放链路实测填写 `aecStreamDelayMs`；当前 `0` 仅表示尚未标定，不代表真实声学延迟。
+
+当 APM 关闭时，采集线程不创建 `webrtc::AudioProcessing`，也不调用 bypass 处理；PCM 直接进入预热/编码路径。
+当 APM/AEC 开启时，预热期的 PCM 虽然不编码输出，仍要送入 APM，以便降噪和回声消除器完成内部状态收敛。
+
+#### 4. 采集启动预热
+
+`AudioCaptureManagerConfig::warmupDiscardDurationMs` 默认 500ms。每次采集启动，或 APM/AEC 模式重建后：
+
+```text
+前 500ms：不送编码器、不推网络
+APM 关闭：直接丢原始 PCM
+APM 开启：送 APM 内部收敛，但丢其输出
+500ms 后：开始正常编码
+```
+
+这样可以屏蔽 ALSA/模拟麦克风启动瞬态与 APM 冷启动音色跳变，而不会把首批突兀音频推上 RTSP。RV1126B 2 秒
+短录实测仅输出 69 个 20ms Opus 包，符合约 0.5 秒预热后再开始输出的预期。
+
+#### 5. A/B 听感与验证工具
+
+新增 `demo/AudioApmAbTest.sh`。它使用 `AudioCaptureApmPcmDemo` 在**同一次**采集中分别保存原始 PCM 与 APM
+处理后 PCM，再按“原始 -> APM”顺序 `aplay`。刻意不经过 Opus，避免编码器成为 A/B 比较变量：
+
+```bash
+sh demo/AudioApmAbTest.sh 12
+```
+
+APM/AEC 专用 demo（`audio_capture_apm_pcm_demo`、`audio_apm_gain_demo`、`audio_apm_aec_smoke_demo`）均显式打开
+`enableAudioProcessing`，不会因产品默认关闭 APM 而退化为原始 PCM。
+
+#### 6. 本次构建与板测
+
+- `./wsl-build.sh`：通过。
+- `./wsl-build-rv1126b.sh`：通过。
+- RV1126B `audio_apm_aec_smoke_demo`：AEC3 reverse/capture 连续 200 个 10ms block 成功。
+- `git diff --check`：通过。
+
+构建仍会显示 webrtc-audio-processing 上游头文件中的 unused-parameter warning；它来自第三方头文件，不影响本次
+目标代码构建，暂不在项目内 patch 上游库。
+
+#### 7. 后续计划
+
+1. 先逐段 review 当前 C 音频全链路；
+2. 在 C core 之上做薄 C++ RAII 封装（无异常，显式错误与 callback），让 RTSP/App 不直接调用 C 函数；
+3. 再接 RTSP 音频收发；jitter buffer、RTP 时序、PLC 留在协议/通话层实现；
+4. 最后用真实扬声器/麦克风链路标定 AEC stream delay 与听感。

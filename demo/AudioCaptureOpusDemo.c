@@ -1,4 +1,4 @@
-#include "AudioInputManager.h"
+#include "AudioCaptureManager.h"
 #include "AudioPacketFile.h"
 
 #include <signal.h>
@@ -62,8 +62,8 @@ static int on_opus_packet(const AudioEncodedPacket *packet, void *userData) {
 }
 
 int main(int argc, char **argv) {
-    AudioInputManager manager;
-    AudioInputManagerConfig config;
+    AudioCaptureManager manager;
+    AudioCaptureManagerConfig config;
     PacketStatistics statistics;
     AudioApmStatistics apmStatistics;
     struct sigaction signalAction;
@@ -76,15 +76,15 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &signalAction, NULL);
     atomic_init(&g_stopRequested, false);
 
-    audio_input_manager_config_init(&config);
-    if (audio_input_manager_init(&manager, &config) < 0) {
+    audio_capture_manager_config_init(&config);
+    if (audio_capture_manager_init(&manager, &config) < 0) {
         fprintf(stderr, "AudioCaptureOpusDemo: 初始化音频管理器失败\n");
         return 1;
     }
-    audio_input_manager_set_packet_callback(&manager, on_opus_packet, &statistics);
-    if (audio_input_manager_start(&manager) < 0) {
+    audio_capture_manager_set_packet_callback(&manager, on_opus_packet, &statistics);
+    if (audio_capture_manager_start(&manager) < 0) {
         fprintf(stderr, "AudioCaptureOpusDemo: 自动打开采集设备或 Opus 编码器失败\n");
-        audio_input_manager_close(&manager);
+        audio_capture_manager_close(&manager);
         return 1;
     }
 
@@ -95,9 +95,9 @@ int main(int argc, char **argv) {
         nanosleep(&sleepDuration, NULL);
     }
 
-    audio_input_manager_stop(&manager);
+    audio_capture_manager_stop(&manager);
     audio_apm_get_statistics(&manager.apm, &apmStatistics);
-    audio_input_manager_close(&manager);
+    audio_capture_manager_close(&manager);
     audio_packet_file_writer_close(&statistics.writer);
     printf("AudioCaptureOpusDemo: 已停止，累计 Opus 包=%zu，文件=%s\n",
            statistics.packets,

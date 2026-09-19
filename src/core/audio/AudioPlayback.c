@@ -142,7 +142,13 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
     sampleRate = effectiveConfig.requestedFormat.sampleRate;
     channels = effectiveConfig.requestedFormat.channels;
     periodFrames = effectiveConfig.requestedPeriodFrames;
-    bufferFrames = periodFrames * 4;
+    bufferFrames = effectiveConfig.requestedBufferFrames == 0
+                       ? periodFrames * 4
+                       : effectiveConfig.requestedBufferFrames;
+    /* 至少保留两个 period；否则 ALSA 即使接受配置，实际也没有可用的调度余量。 */
+    if (bufferFrames < periodFrames * 2) {
+        bufferFrames = periodFrames * 2;
+    }
     if ((result = snd_pcm_hw_params_any(playback->pcmHandle, hardwareParams)) < 0 ||
         (result = snd_pcm_hw_params_set_access(playback->pcmHandle, hardwareParams,
                                                 SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||

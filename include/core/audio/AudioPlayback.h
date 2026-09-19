@@ -6,6 +6,13 @@
 typedef struct AudioPlaybackConfig {
     AudioPcmFormat requestedFormat;
     snd_pcm_uframes_t requestedPeriodFrames;
+
+    /*
+     * 期望的 ALSA 总硬件缓冲深度，单位 frame。0 表示沿用 period * 4 的通用默认值。
+     * 这是声卡调度余量，不是网络 jitter buffer；实时 PlaybackManager 用 8 个 10ms
+     * period（80ms），避免普通 Linux 调度偶发晚于 40ms 时触发 ALSA XRUN。
+     */
+    snd_pcm_uframes_t requestedBufferFrames;
 } AudioPlaybackConfig;
 
 typedef struct AudioPlayback {

@@ -259,9 +259,11 @@ int main(int argc, char **argv) {
 
     /*
      * APM 固定按 10ms 工作，因此采集 period 必须是 sampleRate/100 的整数倍。
-     * AudioCapture 默认 960 帧 @48kHz 即 20ms，满足要求。
+     * AudioCapture 默认 480 帧 @48kHz 即 10ms，正好满足要求。
      */
     audio_apm_config_init(&apmConfig);
+    /* 这是专门用于听 APM 效果的 demo；即使产品默认关闭 APM，也必须显式打开。 */
+    apmConfig.enableAudioProcessing = 1;
     if (fixedGainDb >= 0) {
         apmConfig.fixedDigitalGainDb = fixedGainDb;
     }

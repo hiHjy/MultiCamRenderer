@@ -44,6 +44,8 @@ int main(int argc, char **argv) {
 
     memset(&apm, 0, sizeof(apm));
     audio_apm_config_init(&config);
+    /* 本 demo 的目标是测 WebRTC 增益，不能继承监控 RTSP 的 APM 默认关闭策略。 */
+    config.enableAudioProcessing = 1;
     if (argc >= 2) {
         config.fixedDigitalGainDb = atoi(argv[1]);
     }

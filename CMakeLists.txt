@@ -264,17 +264,18 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
 
-# C 层的通用音频输入链：ALSA PCM 采集 -> 可替换编码器接口。当前实现 Opus，后续
+# C 层的通用音频采集链：ALSA PCM 采集 -> 可替换编码器接口。当前实现 Opus，后续
 # G.711/AAC 只需要新增 AudioEncoderOps，不需要把采集线程或 RTSP 逻辑绑定到具体编码器。
 add_library(mcr_audio_core STATIC
     src/core/audio/AudioCapture.c
     src/core/audio/AudioApm.cpp
     src/core/audio/AudioCodec.c
     src/core/audio/OpusEncoder.c
-    src/core/audio/AudioInputManager.c
+    src/core/audio/AudioCaptureManager.c
     src/core/audio/AudioDecoder.c
     src/core/audio/OpusDecoder.c
     src/core/audio/AudioPlayback.c
+    src/core/audio/AudioPlaybackManager.c
     src/core/audio/AudioPacketFile.c
 )
 target_include_directories(mcr_audio_core
@@ -342,10 +343,26 @@ if(MCR_BUILD_DEMOS)
         INSTALL_RPATH "/oem/usr/lib"
     )
 
+    # 同一份 Opus packet 文件走正式 PlaybackManager：有界队列 -> 单播放线程 ->
+    # 解码 -> 10ms PCM -> ALSA。它不引入 jitter buffer，网络时序由调用方负责。
+    mcr_add_executable(audio_playback_manager_demo demo/AudioPlaybackManagerDemo.c)
+    target_link_libraries(audio_playback_manager_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_playback_manager_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
     # 不依赖 ALSA 设备的 WebRTC AGC 自检：用固定低电平 PCM 验证处理后的实际增益。
     mcr_add_executable(audio_apm_gain_demo demo/AudioApmGainDemo.c)
     target_link_libraries(audio_apm_gain_demo PRIVATE mcr_audio_core m)
     set_target_properties(audio_apm_gain_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖声卡的 AEC3 调用自检：验证 10ms reverse reference 与 capture 能被同一 APM
+    # 实例正确处理；不用于评价真实声学消回声效果。
+    mcr_add_executable(audio_apm_aec_smoke_demo demo/AudioApmAecSmokeDemo.c)
+    target_link_libraries(audio_apm_aec_smoke_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_apm_aec_smoke_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
