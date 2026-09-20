@@ -3727,3 +3727,66 @@ APM/AEC 专用 demo（`audio_capture_apm_pcm_demo`、`audio_apm_gain_demo`、`au
 2. 在 C core 之上做薄 C++ RAII 封装（无异常，显式错误与 callback），让 RTSP/App 不直接调用 C 函数；
 3. 再接 RTSP 音频收发；jitter buffer、RTP 时序、PLC 留在协议/通话层实现；
 4. 最后用真实扬声器/麦克风链路标定 AEC stream delay 与听感。
+
+### RV1126B 本地 AI、Agent 与 CLIP 检索验证（2026-09-20 至 2026-09-21）
+
+本阶段完成了 RV1126B 上本地大模型、工具调用和图文检索的可行性验证。AI 能力暂时封存，不进入当前视频主链路；后续优先完成采集、编解码、推拉流、录像和事件基座，再按需接入。
+
+#### 1. Qwen3-1.7B 本地 Agent 验证
+
+在 2 GiB RV1126B 上，Qwen3-1.7B 使用本地 eMMC 模型运行稳定。为避免 Python 通过终端 PTY 抓取输出的不确定性，新增 C++ RKLLM Unix-domain socket 服务：
+
+```text
+Python / smolagents
+    -> REQUEST <base64 prompt>
+    -> C++ RKLLM server
+    -> RESPONSE <base64 text>
+```
+
+该通道验证了查询状态、启动摄像头、开启夜视等 mock 工具调用。KV history 能改善多步对话连续性，但小模型仍可能跳步或过早结束。因此生产架构不能让模型直接成为硬件控制正确性边界，确认采用：
+
+```text
+模型：理解用户意图、生成受限计划或总结结果
+代码：参数校验、权限控制、条件判断、状态回读、超时与最终执行
+```
+
+`Planner -> deterministic Executor -> Summarizer` 的受限 DSL 原型已经在板上完成多步验证；smolagents 仍可在以后工具增多时作为编排框架，但硬件操作必须保留确定性护栏。
+
+#### 2. Qwen3.5-2B 多模态评估结论
+
+曾使用 RKLLM Toolkit 1.3.0 转换 Qwen3.5-2B 文本模型，并使用 RKNN Toolkit2 2.3.2 导出其视觉编码器。文本模型能在板上运行，但完整视觉加文本链路会在 2 GiB 内存约束下 OOM；将模型加载从 NFS 移到本地 eMMC 只能消除 NFS `D` 状态等待，不能解决 NPU/CMA 与运行期内存总量问题。
+
+此外，2B 模型在无护栏的多工具流程中能理解大意，却会把执行计划当作文字回答而不实际调用第一项工具。结论是其收益不足以覆盖存储、内存和生命周期复杂度。Qwen3.5-2B 原始、转换及板端部署均已清理，保留 Qwen3-1.7B 作为后续低频文本交互实验模型。
+
+#### 3. 官方 CLIP 图文检索验证
+
+从官方 `rknn_model_zoo` 的 CLIP 示例导入 OpenAI CLIP ViT-B/32，使用 RKNN Toolkit2 2.3.2 转换为 RV1126B FP16 模型：
+
+```text
+clip_images_rv1126b_fp16.rknn  约 179 MiB
+clip_text_rv1126b_fp16.rknn    约 124 MiB
+```
+
+板端部署路径为：
+
+```text
+/userdata/rknn_clip_demo
+```
+
+官方 C++ demo 经 RV1126B AArch64 工具链编译后验证通过。官方 `read_lines_from_file()` 会把文件末尾换行计入行数，却留下空指针；原 demo 将其传入 tokenizer 会触发 `basic_string: construction from null is not valid`。已在独立 model-zoo demo 中过滤空指针和空行，不影响 MultiCamRenderer 主工程。
+
+验证结果：官方狗图在 `dog/cat/car` 词表中选中 `a photo of a dog`，分数 `0.989`。随后以 Qwen3-1.7B 将中文 `找一张狗的照片` 转为 `dog photo`，再交给 CLIP，选中狗图，分数 `1.000`。单次约 3 秒的 wall time 主要来自加载两个 CLIP 模型；因此未来应在一次搜索批次中保持 CLIP 常驻，完成后释放，再按需加载 Qwen 或其他可选模型。
+
+#### 4. 后续事件检索方案
+
+视频主链路不保存原始 RGB/YUV 帧：持续录像仍写分段 H.264/H.265 文件。YOLO 等事件检测仅在触发时写入事件记录，并保存 1 至 3 张 JPEG 关键帧和录像时间范围：
+
+```text
+视频帧 -> 事件触发 -> RGA 预处理 -> MPP JPEG 编码 -> event snapshot.jpg
+```
+
+第一版用户检索时，再由 Qwen 将中文请求改写成英文 CLIP 搜索词；程序先按时间、摄像头和 YOLO 元数据筛小候选事件集，CLIP 只处理这些 JPEG 关键帧并返回 Top-K。后续事件数量增长后，可低优先级预计算并持久化 512 维 image embedding，以加速检索。
+
+#### 5. 当前优先级
+
+AI 不常驻，也不影响视频帧率。推荐的未来模型分层为：YOLO 基础检测常驻抽帧；Pose、Seg、OCR、YAMNet 按事件或请求触发；CLIP 仅处理候选关键帧；Qwen 仅在用户问询、检索词翻译或结果总结时加载。当前先回到主要视频链路：持续录像、RTSP/WebRTC、事件存储和视频数据流稳定性。
