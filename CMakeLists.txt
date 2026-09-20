@@ -5,6 +5,7 @@ project(MultiCamRenderer LANGUAGES C CXX)
 option(MCR_BUILD_DEMOS "构建非 Qt 的 demo 与 DRM demo" ON)
 option(MCR_BUILD_QT "构建 Qt 应用与 Qt/RGA demo" OFF)
 option(MCR_BUILD_IPC_APP "构建 RV1126B IPC 双路 RTSP 应用" OFF)
+option(MCR_BUILD_RKLLM_AGENT_SERVER "构建 RV1126B RKLLM Unix socket 推理服务" OFF)
 # FreeType 目前只用于 OSD 的独立学习 demo。它依赖 RV1126B media_out 提供的动态库，
 # 因此不默认开启，避免没有 FreeType 的 RK3568 sysroot 受到影响。
 option(MCR_BUILD_FREETYPE_BITMAP_DEMO "构建 FreeType 字形 bitmap demo" OFF)
@@ -38,6 +39,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/audio"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/ai"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -218,6 +220,27 @@ function(mcr_link_png target)
     target_link_libraries(${target} PRIVATE "${mcr_png_library}" "${mcr_zlib_library}")
 endfunction()
 
+# AI 编排核心不依赖 RKLLM、Python 或任何硬件库。真实模型适配器和设备工具实现都通过
+# 小接口注入，便于先做确定性 demo，再接入板端运行时。
+add_library(mcr_ai_agent STATIC
+    src/ai/LocalAgent.cpp
+)
+target_include_directories(mcr_ai_agent PUBLIC ${MCR_PROJECT_INCLUDE_DIRS})
+target_compile_options(mcr_ai_agent PRIVATE -Wall -Wextra)
+
+# RKLLM 只在 RV1126B SDK 中发布，不应影响默认 RK3568 构建。明确开启后，由调用方提供
+# 与模型 runtime 相同版本的 librkllm_api 根目录。
+set(MCR_RKLLM_API_ROOT "" CACHE PATH "RKLLM librkllm_api 根目录（含 include/ 与 aarch64/）")
+if(MCR_BUILD_RKLLM_AGENT_SERVER)
+    if(NOT EXISTS "${MCR_RKLLM_API_ROOT}/include/rkllm.h" OR
+       NOT EXISTS "${MCR_RKLLM_API_ROOT}/aarch64/librkllmrt.so")
+        message(FATAL_ERROR "MCR_RKLLM_API_ROOT 缺少 RKLLM 头文件或 AArch64 运行库")
+    endif()
+    mcr_add_executable(rkllm_agent_server src/ai/RkllmAgentServer.cpp)
+    target_include_directories(rkllm_agent_server PRIVATE "${MCR_RKLLM_API_ROOT}/include")
+    target_link_libraries(rkllm_agent_server PRIVATE "${MCR_RKLLM_API_ROOT}/aarch64/librkllmrt.so")
+endif()
+
 # 项目自己的 RTSP 发布服务。一个 Server 可在同一 live555 event-loop 中注册多路
 # ServerMediaSession，不会为每一路复制端口或事件线程。
 set(MCR_RTSP_SERVER_SOURCES
@@ -320,6 +343,11 @@ if(MCR_BUILD_IPC_APP)
 endif()
 
 if(MCR_BUILD_DEMOS)
+    # 不加载任何模型：用假模型和假工具把 LocalAgent 的两次推理、严格校验和真实结果总结
+    # 跑完整，方便先理解 Agent 的职责边界。
+    mcr_add_executable(ai_agent_flow_demo demo/ai_agent_flow_demo.cpp)
+    target_link_libraries(ai_agent_flow_demo PRIVATE mcr_ai_agent)
+
     # 不需要摄像头、MPP 或 RTSP：用于板端验证自动发现 ALSA 采集设备、PCM 时钟和
     # 20ms Opus 编码包。按 Ctrl+C 正常 flush/释放设备。
     mcr_add_executable(audio_capture_opus_demo demo/AudioCaptureOpusDemo.c)
