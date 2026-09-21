@@ -82,11 +82,13 @@ void audio_playback_config_init(AudioPlaybackConfig *config) {
 int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig *config) {
     AudioPlaybackConfig effectiveConfig;
     snd_pcm_hw_params_t *hardwareParams = NULL;
+    snd_pcm_sw_params_t *softwareParams = NULL;
     snd_pcm_format_t alsaFormat;
     unsigned int sampleRate;
     unsigned int channels;
     snd_pcm_uframes_t periodFrames;
     snd_pcm_uframes_t bufferFrames;
+    snd_pcm_uframes_t startThresholdFrames;
     int direction = 0;
     int result;
 
@@ -161,9 +163,36 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
                                                          &periodFrames, &direction)) < 0 ||
         (result = snd_pcm_hw_params_set_buffer_size_near(playback->pcmHandle, hardwareParams,
                                                          &bufferFrames)) < 0 ||
-        (result = snd_pcm_hw_params(playback->pcmHandle, hardwareParams)) < 0 ||
-        (result = snd_pcm_prepare(playback->pcmHandle)) < 0) {
+        (result = snd_pcm_hw_params(playback->pcmHandle, hardwareParams)) < 0) {
         fprintf(stderr, "AudioPlayback: configure %s failed: %s\n",
+                playback->deviceInfo.alsaName, snd_strerror(result));
+        audio_playback_close(playback);
+        return result;
+    }
+
+    /*
+     * 默认 start threshold 往 buffer 尾部留一个 period：例如 8 x 10ms 的硬件 buffer
+     * 会在累积 70ms 后开始播放。否则默认策略可能第一块 10ms PCM 就立即起播，普通
+     * Linux 调度只要晚一个 period 就 XRUN，软件侧的 prebuffer 完全发挥不了作用。
+     */
+    startThresholdFrames = effectiveConfig.requestedStartThresholdFrames == 0
+                               ? (bufferFrames > periodFrames ? bufferFrames - periodFrames
+                                                              : periodFrames)
+                               : effectiveConfig.requestedStartThresholdFrames;
+    if (startThresholdFrames > bufferFrames) {
+        startThresholdFrames = bufferFrames;
+    }
+    snd_pcm_sw_params_alloca(&softwareParams);
+    if ((result = snd_pcm_sw_params_current(playback->pcmHandle, softwareParams)) < 0 ||
+        (result = snd_pcm_sw_params_set_start_threshold(playback->pcmHandle,
+                                                        softwareParams,
+                                                        startThresholdFrames)) < 0 ||
+        (result = snd_pcm_sw_params_set_avail_min(playback->pcmHandle,
+                                                  softwareParams,
+                                                  periodFrames)) < 0 ||
+        (result = snd_pcm_sw_params(playback->pcmHandle, softwareParams)) < 0 ||
+        (result = snd_pcm_prepare(playback->pcmHandle)) < 0) {
+        fprintf(stderr, "AudioPlayback: configure software params %s failed: %s\n",
                 playback->deviceInfo.alsaName, snd_strerror(result));
         audio_playback_close(playback);
         return result;
@@ -181,14 +210,15 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
         return -ENOMEM;
     }
     fprintf(stdout,
-            "AudioPlayback: selected %s [%s / %s], PCM=%uHz %uch S16_LE period=%lu buffer=%lu\n",
+            "AudioPlayback: selected %s [%s / %s], PCM=%uHz %uch S16_LE period=%lu buffer=%lu start=%lu\n",
             playback->deviceInfo.alsaName,
             playback->deviceInfo.cardId,
             playback->deviceInfo.pcmName,
             playback->actualFormat.sampleRate,
             playback->actualFormat.channels,
             (unsigned long)playback->periodFrames,
-            (unsigned long)bufferFrames);
+            (unsigned long)bufferFrames,
+            (unsigned long)startThresholdFrames);
     return 0;
 }
 

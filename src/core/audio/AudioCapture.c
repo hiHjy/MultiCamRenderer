@@ -140,6 +140,28 @@ void audio_capture_set_callback(AudioCapture *capture, AudioPcmCallback callback
     capture->callbackUserData = userData;
 }
 
+AudioCapture *audio_capture_create(void) {
+    return (AudioCapture *)calloc(1, sizeof(AudioCapture));
+}
+
+void audio_capture_destroy(AudioCapture *capture) {
+    if (capture == NULL) {
+        return;
+    }
+    audio_capture_close(capture);
+    free(capture);
+}
+
+AudioPcmFormat audio_capture_actual_format(const AudioCapture *capture) {
+    AudioPcmFormat format;
+    memset(&format, 0, sizeof(format));
+    return capture == NULL ? format : capture->actualFormat;
+}
+
+snd_pcm_uframes_t audio_capture_period_frames(const AudioCapture *capture) {
+    return capture == NULL ? 0 : capture->periodFrames;
+}
+
 static void *capture_thread_main(void *argument) {
     AudioCapture *capture = (AudioCapture *)argument;
 

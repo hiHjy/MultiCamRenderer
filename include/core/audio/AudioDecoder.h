@@ -3,6 +3,10 @@
 
 #include "AudioTypes.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef int (*AudioDecodedPcmCallback)(const AudioPcmFrame *frame, void *userData);
 
 typedef struct AudioDecoderOps {
@@ -26,5 +30,9 @@ int audio_decoder_init(AudioDecoder *decoder,
                        const AudioPcmFormat *outputFormat);
 int audio_decoder_decode_packet(AudioDecoder *decoder, const AudioEncodedPacket *packet);
 void audio_decoder_close(AudioDecoder *decoder);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

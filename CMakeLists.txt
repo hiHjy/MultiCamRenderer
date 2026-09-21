@@ -264,19 +264,19 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
 
-# C 层的通用音频采集链：ALSA PCM 采集 -> 可替换编码器接口。当前实现 Opus，后续
-# G.711/AAC 只需要新增 AudioEncoderOps，不需要把采集线程或 RTSP 逻辑绑定到具体编码器。
+# C 层只保留同步、单职责媒体工具；C++ AudioPipeline 在其上组织 Hub/Node 图。
 add_library(mcr_audio_core STATIC
     src/core/audio/AudioCapture.c
     src/core/audio/AudioApm.cpp
     src/core/audio/AudioCodec.c
     src/core/audio/OpusEncoder.c
-    src/core/audio/AudioCaptureManager.c
     src/core/audio/AudioDecoder.c
     src/core/audio/OpusDecoder.c
     src/core/audio/AudioPlayback.c
-    src/core/audio/AudioPlaybackManager.c
     src/core/audio/AudioPacketFile.c
+    src/core/audio/AudioFrame.cpp
+    src/core/audio/AudioPipeline.cpp
+    src/core/audio/AudioPlaybackPipeline.cpp
 )
 target_include_directories(mcr_audio_core
     PUBLIC ${MCR_PROJECT_INCLUDE_DIRS}
@@ -320,11 +320,38 @@ if(MCR_BUILD_IPC_APP)
 endif()
 
 if(MCR_BUILD_DEMOS)
-    # 不需要摄像头、MPP 或 RTSP：用于板端验证自动发现 ALSA 采集设备、PCM 时钟和
-    # 20ms Opus 编码包。按 Ctrl+C 正常 flush/释放设备。
-    mcr_add_executable(audio_capture_opus_demo demo/AudioCaptureOpusDemo.c)
-    target_link_libraries(audio_capture_opus_demo PRIVATE mcr_audio_core)
-    set_target_properties(audio_capture_opus_demo PROPERTIES
+
+    # C++ AudioPipeline 图验证：raw PCM 分发、raw->Opus 与 APM->Opus 并发；运行中取消
+    # APM 支路，确认不会干扰 raw 编码支路。
+    mcr_add_executable(audio_pipeline_demo demo/AudioPipelineDemo.cpp)
+    target_link_libraries(audio_pipeline_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pipeline_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 反复挂载/释放 APM->Opus 支路，同时维持 raw->Opus。验证订阅 RAII 与 Node 生命周期。
+    mcr_add_executable(audio_pipeline_stress_demo demo/AudioPipelineStressDemo.cpp)
+    target_link_libraries(audio_pipeline_stress_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pipeline_stress_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖声卡：验证 PCM/压缩包池的满池丢弃与 payload buffer 复用语义。
+    mcr_add_executable(audio_frame_pool_demo demo/AudioFramePoolDemo.cpp)
+    target_link_libraries(audio_frame_pool_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_frame_pool_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # C++ 唯一扬声器消费端：一条验证 PCM 直放，另一条验证 .mcropus -> 解码 -> ALSA。
+    mcr_add_executable(audio_playback_pipeline_pcm_demo demo/AudioPlaybackPipelinePcmDemo.cpp)
+    target_link_libraries(audio_playback_pipeline_pcm_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_playback_pipeline_pcm_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    mcr_add_executable(audio_playback_pipeline_opus_demo demo/AudioPlaybackPipelineOpusDemo.cpp)
+    target_link_libraries(audio_playback_pipeline_opus_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_playback_pipeline_opus_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
@@ -336,18 +363,10 @@ if(MCR_BUILD_DEMOS)
         INSTALL_RPATH "/oem/usr/lib"
     )
 
-    # 读取 audio_capture_opus_demo 写出的 packet 文件，完成 Opus -> PCM -> ALSA 播放闭环。
+    # 读取已有 .mcropus packet 文件，完成 Opus -> PCM -> ALSA 播放闭环。
     mcr_add_executable(audio_opus_playback_demo demo/AudioOpusPlaybackDemo.c)
     target_link_libraries(audio_opus_playback_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_opus_playback_demo PROPERTIES
-        INSTALL_RPATH "/oem/usr/lib"
-    )
-
-    # 同一份 Opus packet 文件走正式 PlaybackManager：有界队列 -> 单播放线程 ->
-    # 解码 -> 10ms PCM -> ALSA。它不引入 jitter buffer，网络时序由调用方负责。
-    mcr_add_executable(audio_playback_manager_demo demo/AudioPlaybackManagerDemo.c)
-    target_link_libraries(audio_playback_manager_demo PRIVATE mcr_audio_core)
-    set_target_properties(audio_playback_manager_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 

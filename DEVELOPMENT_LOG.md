@@ -3727,3 +3727,225 @@ APM/AEC 专用 demo（`audio_capture_apm_pcm_demo`、`audio_apm_gain_demo`、`au
 2. 在 C core 之上做薄 C++ RAII 封装（无异常，显式错误与 callback），让 RTSP/App 不直接调用 C 函数；
 3. 再接 RTSP 音频收发；jitter buffer、RTP 时序、PLC 留在协议/通话层实现；
 4. 最后用真实扬声器/麦克风链路标定 AEC stream delay 与听感。
+
+### C++ AudioPipeline / PlaybackPipeline 重构与实时内存打磨（2026-09-21）
+
+本次不接 RTSP、不接 WebRTC 协议层，先把项目内音频的“媒体图”收敛成能独立复用、可板测的
+C++ 基座。此前的 `AudioCaptureManager` / `AudioPlaybackManager` C 实现可以完成板测，但把采集、
+APM、Opus、队列、播放/AEC reference 固定串成一条链，不能表达未来实际需要的多支路：例如监控
+RTSP 需要原始 PCM，通话支路需要 AEC/降噪后的 PCM；二者不应因为通话建立而互相重启或中断。
+
+重构完成后核查确认：旧 C manager 已没有 App、RTSP 或 IPC 调用点，只剩各自的旧 demo。因此本次直接删除
+`AudioCaptureManager` / `AudioPlaybackManager` 及其 demo，而不是让两套音频架构长期并存。保留的 C 层只有
+可独立复用的同步媒体工具，所有新的业务链路只从 C++ pipeline 进入。
+
+#### 1. 分层原则与新上行图
+
+底层 C 文件只保留同步、单职责媒体工具：
+
+```text
+AudioCapture      : ALSA -> PCM callback
+AudioApm          : PCM -> PCM
+AudioEncoder      : PCM -> EncodedAudioPacket
+AudioDecoder      : EncodedAudioPacket -> PCM
+AudioPlayback     : PCM -> ALSA
+```
+
+它们不理解 RTSP、WebRTC、Hub 或业务线程。`AudioPipeline` 是 App 显式拥有的 C++ 上行入口，
+不是全局单例：App 在生命周期内 `startCapture()` / `stopCapture()`，未来 RTSP、录音或通话模块按需
+保存订阅句柄。
+
+```text
+C AudioCapture（唯一采集线程，干净 PCM）
+    -> rawPcmHub
+       ├-> raw PCM subscriber
+       ├-> EncoderNode(raw) -> EncodedPacketHub -> RTSP/录制等 subscriber
+       └-> ApmNode -> processedPcmHub
+                       -> EncoderNode(APM) -> EncodedPacketHub -> 通话上行 subscriber
+```
+
+`AudioFrame` / `EncodedAudioPacket` 在 C 回调边界复制数据并拥有其生命周期；Hub 只分发
+`shared_ptr<const ...>`，不做编码、网络 I/O、磁盘 I/O 或阻塞等待。每个 APM / Encoder Node 有自己的
+worker 和 5 帧（默认约 50ms）有界输入队列；满时淘汰旧帧，EncoderNode 发现时间戳缺口后重建编码器，
+确保不会把缺口两端的 PCM 拼成同一个 20ms Opus 包。
+
+APM 是一条可选支路，而非采集设备的全局状态。因此未来创建/结束通话只会增加/撤销 APM 支路；raw
+RTSP 支路持续运行，不会出现“通话一来监控音频断一下”的耦合问题。
+
+#### 2. Hub 发布路径：订阅变更写时复制
+
+初版 `AudioHub::publish()` 为了避免持锁调用外部 callback，每个 10ms PCM 都临时构造
+`std::vector<Callback>` 快照。这一语义正确，但只要有订阅者就会在发布热路径分配/释放 callback 数组。
+
+现改为写时复制快照：
+
+```text
+subscribe/reset
+    -> 持 State::mutex 改订阅表
+    -> 重建 immutable CallbackSnapshot
+
+publish（每 10ms）
+    -> 持 mutex 复制 shared_ptr<const CallbackSnapshot>
+    -> 解锁
+    -> 遍历不可变快照调用 callback
+```
+
+因此 callback 的 `std::function` 拷贝和 vector 分配只发生在订阅变化时；发布路径保留原有并发语义：
+取消订阅和 publish 并发时，已经取到快照的当前一轮 callback 允许执行一次，Node 自己通过运行状态拒绝
+停止后的入队。这既不会自锁，也不会让热路径逐帧 malloc。
+
+#### 3. AudioFrame / EncodedAudioPacket payload pool
+
+48kHz 单声道 S16 的 10ms PCM 是 960 bytes。初版每帧存在两层频繁申请：`make_shared<AudioFrame>`
+的对象/控制块，以及 `samples.resize()` 的 payload vector；APM 输出和 Opus packet 也有同类行为。
+
+新增：
+
+```text
+AudioFramePool
+EncodedAudioPacketPool
+```
+
+每个 pool 默认预分配 32 个对象和 payload buffer，并实际用于：
+
+```text
+raw capture PCM              -> raw AudioFramePool
+每个 ApmNode 输出 PCM         -> 该 Node 的 AudioFramePool
+每个 EncoderNode 输出编码包    -> 该 Node 的 EncodedAudioPacketPool
+```
+
+池满不等待下游归还：立即丢当前实时帧/包，累计计数并在第 1 次及此后每 100 次输出 WARN。这样下游持帧
+过久不会反压 ALSA 采集或解码/编码 worker。PCM 丢失会自然形成 EncoderNode 的时间戳缺口，沿用既有的
+安全重建策略。
+
+需要明确的边界：pool 已消除 `AudioFrame` / `EncodedAudioPacket` 对象和 payload vector 的高频申请；
+由于公开数据流仍使用标准 `shared_ptr`，每次借出时仍有一个标准库 control block。要把它也归零必须把
+所有 Hub API 改成自定义 intrusive lease，复杂度和生命周期风险明显增加，当前不做。后续只有在长时间
+profiling 证明它是热点时再评估。
+
+新增 `audio_frame_pool_demo`，不依赖声卡，验证 PCM / packet pool 的三条不变式：对象借出时不重复使用、
+池满返回空且不阻塞、最后一个 `shared_ptr` 释放后归还并复用同一 payload 地址。
+
+#### 4. C++ 唯一扬声器消费者
+
+新增 `AudioPlaybackPipeline`。它代表 App 内唯一的物理扬声器消费者；一个运行实例只接受一种输入模式，
+不能把两条没有统一时钟的 PCM 和压缩包流直接混到同一个设备：
+
+```cpp
+bool start(const AudioPlaybackPipelineConfig&);
+void stop();
+bool push(AudioFramePtr pcm);
+bool push(EncodedAudioPacketPtr packet);
+```
+
+```text
+push(PCM)     -> 固定容量播放队列 -> playback worker -> AudioPlayback -> ALSA
+push(packet)  -> 固定容量播放队列 -> playback worker -> AudioDecoder -> AudioPlayback -> ALSA
+```
+
+`push()` 只移动 `shared_ptr` 到预分配 ring queue 并唤醒 worker；不会在网络/调用线程执行 Opus 解码或
+`snd_pcm_writei()`。播放队列默认最多 100ms，既按总时长限制也按 16 项硬上限限制；满时淘汰最旧项。
+它不是 jitter buffer，不处理 RTP 乱序、丢包补偿或混音；这些以后属于 RTSP/WebRTC 通话层。
+
+压缩包路径按 `EncodedAudioPacket::codec` 创建/切换 `AudioDecoder`。decoder 使用 packet 的
+`sourceFormat` 解码，随后由 `AudioPlayback` 处理 mono/stereo 设备转换；不能假设 ALSA 实际通道数就是
+Opus 源通道数。
+
+未来 AEC 的 reference 应由 playback worker 在“真正写 ALSA 前”将同一份 decoded PCM 投递到通话支路
+的 reference queue。此次先不接这一回调，避免在 capture C++ 图尚未接入通话协议前重新产生 manager
+之间的反向耦合。
+
+#### 5. ALSA 起播阈值与 XRUN 排查
+
+新 PCM 直放 demo 首测出现连续 XRUN。根因不是 queue 或解码失败：ALSA 默认可能在第一段 10ms PCM 写入
+后就开始消耗，软件侧即使已积累 60ms 也尚未写进硬件 buffer；普通 Linux 调度稍晚一个 period 即触发
+underrun。
+
+`AudioPlayback` 增加 `requestedStartThresholdFrames`：默认自动使用 `bufferFrames - periodFrames`，并设置
+`avail_min = periodFrames`。对 RV1126B 的 48kHz / 10ms period 配置，实际为：
+
+```text
+hardware buffer = 3840 frames = 80ms
+ALSA start threshold = 3360 frames = 70ms
+AudioPlaybackPipeline startup prebuffer = 80ms
+```
+
+worker 开始后先快速把预填充写入 ALSA，再由硬件起播；声卡和软件队列都有明确调度余量。首次仍出现一次
+XRUN 的原因是 PCM demo 使用连续 `sleep_for(10ms)`，每轮普通线程唤醒误差会累计，3 秒后供给慢于硬件。
+demo 已改为 `sleep_until()` 按绝对媒体时间追赶，复测 XRUN 为 0。实际 capture 以 ALSA frame 时钟产出，
+不应使用累积 sleep 的方式模拟。
+
+#### 6. 本次 demo 与 RV1126B 验证
+
+新增：
+
+```text
+audio_pipeline_demo
+    raw PCM -> raw Opus，另挂 APM -> Opus；中途取消 APM 支路
+
+audio_pipeline_stress_demo
+    连续创建/销毁 APM -> Opus 支路，同时 raw -> Opus 常驻
+
+audio_frame_pool_demo
+    不依赖声卡的 PCM/packet pool 容量与复用验证
+
+audio_playback_pipeline_pcm_demo [seconds]
+    440Hz PCM 音调 -> C++ playback pipeline -> ALSA
+
+audio_playback_pipeline_opus_demo [file]
+    .mcropus -> C++ playback pipeline -> Opus decoder -> ALSA
+```
+
+RV1126B（`root@192.168.1.4`）实测：
+
+```text
+audio_frame_pool_demo
+    PASS：PCM/packet 均完成满池丢弃与 payload 地址复用验证
+
+audio_pipeline_demo 8
+    raw PCM = 100 frame/s，raw Opus = 50 packet/s；4 秒取消 APM 支路后，
+    raw Opus 仍从 199 连续增长到 400，APM 停在 174，PASS
+
+audio_pipeline_stress_demo 4
+    4 轮 APM -> Opus 创建/销毁全部 PASS；raw Opus 连续增长到 342
+
+audio_playback_pipeline_pcm_demo 3
+    accepted=300，dropped=0，playedFrames=144000，playbackFailures=0，XRUN=0
+
+板端新录 pipeline-test.mcropus 后 audio_playback_pipeline_opus_demo
+    inputPackets=174，accepted=174，dropped=0，decoded=174，playedFrames=167040，
+    decodeFailures=0，PASS
+```
+
+`./wsl-build.sh` 与 `./wsl-build-rv1126b.sh` 均通过，`git diff --check` 通过。
+
+#### 7. 后续优化与接入顺序
+
+1. 先以 `AudioPipeline` 接 RTSP 音频的 raw -> Opus subscription；不要让 RTSP 直接操作 ALSA/APM。
+2. WebRTC / 对讲接入时，在独立通话支路订阅 APM -> Opus，并把下行 decoded PCM 作为 AEC reference
+   投递；jitter buffer、PLC、RTP 时钟都放在协议层。
+3. `AudioDecoderOps` 未来增加通用 `reset()`。同一 PCM 格式发生时间戳缺口时，Opus 实现可清空项目自己的
+   partial PCM cache 并调用 `OPUS_RESET_STATE`；格式变化仍需 close/init。当前 close/init 逻辑正确且只在
+   丢帧时发生，不是性能热点。
+4. 在真实 RTSP + 通话并发、长时间运行后用 perf/heap profile 判断是否需要自定义 intrusive lease；在没有
+   数据前不把标准 `shared_ptr` 替换成高风险的自定义引用计数。
+5. 不重新引入把采集、APM、编码、播放固定串联的 manager；新的业务需求必须通过 `AudioPipeline` 的订阅
+   支路或 `AudioPlaybackPipeline` 的唯一扬声器入口表达，避免双架构再次并存。
+
+#### 8. 旧 C manager 清理
+
+在完成 C++ 上/下行管线的板端回归后，检查全仓调用点：`AudioCaptureManager` / `AudioPlaybackManager` 已仅被
+自身源码、头文件和两个历史 demo 使用，没有被 IPC App、RTSP server 或其他业务模块依赖。因此删除：
+
+```text
+include/core/audio/AudioCaptureManager.h
+include/core/audio/AudioPlaybackManager.h
+src/core/audio/AudioCaptureManager.c
+src/core/audio/AudioPlaybackManager.c
+demo/AudioCaptureOpusDemo.c
+demo/AudioPlaybackManagerDemo.c
+```
+
+同时从 CMake 和 RV1126B 构建脚本移除对应 target。`AudioPipelineDemo` / `AudioPipelineStressDemo` /
+`AudioFramePoolDemo` 覆盖新上行图，`AudioPlaybackPipelinePcmDemo` / `AudioPlaybackPipelineOpusDemo` 覆盖新的
+唯一扬声器入口；已有 `.opus` packet 文件仍可用两个 Opus playback demo 回归，不为清理旧 manager 新增重复 demo。

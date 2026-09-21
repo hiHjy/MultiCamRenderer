@@ -15,9 +15,15 @@
 #include "AudioTypes.h"
 
 #include <alsa/asoundlib.h>
+#ifndef __cplusplus
 #include <pthread.h>
 #include <stdatomic.h>
+#endif
 #include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct AudioDeviceInfo {
     char alsaName[64];   /* ALSA 设备名，如 "plughw:1,0"。open 时用它 */
@@ -57,6 +63,7 @@ typedef struct AudioCaptureConfig {
     snd_pcm_uframes_t requestedPeriodFrames;
 } AudioCaptureConfig;
 
+#ifndef __cplusplus
 typedef struct AudioCapture {
     /* ALSA 采集 PCM 句柄。open_auto 打开并 prepare；采集线程用它 readi；
        stop 用 snd_pcm_drop 打断阻塞中的 readi；close 负责释放。 */
@@ -95,7 +102,12 @@ typedef struct AudioCapture {
 
     /* 下一块数据的微秒时间戳（CLOCK_MONOTONIC 基准，非墙钟）。
        首次成功读取时以"当前时间 - 一块时长"起算，之后按实际帧数递增；
-       因此流内单调，但不代表真实采集时刻（没有对齐到驱动时间戳）。 */
+       因此流内单调，但不代表真实采集时刻（没有对齐到驱动时间戳）。
+
+	   note:CLOCK_MONOTONIC和std::chrono::steady_clock都是单调时钟，指的是
+	   通常从系统启动那一刻开始计时（但标准不保证）
+
+	  */
     uint64_t nextTimestampUs;
 
     /* 帧数转微秒时除不尽的**余数**，留到下次一起算，避免整数除法累积漂移
@@ -111,6 +123,10 @@ typedef struct AudioCapture {
        stop 用它判断是否需要 join。 */
     int threadCreated;
 } AudioCapture;
+#else
+/* C++ 侧不直接依赖 C11 atomic/pthread 字段；必须经下方 API 操作这个 C 对象。 */
+typedef struct AudioCapture AudioCapture;
+#endif
 
 /* 填入默认配置：48000Hz / 1ch / S16_LE / period 480 帧（10ms）。 */
 void audio_capture_config_init(AudioCaptureConfig *config);
@@ -127,6 +143,15 @@ void audio_capture_set_callback(AudioCapture *capture, AudioPcmCallback callback
  */
 int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *config);
 
+/*
+ * 给 C++ Pipeline 使用的对象生命周期与查询接口。C 调用方仍可像以前一样在栈上定义
+ * AudioCapture；C++ 不可见内部 C11 atomic 布局，使用 create/destroy 取得不透明指针。
+ */
+AudioCapture *audio_capture_create(void);
+void audio_capture_destroy(AudioCapture *capture);
+AudioPcmFormat audio_capture_actual_format(const AudioCapture *capture);
+snd_pcm_uframes_t audio_capture_period_frames(const AudioCapture *capture);
+
 /* 启动采集线程。要求已 open_auto 成功。重复启动返回 -EBUSY。 */
 int audio_capture_start(AudioCapture *capture);
 
@@ -136,5 +161,9 @@ void audio_capture_stop(AudioCapture *capture);
 /* 停止采集、释放 PCM 句柄和缓冲区，并把整个结构体清零。
    清零意味着 close 之后不能再读 actualFormat 等字段。 */
 void audio_capture_close(AudioCapture *capture);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

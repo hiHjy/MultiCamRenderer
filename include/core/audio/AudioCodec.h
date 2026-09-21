@@ -5,6 +5,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef int (*AudioEncodedPacketCallback)(const AudioEncodedPacket *packet, void *userData);
 
 typedef struct AudioEncoderConfig {
@@ -38,5 +42,9 @@ int audio_encoder_init(AudioEncoder *encoder,
 int audio_encoder_push_pcm(AudioEncoder *encoder, const AudioPcmFrame *frame);
 int audio_encoder_flush(AudioEncoder *encoder);
 void audio_encoder_close(AudioEncoder *encoder);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

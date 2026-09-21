@@ -24,7 +24,7 @@ typedef struct AudioApmConfig {
      * 下方的 AEC/AGC/降噪/高通等子开关全部不生效。默认 0：监控 RTSP 音频优先
      * 保留原始环境声，避免语音降噪或高通擅自改变声音。
      *
-     * 对讲开始时由 AudioCaptureManager 以 AEC3 模式显式打开；也可用于板端 A/B 对比。
+     * 对讲开始时由独立的通话 APM Node 以 AEC3 模式显式打开；也可用于板端 A/B 对比。
      */
     int enableAudioProcessing;
 
@@ -100,8 +100,8 @@ int audio_apm_process_capture(AudioApm *apm,
 /*
  * 送入将要播放到本地扬声器的 reference PCM，供 AEC3 建立远端参考。
  *
- * 只能在 AudioApm 所属的采集线程调用；外部播放线程应向 AudioCaptureManager 的
- * reference queue 投递，而不能直接调用本函数。frame 必须与 capture 格式一致，且
+ * 只能在 AudioApm 所属的采集线程调用；未来播放 worker 应向通话 APM Node 的 reference
+ * queue 投递，而不能直接调用本函数。frame 必须与 capture 格式一致，且
  * 帧数为 10ms 的整数倍。AEC 未启用时返回 -ENOTSUP。
  */
 int audio_apm_process_reverse(AudioApm *apm, const AudioPcmFrame *frame);

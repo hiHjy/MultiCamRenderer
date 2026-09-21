@@ -5,6 +5,10 @@
 
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * 仅供 demo 使用的简单 Opus packet 文件，不是 Ogg/MP4 容器：
  * 文件头记录 codec/PCM 格式；每个 record 保存 PTS、包长与原始编码 payload。
@@ -39,5 +43,9 @@ int audio_packet_file_reader_open(AudioPacketFileReader *reader, const char *pat
 /* 返回 1 表示读到一包，0 表示正常 EOF，负数表示文件损坏或 I/O 错误。 */
 int audio_packet_file_reader_read(AudioPacketFileReader *reader, AudioEncodedPacket *packet);
 void audio_packet_file_reader_close(AudioPacketFileReader *reader);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

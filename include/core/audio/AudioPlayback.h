@@ -3,6 +3,10 @@
 
 #include "AudioCapture.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct AudioPlaybackConfig {
     AudioPcmFormat requestedFormat;
     snd_pcm_uframes_t requestedPeriodFrames;
@@ -13,6 +17,12 @@ typedef struct AudioPlaybackConfig {
      * period（80ms），避免普通 Linux 调度偶发晚于 40ms 时触发 ALSA XRUN。
      */
     snd_pcm_uframes_t requestedBufferFrames;
+
+    /*
+     * ALSA 硬件队列累积到此 frame 数后才真正起播。0 表示自动取
+     * "buffer - period"，避免第一小块 PCM 写入就开播而消耗掉软件预填充余量。
+     */
+    snd_pcm_uframes_t requestedStartThresholdFrames;
 } AudioPlaybackConfig;
 
 typedef struct AudioPlayback {
@@ -30,5 +40,9 @@ void audio_playback_config_init(AudioPlaybackConfig *config);
 int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig *config);
 int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame);
 void audio_playback_close(AudioPlayback *playback);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
