@@ -105,7 +105,6 @@ struct MppEncoder::Impl {
 
         rk_mpp_encoder_set_packet_callback(&encoder, &Impl::packetCallback, this);
         initialized = true;
-        headerWritten = false;
         lastError.clear();
         return true;
     }
@@ -119,22 +118,6 @@ struct MppEncoder::Impl {
         std::memset(&encoder, 0, sizeof(encoder));
         initialized = false;
         callbackOk = true;
-        headerWritten = false;
-    }
-
-    bool ensureHeaderWritten()
-    {
-        if (headerWritten)
-            return true;
-
-        callbackOk = true;
-        if (rk_mpp_encoder_write_header(&encoder) != 0) {
-            setError("rk_mpp_encoder_write_header 失败");
-            return false;
-        }
-
-        headerWritten = true;
-        return checkCallbackOk();
     }
 
     bool sendFrame(const VideoFrame& frame, bool eos)
@@ -144,8 +127,6 @@ struct MppEncoder::Impl {
             return false;
         }
         if (!validateFrame(frame))
-            return false;
-        if (!ensureHeaderWritten())
             return false;
 
         callbackOk = true;
@@ -292,7 +273,6 @@ private:
     PacketCallback callback;
     bool initialized = false;
     bool callbackOk = true;
-    bool headerWritten = false;
     std::string lastError;
 };
 
