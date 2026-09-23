@@ -3949,3 +3949,134 @@ demo/AudioPlaybackManagerDemo.c
 同时从 CMake 和 RV1126B 构建脚本移除对应 target。`AudioPipelineDemo` / `AudioPipelineStressDemo` /
 `AudioFramePoolDemo` 覆盖新上行图，`AudioPlaybackPipelinePcmDemo` / `AudioPlaybackPipelineOpusDemo` 覆盖新的
 唯一扬声器入口；已有 `.opus` packet 文件仍可用两个 Opus playback demo 回归，不为清理旧 manager 新增重复 demo。
+
+## 2026-09-23
+
+### AAC-LC RTSP 音频接入、按客户端启停与接口收口
+
+本次把 IPC 的音频从“录音/编码 demo 闭环”接入正式的多路 RTSP Server。目标不是让每一路视频各自
+编码一份音频，而是让整台 IPC 的单路麦克风 PCM 只编码一次，再安全扇出给 `/main`、`/sub` 及其多个
+客户端。
+
+#### 1. 最终推流链路
+
+```text
+ALSA Capture（实际协商 PCM：当前 RV1126B 为 48kHz / mono / S16_LE）
+  -> AudioPipeline raw PCM Hub
+  -> 一个 AAC EncoderNode（仅有音频客户端时存在）
+  -> RtspAudioPublishSink
+  -> Live555RtspServer::pushAacAccessUnit()
+  -> /main AudioAccessUnitQueue
+  -> /sub  AudioAccessUnitQueue
+  -> 各 URL 的 AacAudioSubsession / AudioAccessUnitSource
+  -> MPEG4-GENERIC RTP（AAC-hbr）
+```
+
+`/main` 与 `/sub` queue 内只各自复制 `EncodedAudioPacketPtr`，共同引用同一份不可变 AAC payload；不复制
+压缩字节。进入 live555 `FramedSource` 时才有一次必要的 payload copy 到 live555 的 RTP 发送缓冲。当前
+128 kbit/s AAC 的数据量很小，这一次拷贝不是热点。
+
+每个 AAC AU 精确覆盖 1024 samples。`AudioAccessUnitSource` 用 `frameSamples` 推进 RTP 时间线，不能长期
+累计整数微秒时长，避免 `1024 / 48000 = 21.333...ms` 的取整漂移。
+
+#### 2. 不再让 App 手填编码器细节
+
+此前 `IpcApp.cpp` 需要手动填写：
+
+```cpp
+bitrate = 64000;
+frameSamples = 1024;
+maxPacketBytes = 2048;
+rtspAudio.pcmFormat = audioPipeline.captureFormat();
+```
+
+这会让业务层同时知道 AAC 的帧规范、包池大小、实际 PCM 与 SDP 细节，职责不合理。现在新增：
+
+```cpp
+enum class AudioBitratePreset { Low, Medium, High };
+
+pipeline.subscribeEncoded(AUDIO_CODEC_AAC, AudioBitratePreset::High, callback);
+pipeline.getEncodedStreamInfo(AUDIO_CODEC_AAC, AudioBitratePreset::High, info);
+```
+
+Pipeline 内部统一映射策略：
+
+| codec | Low | Medium | High（IPC 默认） |
+| --- | ---: | ---: | ---: |
+| AAC-LC | 64 kbit/s | 96 kbit/s | 128 kbit/s |
+| Opus VOIP | 16 kbit/s | 32 kbit/s | 64 kbit/s |
+
+AAC 内部固定 1024 samples；Opus 内部固定为 20ms。`AudioEncodedStreamInfo` 从已启动 Capture 读取真实协商的
+PCM 格式，同时携带 codec、码率、frameSamples。RTSP Server 用这份描述生成 SDP `rtpmap/config` 与 RTP
+clock，避免出现“设备实际 44.1kHz，但 SDP 硬编码宣称 48kHz”的格式契约错误。
+
+#### 3. 无客户端时不编码
+
+新增 `RtspAudioPublishSink`，由 `/main`、`/sub` 共同持有。它维护“有音频 PLAY 客户端的 URL 数”，而不是
+给每一个 client 创建订阅：
+
+```text
+任一 URL audio client：0 -> 1
+  -> live555 事件线程只调用 RtspAudioPublishSink::setStreamActive(true)
+  -> Sink 的控制 worker 调用 AudioPipeline::subscribeEncoded()
+  -> 创建一份 AAC EncoderNode；首包约一个 AAC AU（约 21ms）后可发送
+
+第二个及后续 client / 另一 URL 加入
+  -> 只增加引用计数，不重复创建编码器
+
+全部 URL audio client：1 -> 0
+  -> 先清理各自的 AudioAccessUnitQueue
+  -> Sink worker reset AudioSubscription
+  -> AAC EncoderNode 自动停止、析构；ALSA 原始 PCM 采集仍持续运行
+```
+
+创建/销毁编码器绝不在 live555 event-loop 执行；事件线程只改轻量状态、唤醒 Sink worker。这样不会因 FDK-AAC
+初始化或 `AudioPipeline` 订阅操作阻塞 RTSP 收发。Sink 的编码回调使用独立 `DispatchState`，不捕获 Sink 的
+裸 `this`；退订/析构时先关闭 dispatch，再取消 Hub 回调，避免已取得的 Hub callback snapshot 访问悬空对象。
+
+AAC-LC 不需要像视频 IDR 一样为新 client 请求关键帧：AAC AudioSpecificConfig 已通过 SDP 发送，下一包新的
+AAC access unit 即可解码。
+
+#### 4. 热路径与可观测性
+
+`Live555RtspServer::pushAacAccessUnit()` 原先每个 AAC 包都创建 `std::vector<PublishStreamPtr>` 快照。48kHz
+AAC 每秒约 47 包，虽小但会造成不必要的堆申请。由于 Server 运行期间禁止 `addStream()`，现在在注册 URL 时
+预先建立 `m_aacPublishStreams`，发送路径只在 Server 锁保护下遍历稳定表，不再逐 AU 分配 vector。
+
+补齐 APM Node 与 EncoderNode 的 PCM 输入队列溢出统计：队列满时淘汰最旧 10ms PCM 以追实时；首次及每 100
+次输出 WARN。EncoderNode 随后会从 PCM timestamp 缺口识别不连续并重建 codec 状态，不能跨时间缺口拼出同一
+个 AAC/Opus 包。
+
+板测期间发现日志条件必须排除零值：`droppedCount % 100 == 0` 在零时也成立，会导致没有丢帧却每 10ms 刷
+WARN。已修成 `droppedCount != 0 && (...)`，防止日志本身成为实时线程噪声。
+
+#### 5. RV1126B 实测
+
+使用 `root@192.168.1.4`，临时运行新 `ipc_app`，测试结束后恢复 `/oem/usr/bin/multicam_ipc_app` 原自启版本：
+
+```text
+空闲启动
+  AudioCapture: PCM=48000Hz 1ch S16_LE period=480
+  未出现 RtspAudioPublishSink “启动 AAC”日志，证明无人时不编码
+
+ffprobe TCP 拉 /main 音频
+  首个 client -> 启动一次 AAC-LC bitrate=128000
+  RTP PTS: 0, 1024, 2048, ...
+  client 退出 -> 停止一次 AAC 编码
+
+main + sub 重叠拉流
+  main 首先启动 AAC 一次
+  sub 加入不产生第二次 AAC 启动
+  两路退出后只停止一次 AAC 编码
+  main 收到 255 包，sub 收到 204 包
+```
+
+`cmake --build build/rv1126b-aarch64 --target ipc_app` 与 `./wsl-build.sh` 均通过，`git diff --check` 通过。
+
+#### 6. 后续边界
+
+- 监控 RTSP 目前采用 AAC-LC；Opus 编码支路仍保留给 WebRTC/对讲和相关 demo。
+- RTSP AAC queue 默认 8 AU，最坏约 171ms；正常 live555 会即时消费。若后续实测要更低延迟，可评估降到
+  4 AU（约 85ms），但不应无界堆积。
+- 若 AAC EncoderNode 运行期创建失败，Sink 会保留错误；在全部 client 离开、下一次 0->1 时允许重新尝试，
+  不把一次临时失败固化为永久不可恢复状态。

@@ -131,7 +131,7 @@ public:
 
         std::lock_guard<std::mutex> lock(m_state->mutex);
         const uint64_t subscriptionId = m_state->nextSubscriptionId++;
-        m_state->callbacks.emplace(subscriptionId, std::move(callback));
+        m_state->callbacks.emplace(subscriptionId, std::move(callback));//添加一个回调
         /* 写时复制：订阅通常极少变化，换取 10ms publish 路径零 Callback 堆分配。 */
         m_state->rebuildCallbackSnapshotLocked();
         return Subscription(m_state, subscriptionId);

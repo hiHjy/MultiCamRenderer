@@ -144,6 +144,7 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
     sampleRate = effectiveConfig.requestedFormat.sampleRate;
     channels = effectiveConfig.requestedFormat.channels;
     periodFrames = effectiveConfig.requestedPeriodFrames;
+    /* 硬件总缓冲（如 80ms）：上层传入 requestedBufferFrames（8 x 10ms = 80ms）；未指定时默认 4 个 period。 */
     bufferFrames = effectiveConfig.requestedBufferFrames == 0
                        ? periodFrames * 4
                        : effectiveConfig.requestedBufferFrames;
@@ -161,6 +162,7 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
                                                       &channels)) < 0 ||
         (result = snd_pcm_hw_params_set_period_size_near(playback->pcmHandle, hardwareParams,
                                                          &periodFrames, &direction)) < 0 ||
+        /* 告诉 ALSA 驱动开辟总深度为 bufferFrames（如 80ms）的硬件环形 DMA 缓冲。 */
         (result = snd_pcm_hw_params_set_buffer_size_near(playback->pcmHandle, hardwareParams,
                                                          &bufferFrames)) < 0 ||
         (result = snd_pcm_hw_params(playback->pcmHandle, hardwareParams)) < 0) {
@@ -171,9 +173,10 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
     }
 
     /*
-     * 默认 start threshold 往 buffer 尾部留一个 period：例如 8 x 10ms 的硬件 buffer
-     * 会在累积 70ms 后开始播放。否则默认策略可能第一块 10ms PCM 就立即起播，普通
-     * Linux 调度只要晚一个 period 就 XRUN，软件侧的 prebuffer 完全发挥不了作用。
+     * 默认 start threshold 往 buffer 尾部留一个 period：
+     * 例如 8 x 10ms (80ms) 的硬件 buffer，在此处计算为 80ms - 10ms = 70ms。
+     * ALSA 硬件驱动会在累积写满 70ms 深度后才开始触发 DMA 播放出声。
+     * 避免第一块 10ms PCM 写入就立刻起播，防止 Linux CFS 调度偶发晚 10ms 就饿死触发 XRUN。
      */
     startThresholdFrames = effectiveConfig.requestedStartThresholdFrames == 0
                                ? (bufferFrames > periodFrames ? bufferFrames - periodFrames
@@ -184,6 +187,7 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
     }
     snd_pcm_sw_params_alloca(&softwareParams);
     if ((result = snd_pcm_sw_params_current(playback->pcmHandle, softwareParams)) < 0 ||
+        /* 告诉 ALSA 驱动：数据未累积到 startThresholdFrames（如 70ms）前不启动硬件播放。 */
         (result = snd_pcm_sw_params_set_start_threshold(playback->pcmHandle,
                                                         softwareParams,
                                                         startThresholdFrames)) < 0 ||

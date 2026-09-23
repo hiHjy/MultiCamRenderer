@@ -26,10 +26,10 @@ cmake -S "${BASE}" -B "${BUILD_DIR}" -G Ninja \
 
 # RV1126B SDK 当前缺少 OpenSSL 开发头，带 TLS 的 live555 拉流 demo 无法在该 sysroot 下
 # 编译；IPC 推流服务、OSD demo 与独立音频采集/Opus 编码 demo 不依赖该路径。
-cmake --build "${BUILD_DIR}" --target ipc_app freetype_bitmap_demo audio_pipeline_demo audio_pipeline_stress_demo audio_frame_pool_demo audio_playback_pipeline_pcm_demo audio_playback_pipeline_opus_demo audio_capture_apm_pcm_demo audio_opus_playback_demo audio_apm_gain_demo audio_apm_aec_smoke_demo audio_mixer_inspect_demo --parallel "$(nproc)"
+cmake --build "${BUILD_DIR}" --target ipc_app freetype_bitmap_demo audio_pipeline_demo audio_pipeline_stress_demo audio_frame_pool_demo audio_playback_pipeline_pcm_demo audio_playback_pipeline_opus_demo audio_capture_aac_demo audio_pcm_capture_demo audio_pcm_playback_demo audio_capture_apm_pcm_demo audio_opus_playback_demo audio_apm_gain_demo audio_apm_aec_smoke_demo audio_mixer_inspect_demo audio_capture_and_playback --parallel "$(nproc)"
 
 if [[ -x "${BASE}/tools/update_compile_commands.sh" ]]; then
     "${BASE}/tools/update_compile_commands.sh" || true
 fi
 
-echo "=== built RV1126B targets (ipc_app, freetype_bitmap_demo, audio_pipeline_demo, audio_pipeline_stress_demo, audio_frame_pool_demo, audio_playback_pipeline_pcm_demo, audio_playback_pipeline_opus_demo, audio_capture_apm_pcm_demo, audio_opus_playback_demo, audio_apm_gain_demo, audio_apm_aec_smoke_demo, audio_mixer_inspect_demo): ${BUILD_DIR} ==="
+echo "=== built RV1126B targets (ipc_app, freetype_bitmap_demo, audio_pipeline_demo, audio_pipeline_stress_demo, audio_frame_pool_demo, audio_playback_pipeline_pcm_demo, audio_playback_pipeline_opus_demo, audio_capture_aac_demo, audio_pcm_capture_demo, audio_pcm_playback_demo, audio_capture_apm_pcm_demo, audio_opus_playback_demo, audio_apm_gain_demo, audio_apm_aec_smoke_demo, audio_mixer_inspect_demo, audio_capture_and_playback): ${BUILD_DIR} ==="

@@ -127,6 +127,7 @@ AudioEncodedPacket EncodedAudioPacket::packetView() const
     packet.data = bytes.empty() ? nullptr : bytes.data();
     packet.size = bytes.size();
     packet.timestampUs = timestampUs;
+    packet.frameSamples = frameSamples;
     packet.durationUs = durationUs;
     packet.sourceFormat = sourceFormat;
     return packet;
@@ -142,6 +143,7 @@ std::shared_ptr<const EncodedAudioPacket> EncodedAudioPacket::copyFrom(const Aud
     copied->codec = packet.codec;
     copied->bytes.assign(packet.data, packet.data + packet.size);
     copied->timestampUs = packet.timestampUs;
+    copied->frameSamples = packet.frameSamples;
     copied->durationUs = packet.durationUs;
     copied->sourceFormat = packet.sourceFormat;
     return copied;
@@ -193,6 +195,7 @@ EncodedAudioPacketPtr EncodedAudioPacketPool::copyFrom(const AudioEncodedPacket&
     std::memcpy(copied->bytes.data(), packet.data, packet.size);
     copied->codec = packet.codec;
     copied->timestampUs = packet.timestampUs;
+    copied->frameSamples = packet.frameSamples;
     copied->durationUs = packet.durationUs;
     copied->sourceFormat = packet.sourceFormat;
 
@@ -202,6 +205,7 @@ EncodedAudioPacketPtr EncodedAudioPacketPool::copyFrom(const AudioEncodedPacket&
         returned->bytes.clear();
         returned->codec = AUDIO_CODEC_UNKNOWN;
         returned->timestampUs = 0;
+        returned->frameSamples = 0;
         returned->durationUs = 0;
         returned->sourceFormat = {};
         std::lock_guard<std::mutex> lock(state->mutex);

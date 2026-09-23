@@ -52,6 +52,7 @@ static int encode_cached_frame(AudioOpusEncoder *encoder) {
     packet.data = encoder->packetBuffer;
     packet.size = (size_t)encodedBytes;
     packet.timestampUs = encoder->cachedTimestampUs;
+    packet.frameSamples = (uint32_t)encoder->frameSamples;
     packet.durationUs = encoder->frameDurationUs;
     packet.sourceFormat = encoder->inputFormat;
 

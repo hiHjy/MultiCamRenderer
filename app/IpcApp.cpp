@@ -1,7 +1,9 @@
 #include "CamManager.hpp"
+#include "AudioPipeline.hpp"
 #include "IspController.hpp"
 #include "Live555RtspServer.hh"
 #include "Log.hpp"
+#include "RtspAudioPublishSink.hpp"
 #include "RtspPublishSink.hpp"
 
 #include <chrono>
@@ -43,7 +45,14 @@ int main()
 
     CamManager cameraManager;
     Live555RtspServer rtspServer;
+    AudioPipeline audioPipeline;
 
+    // 音频采集与 AAC-LC 编码独立于 main/sub 视频分辨率：整台 IPC 只采集、编码一次，
+    // Server 再将同一份不可变 AAC 包分发到两个 URL 的独立 audio track queue。
+    if (!audioPipeline.startCapture()) {
+        LOG_ERROR("IpcApp", "启动音频采集失败: " << audioPipeline.lastError());
+        return 1;
+    }
     CamManager::CameraConfig mainCameraConfig {};
     mainCameraConfig.devicePath = kMainDevicePath;
     mainCameraConfig.width = 1920;
@@ -106,29 +115,51 @@ int main()
         return 1;
     }
 
+    /*
+     * 这一个 Sink 被 main/sub 共同使用：首个 audio client 到来时才在自己的 worker 中订阅
+     * AAC 编码；全部 audio client 离开后自动退订。App 不填写 PCM、1024 samples 或 bit/s。
+     */
+    auto audioPublishSink = std::make_shared<RtspAudioPublishSink>(
+        audioPipeline, rtspServer,
+        RtspAudioPublishSink::Config {AUDIO_CODEC_AAC, AudioBitratePreset::Medium});
+    if (!audioPublishSink->isReady()) {
+        LOG_ERROR("IpcApp", "创建 RTSP 音频发布 Sink 失败: " << audioPublishSink->lastError());
+        cameraManager.stopAllCameras();
+        cameraManager.shutdownPolling();
+        audioPipeline.stopCapture();
+        return 1;
+    }
+
     Live555RtspServer::StreamConfig mainRtspConfig {};
     mainRtspConfig.streamName = "main";
     mainRtspConfig.codec = VideoCodec::H265;
+    mainRtspConfig.audio.enabled = true;
+    mainRtspConfig.audio.encoded = audioPublishSink->streamInfo();
     Live555RtspServer::StreamConfig subRtspConfig {};
     subRtspConfig.streamName = "sub";
     subRtspConfig.codec = VideoCodec::H264;
-    if (!rtspServer.addStream(mainRtspConfig, mainPublishSink) ||
-        !rtspServer.addStream(subRtspConfig, subPublishSink)) {
+    subRtspConfig.audio = mainRtspConfig.audio;
+    if (!rtspServer.addStream(mainRtspConfig, mainPublishSink, audioPublishSink) ||
+        !rtspServer.addStream(subRtspConfig, subPublishSink, audioPublishSink)) {
         LOG_ERROR("IpcApp", "注册 RTSP stream 失败: " << rtspServer.lastError());
         cameraManager.stopAllCameras();
         cameraManager.shutdownPolling();
+        audioPipeline.stopCapture();
         return 1;
     }
 
     // 空用户名/密码表示不启用认证。
     if (!rtspServer.start(kRtspPort, "", "")) {
         LOG_ERROR("IpcApp", "启动 RTSP Server 失败: " << rtspServer.lastError());
+        audioPublishSink.reset();
+        audioPipeline.stopCapture();
         cameraManager.stopAllCameras();
         cameraManager.shutdownPolling();
         return 1;
     }
 
-    LOG_INFO("IpcApp", "IPC RTSP 服务已就绪（两路 VPSS 保持采集；无客户端时不编码）"
+    LOG_INFO("IpcApp", "IPC RTSP 服务已就绪（两路 VPSS 保持采集；无视频客户端时不编码；"
+                           "AAC-LC 在 main/sub 间共用一份编码）"
                            << " main=" << rtspServer.rtspURL("main")
                            << " sub=" << rtspServer.rtspURL("sub"));
 
@@ -137,6 +168,8 @@ int main()
 
     LOG_INFO("IpcApp", "收到退出信号，正在停止 IPC RTSP 服务");
     rtspServer.stop();
+    audioPublishSink.reset();
+    audioPipeline.stopCapture();
     cameraManager.stopAllCameras();
     cameraManager.shutdownPolling();
     return 0;

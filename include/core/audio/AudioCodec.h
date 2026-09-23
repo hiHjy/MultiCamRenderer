@@ -11,10 +11,19 @@ extern "C" {
 
 typedef int (*AudioEncodedPacketCallback)(const AudioEncodedPacket *packet, void *userData);
 
+/* 一个 Encoder Node 的编码策略。实际 PCM 格式来自 AudioFrame，而不是上层重复填写。 */
 typedef struct AudioEncoderConfig {
+    /* 要创建的压缩编码器，例如 AUDIO_CODEC_OPUS 或 AUDIO_CODEC_AAC。 */
     AudioCodec codec;
+    /* 目标平均码率，单位 bit/s。 */
     uint32_t bitrate;
+    /* 以微秒表示的请求编码帧时长。适用于 Opus 这类帧时长可选且能整除采样率的编码器。
+       若 frameSamples 非 0，编码器优先使用 frameSamples；AAC-LC 忽略此字段。 */
     uint32_t frameDurationUs;
+    /* 每个压缩包覆盖的准确每声道 sample 数。0 表示由 codec 根据 frameDurationUs 或自身
+       固定规范决定；AAC-LC 固定为 1024。此字段避免把 1024/48000 错截断为 21ms。 */
+    uint32_t frameSamples;
+    /* 单个编码包允许的最大字节数；池和底层临时输出 buffer 据此预分配。 */
     size_t maxPacketBytes;
 } AudioEncoderConfig;
 

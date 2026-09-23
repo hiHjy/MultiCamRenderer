@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 重新生成 third_party 下 opus 与 webrtc-audio-processing 的预编译库。
+# 重新生成 third_party 下 opus、fdk-aac 与 webrtc-audio-processing 的预编译库。
 #
 # 这两个依赖以"头文件 + 预编译静态库"的形式入库（同 third_party/live555），
 # 源码放在 $THIRD_PARTY_SRC_ROOT（默认 ~/third_party-src）下，不在仓库里。
@@ -24,10 +24,10 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # ---------------------------------------------------------------------------
 # 前置检查
 # ---------------------------------------------------------------------------
-for dir in opus abseil-cpp webrtc-audio-processing; do
+for dir in opus fdk-aac abseil-cpp webrtc-audio-processing; do
     if [[ ! -d "${SRC_ROOT}/${dir}" ]]; then
         echo "缺少源码 ${SRC_ROOT}/${dir}" >&2
-        echo "把 opus / abseil-cpp / webrtc-audio-processing 的源码放到该目录下再跑。" >&2
+        echo "把 opus / fdk-aac / abseil-cpp / webrtc-audio-processing 的源码放到该目录下再跑。" >&2
         exit 1
     fi
 done
@@ -62,6 +62,17 @@ for arch in "${ARCHES[@]}"; do
         -DOPUS_BUILD_DOCS=OFF >/dev/null
     cmake --build "${BUILD_ROOT}/opus-${arch}" --target opus --parallel "$(nproc)"
 
+    log "fdk-aac  ${arch}"
+    rm -rf "${BUILD_ROOT}/fdk-aac-${arch}"
+    cmake -S "${SRC_ROOT}/fdk-aac" -B "${BUILD_ROOT}/fdk-aac-${arch}" -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE="${toolchain}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_PROGRAMS=OFF \
+        -DFDK_AAC_INSTALL_CMAKE_CONFIG_MODULE=OFF \
+        -DFDK_AAC_INSTALL_PKGCONFIG_MODULE=OFF >/dev/null
+    cmake --build "${BUILD_ROOT}/fdk-aac-${arch}" --target fdk-aac --parallel "$(nproc)"
+
     log "webrtc-audio-processing + abseil  ${arch}"
     rm -rf "${BUILD_ROOT}/webrtc-${arch}"
     cmake -S "${SRC_ROOT}/webrtc-audio-processing" -B "${BUILD_ROOT}/webrtc-${arch}" -G Ninja \
@@ -74,11 +85,13 @@ done
 # 安装：库
 # ---------------------------------------------------------------------------
 for arch in "${ARCHES[@]}"; do
-    for pkg in opus webrtc-audio-processing; do
+    for pkg in opus fdk-aac webrtc-audio-processing; do
         mkdir -p "${BASE}/third_party/${pkg}/lib/aarch64-${arch}"
     done
     cp "${BUILD_ROOT}/opus-${arch}/libopus.a" \
        "${BASE}/third_party/opus/lib/aarch64-${arch}/"
+    cp "${BUILD_ROOT}/fdk-aac-${arch}/libfdk-aac.a" \
+       "${BASE}/third_party/fdk-aac/lib/aarch64-${arch}/"
     cp "${BUILD_ROOT}/webrtc-${arch}/libmcr_webrtc_apm.a" \
        "${BASE}/third_party/webrtc-audio-processing/lib/aarch64-${arch}/"
 done
@@ -145,8 +158,18 @@ PYEOF
 mkdir -p "${BASE}/third_party/opus/include"
 cp "${SRC_ROOT}"/opus/include/*.h "${BASE}/third_party/opus/include/"
 
+# FDK-AAC 的公开 API 只依赖这六个头；NOTICE 必须随二进制依赖一并保留。
+mkdir -p "${BASE}/third_party/fdk-aac/include"
+cp "${SRC_ROOT}/fdk-aac/libAACenc/include/aacenc_lib.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/libAACdec/include/aacdecoder_lib.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/libSYS/include/machine_type.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/libSYS/include/FDK_audio.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/libSYS/include/genericStds.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/libSYS/include/syslib_channelMapDescr.h" "${BASE}/third_party/fdk-aac/include/"
+cp "${SRC_ROOT}/fdk-aac/NOTICE" "${BASE}/third_party/fdk-aac/"
+
 # ---------------------------------------------------------------------------
 log "完成"
-du -sh "${BASE}/third_party/opus" "${BASE}/third_party/webrtc-audio-processing"
+du -sh "${BASE}/third_party/opus" "${BASE}/third_party/fdk-aac" "${BASE}/third_party/webrtc-audio-processing"
 echo
 echo "third_party 下的变更已就绪，确认无误后提交即可。"

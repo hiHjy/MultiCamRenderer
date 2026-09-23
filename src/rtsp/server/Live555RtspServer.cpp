@@ -1,7 +1,11 @@
 #include "Live555RtspServer.hh"
 
+#include "AacAudioSubsession.hh"
 #include "AnnexBFrameQueue.hh"
+#include "AudioAccessUnitQueue.hh"
+#include "AudioAac.h"
 #include "Log.hpp"
+#include "RtspAudioPublishSink.hpp"
 #include "RtspPublishSink.hpp"
 #include "VideoSubsession.hh"
 
@@ -32,15 +36,29 @@ const char* codecName(VideoCodec codec)
     return codec == VideoCodec::H264 ? "H264" : "H265";
 }
 
+bool isValidAacAudioConfig(const Live555RtspServer::AacAudioTrackConfig& audio)
+{
+    return !audio.enabled
+        || (audio.encoded.codec == AUDIO_CODEC_AAC && audio.encoded.sourceFormat.sampleRate != 0
+            && audio.encoded.sourceFormat.channels >= 1 && audio.encoded.sourceFormat.channels <= 2
+            && audio.encoded.sourceFormat.sampleFormat == AUDIO_SAMPLE_FORMAT_S16_LE
+            && audio.encoded.bitrate != 0 && audio.encoded.frameSamples == AUDIO_AAC_LC_FRAME_SAMPLES);
+}
+
 } // namespace
 
 Live555RtspServer::RtspPublishStream::RtspPublishStream(
     StreamConfig streamConfig,
-    std::weak_ptr<RtspPublishSink> streamPublishSink)
+    std::weak_ptr<RtspPublishSink> streamPublishSink,
+    std::weak_ptr<RtspAudioPublishSink> streamAudioPublishSink)
     : config(std::move(streamConfig)),
       publishSink(std::move(streamPublishSink)),
+      audioPublishSink(std::move(streamAudioPublishSink)),
       frameQueue(std::make_shared<AnnexBFrameQueue>())
 {
+    if (config.audio.enabled) {
+        audioQueue = std::make_shared<AudioAccessUnitQueue>();
+    }
 }
 
 Live555RtspServer::Live555RtspServer() = default;
@@ -51,7 +69,8 @@ Live555RtspServer::~Live555RtspServer()
 }
 
 bool Live555RtspServer::addStream(const StreamConfig& config,
-                                  const std::shared_ptr<RtspPublishSink>& publishSink)
+                                  const std::shared_ptr<RtspPublishSink>& publishSink,
+                                  const std::shared_ptr<RtspAudioPublishSink>& audioPublishSink)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_running.load()) {
@@ -70,8 +89,21 @@ bool Live555RtspServer::addStream(const StreamConfig& config,
         setErrorLocked("RTSP stream 缺少 RtspPublishSink: " + config.streamName);
         return false;
     }
+    if (!isValidAacAudioConfig(config.audio)) {
+        setErrorLocked("RTSP stream AAC 配置无效: " + config.streamName);
+        return false;
+    }
+    if (config.audio.enabled && (audioPublishSink == nullptr || !audioPublishSink->isReady())) {
+        setErrorLocked("RTSP stream 缺少可用 RtspAudioPublishSink: " + config.streamName);
+        return false;
+    }
 
-    m_streamMap.emplace(config.streamName, std::make_shared<RtspPublishStream>(config, publishSink));
+    const PublishStreamPtr stream = std::make_shared<RtspPublishStream>(config, publishSink, audioPublishSink);
+    m_streamMap.emplace(config.streamName, stream);
+    if (config.audio.enabled) {
+        /* addStream() 只能在 start() 前调用；此表在 RTSP 运行期间保持不变。 */
+        m_aacPublishStreams.push_back(stream);
+    }
     return true;
 }
 
@@ -102,8 +134,12 @@ bool Live555RtspServer::start(unsigned short rtspPort,
         const PublishStreamPtr& stream = entry.second;
         std::lock_guard<std::mutex> clientLock(stream->clientStateMutex);
         stream->activeClientCount = 0;
+        stream->activeAudioClientCount = 0;
         stream->url.clear();
         stream->frameQueue->clear();
+        if (stream->audioQueue != nullptr) {
+            stream->audioQueue->clear();
+        }
     }
 
     m_running.store(true);
@@ -164,6 +200,41 @@ bool Live555RtspServer::pushAnnexBFrame(const std::string& streamName,
 
     stream->frameQueue->pushAnnexBFrame(data, size, timestampUs);
     return true;
+}
+
+bool Live555RtspServer::pushAacAccessUnit(EncodedAudioPacketPtr packet)
+{
+    if (!packet || packet->codec != AUDIO_CODEC_AAC || packet->bytes.empty()) {
+        return false;
+    }
+
+    /*
+     * m_aacPublishStreams 只会在 start() 前写入。这里持有 Server 锁读取它，防止调用方
+     * 在尚未启动的边界错误地并发 addStream()；不再为每个 AAC 包复制 vector 快照。
+     * 锁顺序始终是 m_mutex -> clientStateMutex，与 start()/cleanup 路径一致。
+     */
+    std::lock_guard<std::mutex> serverLock(m_mutex);
+    const bool hasAacTrack = !m_aacPublishStreams.empty();
+    for (const PublishStreamPtr& stream : m_aacPublishStreams) {
+        std::lock_guard<std::mutex> lock(stream->clientStateMutex);
+        if (stream->audioQueue == nullptr) {
+            continue;
+        }
+        if (stream->activeAudioClientCount == 0) {
+            continue;
+        }
+
+        // 这里只复制 shared_ptr；main/sub 的 queue 共同引用 AudioPipeline 编出的同一份 AAC payload。
+        const bool dropped = stream->audioQueue->push(packet);
+        if (dropped) {
+            const uint64_t droppedCount = stream->audioQueue->droppedAccessUnits();
+            if (droppedCount == 1 || droppedCount % 100 == 0) {
+                LOG_WARN("Live555RtspServer", "stream=" << stream->config.streamName
+                                                            << " AAC queue 已淘汰旧包累计=" << droppedCount);
+            }
+        }
+    }
+    return hasAacTrack;
 }
 
 bool Live555RtspServer::isRunning() const
@@ -274,6 +345,12 @@ bool Live555RtspServer::setupLive555()
         session->addSubsession(VideoSubsession::createNew(
             *m_env, stream->frameQueue, config.codec,
             [this, stream](bool started) { onClientPlaybackStateChanged(stream, started); }));
+        if (config.audio.enabled) {
+            session->addSubsession(AacAudioSubsession::createNew(
+                *m_env, stream->audioQueue, config.audio.encoded.sourceFormat,
+                config.audio.encoded.bitrate / 1000,
+                [this, stream](bool started) { onAudioClientPlaybackStateChanged(stream, started); }));
+        }
         m_server->addServerMediaSession(session);
 
         char* url = m_server->rtspURL(session);
@@ -293,7 +370,14 @@ bool Live555RtspServer::setupLive555()
 
         LOG_INFO("Live555RtspServer", "注册 RTSP stream=" << config.streamName
                                                                << " url=" << rtspURL(config.streamName)
-                                                               << " codec=" << codecName(config.codec));
+                                                               << " video=" << codecName(config.codec)
+                                                               << (config.audio.enabled
+                                                                       ? " audio=AAC-LC/"
+                                                                           + std::to_string(config.audio.encoded.sourceFormat.sampleRate)
+                                                                           + "Hz/"
+                                                                           + std::to_string(config.audio.encoded.sourceFormat.channels)
+                                                                           + "ch"
+                                                                       : ""));
     }
     return true;
 }
@@ -322,18 +406,29 @@ void Live555RtspServer::cleanupLive555()
     m_scheduler = nullptr;
 
     std::vector<std::shared_ptr<RtspPublishSink>> sinksToStop;
+    std::vector<std::shared_ptr<RtspAudioPublishSink>> audioSinksToStop;
     for (const auto& entry : m_streamMap) {
         const PublishStreamPtr& stream = entry.second;
         bool hadActiveClient = false;
+        bool hadActiveAudioClient = false;
         {
             std::lock_guard<std::mutex> clientLock(stream->clientStateMutex);
             hadActiveClient = stream->activeClientCount != 0;
+            hadActiveAudioClient = stream->activeAudioClientCount != 0;
             stream->activeClientCount = 0;
+            stream->activeAudioClientCount = 0;
             stream->frameQueue->clear();
+            if (stream->audioQueue != nullptr) {
+                stream->audioQueue->clear();
+            }
         }
         if (hadActiveClient) {
             if (const std::shared_ptr<RtspPublishSink> sink = stream->publishSink.lock())
                 sinksToStop.push_back(sink);
+        }
+        if (hadActiveAudioClient) {
+            if (const std::shared_ptr<RtspAudioPublishSink> sink = stream->audioPublishSink.lock())
+                audioSinksToStop.push_back(sink);
         }
     }
 
@@ -341,6 +436,47 @@ void Live555RtspServer::cleanupLive555()
     // 确保编码 worker 必定停下来。不能持有 clientStateMutex 调用外部代码。
     for (const std::shared_ptr<RtspPublishSink>& sink : sinksToStop)
         sink->onClientPlaybackEvent(RtspClientPlaybackEvent::LastClientStopped);
+    for (const std::shared_ptr<RtspAudioPublishSink>& sink : audioSinksToStop)
+        sink->setStreamActive(false);
+}
+
+void Live555RtspServer::onAudioClientPlaybackStateChanged(const PublishStreamPtr& stream, bool started)
+{
+    bool shouldNotifySink = false;
+    bool sinkActive = false;
+    unsigned activeAudioClientCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(stream->clientStateMutex);
+        if (stream->audioQueue == nullptr) {
+            return;
+        }
+        if (started) {
+            ++stream->activeAudioClientCount;
+            shouldNotifySink = stream->activeAudioClientCount == 1;
+            sinkActive = true;
+        } else {
+            if (stream->activeAudioClientCount == 0) {
+                return;
+            }
+            --stream->activeAudioClientCount;
+            if (stream->activeAudioClientCount == 0) {
+                stream->audioQueue->clear();
+                shouldNotifySink = true;
+            }
+        }
+        activeAudioClientCount = stream->activeAudioClientCount;
+    }
+
+    LOG_INFO("Live555RtspServer", "stream=" << stream->config.streamName
+                                                 << " active audio clients=" << activeAudioClientCount
+                                                 << (!started && activeAudioClientCount == 0 ? " (queue cleared)" : ""));
+
+    // 与视频一样，不持有 clientStateMutex 调用外部 Sink；Sink 只投递 worker 控制命令。
+    if (shouldNotifySink) {
+        if (const std::shared_ptr<RtspAudioPublishSink> sink = stream->audioPublishSink.lock()) {
+            sink->setStreamActive(sinkActive);
+        }
+    }
 }
 
 void Live555RtspServer::onClientPlaybackStateChanged(const PublishStreamPtr& stream, bool started)

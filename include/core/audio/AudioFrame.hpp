@@ -57,10 +57,17 @@ private:
  * 同样不直接转交 AudioEncoder 回调中的 data 指针，确保 packetHub 的消费者可以异步入队。
  */
 struct EncodedAudioPacket {
+    /* 压缩编码类型。 */
     AudioCodec codec = AUDIO_CODEC_UNKNOWN;
+    /* 此对象拥有的压缩 access-unit payload。 */
     std::vector<uint8_t> bytes;
+    /* 本包第一 sample 的单调时钟时间戳。 */
     uint64_t timestampUs = 0;
+    /* 本包准确的每声道 sample 数；RTP 时间戳推进应使用它。 */
+    uint32_t frameSamples = 0;
+    /* 近似微秒时长，仅作队列时长预算；不能用于长期累计的精确时钟。 */
     uint32_t durationUs = 0;
+    /* 编码前 PCM 格式。 */
     AudioPcmFormat sourceFormat {};
 
     AudioEncodedPacket packetView() const;
@@ -68,6 +75,19 @@ struct EncodedAudioPacket {
 };
 
 using EncodedAudioPacketPtr = std::shared_ptr<const EncodedAudioPacket>;
+
+/*
+ * 一条压缩音频流在建链前即可确定的媒体描述。
+ *
+ * sourceFormat 是实际采集 PCM 的格式；RTSP SDP 与 RTP 时钟必须使用它，而不是硬编码的
+ * “期望 48k mono”。AudioPipeline 根据 codec/质量档位填充 bitrate 和 frameSamples。
+ */
+struct AudioEncodedStreamInfo {
+    AudioCodec codec = AUDIO_CODEC_UNKNOWN;
+    AudioPcmFormat sourceFormat {};
+    uint32_t bitrate = 0;
+    uint32_t frameSamples = 0;
+};
 
 /* 与 AudioFramePool 相同的语义，但 buffer 容纳的是压缩编码包。 */
 class EncodedAudioPacketPool {

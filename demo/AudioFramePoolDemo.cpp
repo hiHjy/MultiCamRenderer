@@ -58,7 +58,7 @@ int main()
 
     std::array<uint8_t, 64> opusBytes {};
     const AudioEncodedPacket opus {
-        AUDIO_CODEC_OPUS, opusBytes.data(), opusBytes.size(), 123456, 20000, pcmFormat
+        AUDIO_CODEC_OPUS, opusBytes.data(), opusBytes.size(), 123456, 960, 20000, pcmFormat
     };
     EncodedAudioPacketPool packetPool(2, 128);
     EncodedAudioPacketPtr packetFirst = packetPool.copyFrom(opus);

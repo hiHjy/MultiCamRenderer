@@ -45,8 +45,28 @@ struct AudioEncodedRequest {
 };
 
 /*
- * 外部订阅的 RAII 句柄。析构或 reset() 后取消回调；句柄同时保持所需 Node 存活。
- * 必须保存返回值，不能 subscribe 后立即丢弃。
+ * 面向业务层的音频质量档位。数值由 codec 决定，不能把同一个 bit/s 生搬到 AAC 和 Opus：
+ *
+ *   AAC-LC：Low=64k，Medium=96k，High=128k（默认）
+ *   Opus：  Low=16k，Medium=32k，High=64k（VOIP）
+ *
+ * 业务层只选择听感/带宽策略，不填写 bitrate、AAC 1024 samples 或 Opus 20ms 等 codec 细节。
+ */
+enum class AudioBitratePreset {
+    Low,
+    Medium,
+    High,
+};
+
+/*
+ * 外部订阅的生命周期句柄（RAII 遥控器）。
+ *
+ * 【设计哲学】：
+ *   1. 谁持有句柄，谁就保持对应的数据流和处理 Node（ApmNode/EncoderNode）存活；
+ *   2. 业务结束退出（如句柄析构或显式调用 reset() 时），自动取消 Hub 回调，
+ *      且底层的中间处理 Node 在没有其他人使用时会自动停止线程并销毁；
+ *   3. ⚠️ 重要用法：必须用变量保存 subscribePcm / subscribeEncoded 的返回值！
+ *      若直接丢弃返回值，该句柄会在当前行结束时立即析构，导致刚建立的订阅瞬间被取消。
  */
 class AudioSubscription {
 public:
@@ -100,6 +120,22 @@ public:
     AudioSubscription subscribeEncoded(const AudioEncodedRequest& request,
                                        EncodedPacketCallback callback);
 
+    /*
+     * 业务层的简化编码订阅接口。内部按 codec/preset 填写完整 AudioEncoderConfig；
+     * AAC-LC 固定 1024 samples，Opus 使用 20ms，调用方无须重复填写这些底层参数。
+     */
+    AudioSubscription subscribeEncoded(AudioCodec codec,
+                                       AudioBitratePreset preset,
+                                       EncodedPacketCallback callback);
+
+    /*
+     * 返回与上述简化订阅完全同一套策略、且绑定实际采集 PCM 的流描述。
+     * 必须在 startCapture() 成功后调用；失败时返回 false，可由 lastError() 查询原因。
+     */
+    bool getEncodedStreamInfo(AudioCodec codec,
+                              AudioBitratePreset preset,
+                              AudioEncodedStreamInfo& info) const;
+
     std::string lastError() const;
 
 private:
@@ -118,7 +154,7 @@ private:
     std::vector<std::shared_ptr<EncoderNode>> collectEncoderNodesLocked();
     bool startNodeLocked(const std::shared_ptr<ApmNode>& node);
     bool startNodeLocked(const std::shared_ptr<EncoderNode>& node);
-    void setErrorLocked(const std::string& message);
+    void setErrorLocked(const std::string& message) const;
 
     mutable std::mutex m_mutex;
     AudioPipelineConfig m_config;
@@ -131,5 +167,5 @@ private:
     std::vector<std::weak_ptr<ApmNode>> m_apmNodes;
     std::vector<std::weak_ptr<EncoderNode>> m_encoderNodes;
     bool m_captureRunning = false;
-    std::string m_lastError;
+    mutable std::string m_lastError;
 };

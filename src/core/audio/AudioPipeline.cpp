@@ -1,5 +1,6 @@
 #include "AudioPipeline.hpp"
 
+#include "AudioAac.h"
 #include "Log.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <thread>
 #include <utility>
 
@@ -41,6 +43,7 @@ bool sameEncoderConfig(const AudioEncoderConfig& left, const AudioEncoderConfig&
 {
     return left.codec == right.codec && left.bitrate == right.bitrate
         && left.frameDurationUs == right.frameDurationUs
+        && left.frameSamples == right.frameSamples
         && left.maxPacketBytes == right.maxPacketBytes;
 }
 
@@ -64,6 +67,40 @@ bool isTimestampDiscontinuous(uint64_t expectedTimestampUs, uint64_t actualTimes
         ? expectedTimestampUs - actualTimestampUs
         : actualTimestampUs - expectedTimestampUs;
     return delta > 1000ULL;
+}
+
+bool makeEncoderConfig(AudioCodec codec, AudioBitratePreset preset, AudioEncoderConfig& config)
+{
+    audio_encoder_config_init(&config);
+    config.codec = codec;
+
+    switch (codec) {
+    case AUDIO_CODEC_AAC:
+        /* AAC-LC 原始 access unit 固定覆盖 1024 samples；64/96/128k 是常用监控档位。 */
+        config.bitrate = preset == AudioBitratePreset::Low ? 64000
+            : preset == AudioBitratePreset::Medium ? 96000
+                                                  : 128000;
+        config.frameDurationUs = 0;
+        config.frameSamples = AUDIO_AAC_LC_FRAME_SAMPLES;
+        config.maxPacketBytes = 2048;
+        return true;
+
+    case AUDIO_CODEC_OPUS:
+        /* Opus VOIP 使用 20ms 包；16/32/64k 分别覆盖低带宽、普通语音和高质量语音。 */
+        config.bitrate = preset == AudioBitratePreset::Low ? 16000
+            : preset == AudioBitratePreset::Medium ? 32000
+                                                  : 64000;
+        config.frameDurationUs = 20000;
+        config.frameSamples = 0;
+        config.maxPacketBytes = 1200;
+        return true;
+
+    case AUDIO_CODEC_UNKNOWN:
+    case AUDIO_CODEC_G711A:
+    case AUDIO_CODEC_G711U:
+        return false;
+    }
+    return false;
 }
 
 } // namespace
@@ -170,6 +207,7 @@ public:
         m_format = format;
         m_outputFramePool = std::make_shared<AudioFramePool>(
             m_framePoolCapacity, pcmBufferBytes(format, maximumInputFrames));
+        m_droppedInputFrames = 0;
         m_droppedOutputFramesByPool = 0;
         m_warmupFramesRemaining = (static_cast<uint64_t>(m_warmupDiscardDurationMs) * format.sampleRate + 999ULL) / 1000ULL;
         m_stopRequested = false;
@@ -203,16 +241,24 @@ public:
         if (!frame) {
             return;
         }
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_running || m_stopRequested) {
-            return;
+        uint64_t droppedCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_running || m_stopRequested) {
+                return;
+            }
+            if (m_queue.size() == m_queueCapacity) {
+                /* APM 跟不上采集时追实时：淘汰最旧 10ms PCM，而不是继续累计延迟。 */
+                m_queue.pop_front();
+                droppedCount = ++m_droppedInputFrames;
+            }
+            m_queue.push_back(std::move(frame));
+            m_cv.notify_one();
         }
-        if (m_queue.size() == m_queueCapacity) {
-            m_queue.pop_front();
-            ++m_droppedInputFrames;
+        if (droppedCount != 0 && (droppedCount == 1 || droppedCount % 100 == 0)) {
+            LOG_WARN("ApmNode", "APM 输入 PCM 队列已满，淘汰旧 10ms 帧累计=" << droppedCount
+                                << " queueCapacity=" << m_queueCapacity);
         }
-        m_queue.push_back(std::move(frame));
-        m_cv.notify_one();
     }
 
     const std::shared_ptr<AudioPcmHub>& outputHub() const
@@ -347,6 +393,7 @@ public:
 
         m_packetPool = std::make_shared<EncodedAudioPacketPool>(m_packetPoolCapacity,
                                                                  m_config.maxPacketBytes);
+        m_droppedInputFrames = 0;
         m_droppedOutputPacketsByPool = 0;
         audio_encoder_set_packet_callback(&m_encoder, &EncoderNode::onEncodedPacket, this);
         if (!initializeEncoderLocked(format)) {
@@ -386,16 +433,24 @@ public:
         if (!frame) {
             return;
         }
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_running || m_stopRequested) {
-            return;
+        uint64_t droppedCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_running || m_stopRequested) {
+                return;
+            }
+            if (m_queue.size() == m_queueCapacity) {
+                /* 编码跟不上采集时追实时；worker 会据时间戳断裂重建 AAC/Opus 状态。 */
+                m_queue.pop_front();
+                droppedCount = ++m_droppedInputFrames;
+            }
+            m_queue.push_back(std::move(frame));
+            m_cv.notify_one();
         }
-        if (m_queue.size() == m_queueCapacity) {
-            m_queue.pop_front();
-            ++m_droppedInputFrames;
+        if (droppedCount != 0 && (droppedCount == 1 || droppedCount % 100 == 0)) {
+            LOG_WARN("EncoderNode", "编码输入 PCM 队列已满，淘汰旧 10ms 帧累计=" << droppedCount
+                                    << " queueCapacity=" << m_queueCapacity);
         }
-        m_queue.push_back(std::move(frame));
-        m_cv.notify_one();
     }
 
     const std::shared_ptr<AudioEncodedPacketHub>& outputHub() const
@@ -569,6 +624,8 @@ bool AudioPipeline::startCapture()
         setErrorLocked("音频采集设备没有返回有效 PCM 格式");
         return false;
     }
+
+	//默认 480 x 2 x 1 = 960B
     m_rawFramePool = std::make_shared<AudioFramePool>(
         m_config.pcmFramePoolCapacity, pcmBufferBytes(m_captureFormat, m_capturePeriodFrames));
     m_droppedRawFramesByPool = 0;
@@ -668,6 +725,21 @@ AudioPcmFormat AudioPipeline::captureFormat() const
     return m_captureFormat;
 }
 
+/*
+ * =========================================================================================
+ * 订阅线路 1：subscribePcm (订阅 PCM 原始/降噪后的音频帧)
+ *
+ * 【业务调用示例】：
+ *   AudioPcmRequest req;
+ *   req.useApm = true; // 是否开启 3A (AEC/ANS/AGC)
+ *   AudioSubscription sub = pipeline.subscribePcm(req, [](AudioFramePtr frame) { ... });
+ *
+ * 【核心设计】：
+ *   1. 若无需 APM，直接挂在采集源的 m_rawPcmHub 上；
+ *   2. 若需 APM，复用或新建一个 ApmNode，挂在 ApmNode->outputHub() 上；
+ *   3. 返回 AudioSubscription 句柄，内部通过 keepAlive 强引用 ApmNode，实现 RAII 生命周期绑定。
+ * =========================================================================================
+ */
 AudioSubscription AudioPipeline::subscribePcm(const AudioPcmRequest& request, PcmCallback callback)
 {
     if (!callback) {
@@ -679,25 +751,51 @@ AudioSubscription AudioPipeline::subscribePcm(const AudioPcmRequest& request, Pc
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!request.useApm) {
+            // 分支 A：不需要 3A 处理，直接订阅麦克风原始采集的 rawPcmHub
             hub = m_rawPcmHub;
         } else {
+            // 分支 B：需要 3A 处理，复用或创建对应的 ApmNode
             const std::shared_ptr<ApmNode> node = findOrCreateApmNodeLocked(request);
             if (!node) {
                 return {};
             }
+            // 订阅的数据来源切换为该 ApmNode 处理后的 outputHub
             hub = node->outputHub();
+
+            // 将 ApmNode 的 shared_ptr 放入 keepAlive 结构体中
+            // 只要最终返回的 AudioSubscription 活着，这个 ApmNode 就不会被析构销毁
             keepAlive = std::make_shared<KeepAlive>();
             keepAlive->nodes.push_back(node);
         }
     }
 
-    auto holder = std::make_shared<AudioPcmHub::Subscription>(hub->subscribe(std::move(callback)));
+    // 在目标 Hub 上注册回调函数；返回底层 Hub 的 Subscription 句柄
+	//hub->subscribe(std::move(callback) 返回 AudioPcmHub::Subscription对象
+    std::shared_ptr<AudioPcmHub::Subscription> holder = std::make_shared<AudioPcmHub::Subscription>(hub->subscribe(std::move(callback)));
     if (!holder->valid()) {
         return {};
     }
+
+    // 封装并返回高阶句柄 AudioSubscription：
+    // - 第一个参数是退订动作：当句柄析构时调用 holder->reset() 取消 Hub 回调；
+    // - 第二个参数是保活指针 keepAlive：句柄析构时释放 Node 强引用，若无其他人使用该 Node，Node 自动销毁退出。
     return AudioSubscription([holder] { holder->reset(); }, keepAlive);
 }
 
+/*
+ * =========================================================================================
+ * 订阅线路 2：subscribeEncoded (订阅 Opus 编码压缩包，用于 RTSP 推流或网络传输)
+ *
+ * 【数据流水线拓扑】：
+ *   声卡采集 (rawPcmHub) -> [ApmNode 3A处理(可选)] -> EncoderNode (Opus编码) -> 业务回调
+ *
+ * 【核心设计】：
+ *   1. 确定输入源：rawPcmHub 或 ApmNode->outputHub()；
+ *   2. 挂载 EncoderNode：复用或新建对应编码参数的 EncoderNode，输入端接在上面的源头上；
+ *   3. 将业务回调挂在 EncoderNode->outputHub()；
+ *   4. 返回 AudioSubscription 句柄，同时把 ApmNode 和 EncoderNode 塞入 keepAlive 保活。
+ * =========================================================================================
+ */
 AudioSubscription AudioPipeline::subscribeEncoded(const AudioEncodedRequest& request,
                                                    EncodedPacketCallback callback)
 {
@@ -709,7 +807,11 @@ AudioSubscription AudioPipeline::subscribeEncoded(const AudioEncodedRequest& req
     auto keepAlive = std::make_shared<KeepAlive>();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+
+        // 步骤 1：默认输入源为原始麦克风 PCM
         std::shared_ptr<AudioPcmHub> inputHub = m_rawPcmHub;
+
+        // 步骤 2：若请求开启 APM，先串入 ApmNode
         if (request.useApm) {
             AudioPcmRequest apmRequest;
             apmRequest.useApm = true;
@@ -719,23 +821,72 @@ AudioSubscription AudioPipeline::subscribeEncoded(const AudioEncodedRequest& req
             if (!apmNode) {
                 return {};
             }
+            // 编码器的输入源切换为 ApmNode 的输出
             inputHub = apmNode->outputHub();
+            // ApmNode 纳入保活名单
             keepAlive->nodes.push_back(apmNode);
         }
 
+        // 步骤 3：在输入源后面拼接 EncoderNode (Opus 编码器节点)
         const std::shared_ptr<EncoderNode> encoderNode = findOrCreateEncoderNodeLocked(inputHub, request);
         if (!encoderNode) {
             return {};
         }
+        // EncoderNode 纳入保活名单
         keepAlive->nodes.push_back(encoderNode);
+
+        // 最终业务回调要监听的是 EncoderNode 压出 Opus 包后的 outputHub
         hub = encoderNode->outputHub();
     }
 
+    // 在编码包 Hub 上注册业务回调函数
     auto holder = std::make_shared<AudioEncodedPacketHub::Subscription>(hub->subscribe(std::move(callback)));
     if (!holder->valid()) {
         return {};
     }
+
+    // 返回 RAII 句柄：
+    // - 只要外部持有该返回值，整条链路（ApmNode + EncoderNode）就保持运行；
+    // - 外部一旦丢弃或重置该返回值，holder 退订、keepAlive 释放，链条上的节点自动停止并回收。
     return AudioSubscription([holder] { holder->reset(); }, keepAlive);
+}
+
+AudioSubscription AudioPipeline::subscribeEncoded(AudioCodec codec,
+                                                   AudioBitratePreset preset,
+                                                   EncodedPacketCallback callback)
+{
+    AudioEncodedRequest request;
+    if (!makeEncoderConfig(codec, preset, request.encoderConfig)) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        setErrorLocked("不支持按预设创建的音频编码器");
+        return {};
+    }
+    return subscribeEncoded(request, std::move(callback));
+}
+
+bool AudioPipeline::getEncodedStreamInfo(AudioCodec codec,
+                                         AudioBitratePreset preset,
+                                         AudioEncodedStreamInfo& info) const
+{
+    AudioEncoderConfig config {};
+    if (!makeEncoderConfig(codec, preset, config)) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        setErrorLocked("不支持按预设创建的音频编码器");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_captureRunning || m_captureFormat.sampleRate == 0 || m_captureFormat.channels == 0
+        || m_captureFormat.sampleFormat != AUDIO_SAMPLE_FORMAT_S16_LE) {
+        setErrorLocked("音频采集尚未启动，无法取得实际 PCM 格式");
+        return false;
+    }
+
+    info.codec = codec;
+    info.sourceFormat = m_captureFormat;
+    info.bitrate = config.bitrate;
+    info.frameSamples = config.frameSamples;
+    return true;
 }
 
 std::string AudioPipeline::lastError() const
@@ -773,19 +924,34 @@ void AudioPipeline::publishCapturedPcm(const AudioPcmFrame& frame)
     m_rawPcmHub->publish(copied);
 }
 
+/*
+ * -----------------------------------------------------------------------------------------
+ * 辅助函数：findOrCreateApmNodeLocked (查找或创建 ApmNode)
+ *
+ * 【为什么内部存的是 weak_ptr？】
+ *   AudioPipeline 自己不强行霸占 ApmNode 的生命周期，而是使用弱引用 weak_ptr。
+ *   - 只要外部有人在订阅（持有 AudioSubscription -> keepAlive 强引用），这个 ApmNode 就活着；
+ *   - 一旦所有订阅者都退出了，ApmNode 自动析构；这里遍历时 lock() 就会变空，自动从列表中剔除。
+ * -----------------------------------------------------------------------------------------
+ */
 std::shared_ptr<AudioPipeline::ApmNode> AudioPipeline::findOrCreateApmNodeLocked(const AudioPcmRequest& request)
 {
+    // 步骤 1：遍历已有缓存的 ApmNode 弱引用列表
     for (auto it = m_apmNodes.begin(); it != m_apmNodes.end();) {
         if (const std::shared_ptr<ApmNode> node = it->lock()) {
+            // 该节点依然存活，检查其 3A 配置与预热丢弃参数是否和请求完全一致
             if (node->matches(request)) {
+                // 完美命中！直接复用该节点，避免重复创建多个相同的 WebRTC 实例消耗 CPU
                 return node;
             }
             ++it;
         } else {
+            // 该弱引用指向的节点已经死掉了（所有订阅者都已退订），顺手把它从列表中清理掉
             it = m_apmNodes.erase(it);
         }
     }
 
+    // 步骤 2：没有找到可复用的节点，新实例化一个 ApmNode
     auto node = std::make_shared<ApmNode>(request.apmConfig,
                                           request.apmWarmupDiscardDurationMs,
                                           m_config.defaultNodeQueueCapacity,
@@ -795,10 +961,19 @@ std::shared_ptr<AudioPipeline::ApmNode> AudioPipeline::findOrCreateApmNodeLocked
     if (m_captureRunning && !startNodeLocked(node)) {
         return nullptr;
     }
+    // 存入 weak_ptr 列表方便后续其他订阅者复用
     m_apmNodes.push_back(node);
     return node;
 }
 
+/*
+ * -----------------------------------------------------------------------------------------
+ * 辅助函数：findOrCreateEncoderNodeLocked (查找或创建 EncoderNode)
+ *
+ * 逻辑同上：按 (输入源 inputHub + 编码参数) 查找是否已有运行中的编码器节点；
+ * 有则复用，无则新建并挂在对应 inputHub 下。
+ * -----------------------------------------------------------------------------------------
+ */
 std::shared_ptr<AudioPipeline::EncoderNode> AudioPipeline::findOrCreateEncoderNodeLocked(
     const std::shared_ptr<AudioPcmHub>& inputHub,
     const AudioEncodedRequest& request)
@@ -808,17 +983,21 @@ std::shared_ptr<AudioPipeline::EncoderNode> AudioPipeline::findOrCreateEncoderNo
         normalizedRequest.inputQueueCapacity = m_config.defaultNodeQueueCapacity;
     }
 
+    // 步骤 1：遍历查找可复用的 EncoderNode
     for (auto it = m_encoderNodes.begin(); it != m_encoderNodes.end();) {
         if (const std::shared_ptr<EncoderNode> node = it->lock()) {
+            // 检查输入源 Hub 是否相同，且编码参数是否匹配
             if (node->matches(inputHub, normalizedRequest)) {
                 return node;
             }
             ++it;
         } else {
+            // 清理已死亡的弱引用
             it = m_encoderNodes.erase(it);
         }
     }
 
+    // 步骤 2：未找到则创建新的 Opus 编码器节点
     auto node = std::make_shared<EncoderNode>(inputHub,
                                               normalizedRequest.encoderConfig,
                                               normalizedRequest.inputQueueCapacity,
@@ -878,7 +1057,7 @@ bool AudioPipeline::startNodeLocked(const std::shared_ptr<EncoderNode>& node)
     return false;
 }
 
-void AudioPipeline::setErrorLocked(const std::string& message)
+void AudioPipeline::setErrorLocked(const std::string& message) const
 {
     m_lastError = message;
     LOG_ERROR("AudioPipeline", message);

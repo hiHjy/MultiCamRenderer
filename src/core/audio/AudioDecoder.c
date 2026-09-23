@@ -1,5 +1,6 @@
 #include "AudioDecoder.h"
 
+#include "AacDecoderInternal.h"
 #include "OpusDecoderInternal.h"
 
 #include <errno.h>
@@ -31,10 +32,12 @@ int audio_decoder_init(AudioDecoder *decoder,
     case AUDIO_CODEC_OPUS:
         result = audio_opus_decoder_create(decoder, outputFormat, &implementation, &ops);
         break;
+    case AUDIO_CODEC_AAC:
+        result = audio_aac_decoder_create(decoder, outputFormat, &implementation, &ops);
+        break;
     case AUDIO_CODEC_UNKNOWN:
     case AUDIO_CODEC_G711A:
     case AUDIO_CODEC_G711U:
-    case AUDIO_CODEC_AAC:
     default:
         return -ENOTSUP;
     }

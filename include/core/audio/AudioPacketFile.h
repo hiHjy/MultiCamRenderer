@@ -10,13 +10,18 @@ extern "C" {
 #endif
 
 /*
- * 仅供 demo 使用的简单 Opus packet 文件，不是 Ogg/MP4 容器：
- * 文件头记录 codec/PCM 格式；每个 record 保存 PTS、包长与原始编码 payload。
- * 这样可以无歧义重放 Opus 包，且后续 RTSP 接入不会依赖该格式。
+ * 仅供 demo 使用的简单压缩音频 packet 文件，不是 Ogg/MP4 容器：
+ * 文件头记录 codec/PCM 格式与准确帧样本数；每个 record 保存 PTS、包长与原始 access unit。
+ * 它用于验证 AudioPipeline 编解码闭环，正式 RTSP 不依赖该格式。
  */
 typedef struct AudioPacketFileInfo {
+    /* 文件内 access unit 的编码类型，当前支持 Opus 与 AAC-LC。 */
     AudioCodec codec;
+    /* 生成这些压缩包时的 PCM 格式。 */
     AudioPcmFormat sourceFormat;
+    /* 每个压缩包覆盖的准确每声道 sample 数；AAC-LC 为 1024。 */
+    uint32_t frameSamples;
+    /* frameSamples 换算得到的近似微秒时长，兼容旧 Opus 测试文件。 */
     uint32_t frameDurationUs;
 } AudioPacketFileInfo;
 

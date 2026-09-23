@@ -1,5 +1,6 @@
 #include "AudioCodec.h"
 
+#include "AacEncoderInternal.h"
 #include "OpusEncoderInternal.h"
 
 #include <errno.h>
@@ -14,6 +15,7 @@ void audio_encoder_config_init(AudioEncoderConfig *config) {
     config->codec = AUDIO_CODEC_OPUS;
     config->bitrate = 32000;
     config->frameDurationUs = 20000;
+    config->frameSamples = 0;
     config->maxPacketBytes = 1200;
 }
 
@@ -48,11 +50,13 @@ int audio_encoder_init(AudioEncoder *encoder,
         result = audio_opus_encoder_create(encoder, config, inputFormat,
                                            &implementation, &ops);
         break;
+    case AUDIO_CODEC_AAC:
+        result = audio_aac_encoder_create(encoder, config, inputFormat,
+                                          &implementation, &ops);
+        break;
     case AUDIO_CODEC_UNKNOWN:
     case AUDIO_CODEC_G711A:
     case AUDIO_CODEC_G711U:
-    case AUDIO_CODEC_AAC:
-        return -ENOTSUP;
     default:
         return -ENOTSUP;
     }

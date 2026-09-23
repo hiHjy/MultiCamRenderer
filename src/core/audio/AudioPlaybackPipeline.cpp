@@ -18,7 +18,12 @@ uint64_t pcmDurationUs(const AudioFrame& frame)
 
 uint64_t encodedDurationUs(const EncodedAudioPacket& packet)
 {
-    /* Opus 常见一包 20ms；损坏/旧来源未填写 duration 时仍维持队列的硬时长上限。 */
+    /* 优先由准确 sample 数换算；AAC-LC 的 1024 samples 不能被错误当成固定 21ms。 */
+    if (packet.frameSamples != 0 && packet.sourceFormat.sampleRate != 0) {
+        return static_cast<uint64_t>(packet.frameSamples) * 1000000ULL
+            / packet.sourceFormat.sampleRate;
+    }
+    /* 旧来源未填写 frameSamples 时，仍兼容它的 duration；最后才按 Opus 常见 20ms 兜底。 */
     return packet.durationUs == 0 ? 20000ULL : packet.durationUs;
 }
 
@@ -35,6 +40,7 @@ AudioPlaybackPipelineConfig::AudioPlaybackPipelineConfig()
     audio_playback_config_init(&playback);
     /* 项目内 APM/reference 的最小时间单位是 10ms，播放侧也保持这个 period。 */
     playback.requestedPeriodFrames = playback.requestedFormat.sampleRate / 100;
+    /* 硬件总缓冲设为 8 个 period（80ms），与底层 start_threshold（70ms 起播门限）配合防 XRUN。 */
     playback.requestedBufferFrames = playback.requestedPeriodFrames * 8;
 }
 
@@ -228,6 +234,8 @@ void AudioPlaybackPipeline::workerMain()
         QueueItem item;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
+
+			//首次播放时先在队列中存 m_config.startupPrebufferDurationUs 的音频包，
             m_cv.wait(lock, [this] {
                 return m_stopRequested || (m_queueCount != 0
                                            && (m_playbackStarted
@@ -236,7 +244,7 @@ void AudioPlaybackPipeline::workerMain()
             if (m_stopRequested) {
                 return;
             }
-            m_playbackStarted = true;
+            m_playbackStarted = true;//标记开始播放
             item = std::move(m_queue[m_queueHead]);
             m_queuedDurationUs -= std::min(m_queuedDurationUs, item.durationUs);
             m_queue[m_queueHead] = {};
@@ -244,6 +252,7 @@ void AudioPlaybackPipeline::workerMain()
             --m_queueCount;
         }
 
+		//如果是pcm直接播放
         if (item.kind == ItemKind::Pcm) {
             if (!item.pcm || !playPcm(item.pcm->pcmView())) {
                 ++m_playbackFailures;
@@ -251,6 +260,7 @@ void AudioPlaybackPipeline::workerMain()
             continue;
         }
 
+		//说明是压缩格式需要解码在播放
         AudioEncodedPacket packet {};
         if (item.encoded) {
             packet = item.encoded->packetView();

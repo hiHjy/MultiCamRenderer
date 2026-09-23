@@ -89,12 +89,15 @@ set_property(CACHE MCR_THIRD_PARTY_ARCH PROPERTY STRINGS rk3568 rv1126b)
 set(MCR_OPUS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/include")
 set(MCR_OPUS_LIBRARY
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libopus.a")
+set(MCR_FDK_AAC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fdk-aac/include")
+set(MCR_FDK_AAC_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fdk-aac/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libfdk-aac.a")
 set(MCR_WEBRTC_APM_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/include")
 set(MCR_WEBRTC_APM_LIBRARY
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libmcr_webrtc_apm.a")
 
-foreach(mcr_prebuilt IN ITEMS "${MCR_OPUS_LIBRARY}" "${MCR_WEBRTC_APM_LIBRARY}")
+foreach(mcr_prebuilt IN ITEMS "${MCR_OPUS_LIBRARY}" "${MCR_FDK_AAC_LIBRARY}" "${MCR_WEBRTC_APM_LIBRARY}")
     if(NOT EXISTS "${mcr_prebuilt}")
         message(FATAL_ERROR
             "缺少预编译库 ${mcr_prebuilt}\n"
@@ -151,11 +154,13 @@ endfunction()
 function(mcr_link_audio_deps target)
     target_include_directories(${target} PRIVATE
         "${MCR_OPUS_INCLUDE_DIR}"
+        "${MCR_FDK_AAC_INCLUDE_DIR}"
         "${MCR_WEBRTC_APM_INCLUDE_DIR}"
     )
     target_link_libraries(${target} PRIVATE
         "${MCR_WEBRTC_APM_LIBRARY}"
         "${MCR_OPUS_LIBRARY}"
+        "${MCR_FDK_AAC_LIBRARY}"
         Threads::Threads
         m
         rt
@@ -223,8 +228,12 @@ endfunction()
 set(MCR_RTSP_SERVER_SOURCES
     src/rtsp/server/AnnexBFrameQueue.cpp
     src/rtsp/server/AnnexBSource.cpp
+    src/rtsp/server/AudioAccessUnitQueue.cpp
+    src/rtsp/server/AudioAccessUnitSource.cpp
+    src/rtsp/server/AacAudioSubsession.cpp
     src/rtsp/server/VideoSubsession.cpp
     src/rtsp/server/Live555RtspServer.cpp
+    src/rtsp/server/RtspAudioPublishSink.cpp
 )
 add_library(mcr_rtsp_server STATIC ${MCR_RTSP_SERVER_SOURCES})
 target_include_directories(mcr_rtsp_server
@@ -269,8 +278,11 @@ add_library(mcr_audio_core STATIC
     src/core/audio/AudioCapture.c
     src/core/audio/AudioApm.cpp
     src/core/audio/AudioCodec.c
+    src/core/audio/AacCodec.c
+    src/core/audio/AacEncoder.c
     src/core/audio/OpusEncoder.c
     src/core/audio/AudioDecoder.c
+    src/core/audio/AacDecoder.c
     src/core/audio/OpusDecoder.c
     src/core/audio/AudioPlayback.c
     src/core/audio/AudioPacketFile.c
@@ -289,6 +301,10 @@ target_link_libraries(mcr_audio_core PUBLIC
     Threads::Threads
 )
 
+# RTSP AAC subsession 通过 AudioAac 的 AudioSpecificConfig 生成 SDP；声明为 PUBLIC 后，
+# 凡是链接 mcr_rtsp_server 的 demo 都会自动带上该实现，不会出现静态库链接顺序遗漏。
+target_link_libraries(mcr_rtsp_server PUBLIC mcr_audio_core)
+
 if(MCR_BUILD_IPC_APP)
     mcr_add_executable(ipc_app
         app/IpcApp.cpp
@@ -305,6 +321,8 @@ if(MCR_BUILD_IPC_APP)
         src/core/hw/rga/RgaEngine.cpp
         ${MCR_MPP_DECODER_SOURCES}
     )
+    # mcr_rtsp_server 公开依赖 mcr_audio_core（AAC SDP 与 source 所需）；IPC 本身也通过
+    # 这条传递依赖使用 AudioPipeline，避免在每个 app 重复列同一个音频库。
     target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
     target_include_directories(ipc_app PRIVATE "${MCR_RKAIQ_INCLUDE_DIR}")
     target_link_libraries(ipc_app PRIVATE "${MCR_RKAIQ_LIBRARY}")
@@ -354,6 +372,33 @@ if(MCR_BUILD_DEMOS)
     set_target_properties(audio_playback_pipeline_opus_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
+
+    # 用实际麦克风驱动 AudioPipeline 的 AAC-LC 支路，并异步写入 demo packet 文件。
+    mcr_add_executable(audio_capture_aac_demo demo/AudioCaptureAacDemo.cpp)
+    target_link_libraries(audio_capture_aac_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_capture_aac_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不经过 Opus/APM 的 raw PCM 文件闭环，用于隔离板级采集、播放与全双工问题。
+    mcr_add_executable(audio_pcm_capture_demo demo/AudioPcmCaptureDemo.cpp)
+    target_link_libraries(audio_pcm_capture_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pcm_capture_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    mcr_add_executable(audio_pcm_playback_demo demo/AudioPcmPlaybackDemo.cpp)
+    target_link_libraries(audio_pcm_playback_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pcm_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 采集与播放直通闭环：麦克风采集 PCM 并实时送入播放管线推至扬声器。
+    mcr_add_executable(audio_capture_and_playback demo/audio_capture_and_playback.cpp)
+    target_link_libraries(audio_capture_and_playback PRIVATE mcr_audio_core)
+    set_target_properties(audio_capture_and_playback PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    add_custom_target(audio_capture_and_playback_demo DEPENDS audio_capture_and_playback)
 
     # 采集 -> APM(AGC) -> 写 WAV，不经过 Opus。用于直接听/量 AGC 处理后的效果，
     # 例如判断板端麦克风电平偏低时 AGC 究竟能补回多少 dB。
