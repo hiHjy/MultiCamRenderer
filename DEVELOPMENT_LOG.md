@@ -4080,3 +4080,98 @@ main + sub 重叠拉流
   4 AU（约 85ms），但不应无界堆积。
 - 若 AAC EncoderNode 运行期创建失败，Sink 会保留错误；在全部 client 离开、下一次 0->1 时允许重新尝试，
   不把一次临时失败固化为永久不可恢复状态。
+
+### MPP 实时首包 PTS 修复与 RTSP 客户端 AAC 接收
+
+#### 1. 发现：初始化阶段发送独立 MPP header 是实时 RTP 的错误路径
+
+此前 `MppEncoder::sendFrame()` 第一次送帧前会调用 `rk_mpp_encoder_write_header()`，底层实际执行
+`MPP_ENC_GET_HDR_SYNC`。该调用会同步触发 packet callback，并产出一份单独的参数集：H264 为 SPS/PPS，
+H265 为 VPS/SPS/PPS。MPP 给这份配置数据的 PTS 固定为 `0`，它不是一张真实输入图像的编码结果。
+
+随后第一张真实帧才携带 V4L2 单调时钟 PTS。在 RTSP 推流中将两者直接相继送入 RTP，会形成：
+
+```text
+独立 VPS/SPS/PPS (PTS = 0)
+  -> 第一张真实 IDR (PTS = 当前单调时钟，可能已运行数万秒)
+```
+
+这会污染视频 RTP 时间线。客户端日志中出现过视频起始时间与音频相差数万秒，根因就是这里，不能通过
+播放器侧修复。
+
+为确认 MPP 的实际行为，临时探针分别比较“只送第一张真实帧”和“先 `GET_HDR_SYNC` 再送真实帧”：
+
+```text
+H264 只送真实首帧：SPS(7), PPS(8), SEI(6), IDR(5)，PTS=真实帧 PTS
+H265 只送真实首帧：VPS(32), SPS(33), PPS(34), SEI(39), IDR(19)，PTS=真实帧 PTS
+
+显式 GET_HDR_SYNC：仅参数集，PTS=0
+后续真实 IDR：仅 SEI/IDR（参数集已被前一包提前拿走）
+```
+
+因此正式修复（commit `3c4d8f6`）是删除 `MppEncoder` 的 `ensureHeaderWritten()` 与
+`headerWritten` 状态；保留 MPP 的 `MPP_ENC_HEADER_MODE_EACH_IDR` 配置，让每个 IDR 自身携带参数集。
+`rk_mpp_encoder_write_header()` C 接口仍保留给文件封装或底层诊断，但明确禁止在实时 RTP 首包路径调用。
+
+RV1126B 实测更新后的 `/oem/usr/bin/multicam_ipc_app`：
+
+```text
+[RKMPP Encoder] frame=1 ... header=0 intra=1
+ffprobe(TCP): video start_time=0.033356, audio start_time=0.000000
+```
+
+不再出现 `header=1` 的独立 PTS=0 包，也不再有数万秒的音视频起点错位。
+
+这项修复不等同于解决所有 UDP 首帧问题：静态画面下 H265 IDR 仍可能很大，默认 UDP 客户端接收缓冲不足时
+丢失任意 RTP FU 分片，依然会出现 `SPS/PPS does not exist`。TCP 验证正常；提高客户端 UDP 接收缓冲也可
+验证该现象。这是首张大 IDR 的传输突发问题，应作为独立事项处理，不能再归因到 header PTS。
+
+#### 2. RTSP 客户端接收 AAC audio track
+
+commit `5e65246` 将拉流端从“只识别一条 H264/H265 视频轨”扩展为可同时接收一条 AAC-LC 音轨：
+
+```text
+DESCRIBE SDP
+  -> Live555RtspClient 识别 MPEG4-GENERIC audio subsession
+  -> SETUP/PLAY 与视频 track 一样建立 RTP 接收链路
+  -> AacAudioSink 收到完整 AAC access unit
+  -> Stream::onAudioPacket()
+  -> 上层 AudioPlaybackPipeline / 录像等自行复制到有界队列
+```
+
+`AacAudioSink` 只交付压缩 access unit、SDP 协商出的 PCM 格式、1024 samples 与 presentation timestamp；它不在
+live555 事件线程解码或写声卡。`Stream` 的音频回调只借用 packet payload，异步消费者必须用
+`EncodedAudioPacketPool` 或自己的有界队列取得所有权，这与视频 NALU 回调的生命周期纪律一致。
+
+新增两个诊断 demo：
+
+- `rtsp_aac_wav_record_demo`：RTSP AAC -> FDK-AAC -> WAV，同时保存 ADTS 码流，隔离 RTP/AAC 与 ALSA 问题；
+- `rtsp_audio_playback_demo`：RTSP AAC -> `AudioPlaybackPipeline` -> ALSA。
+
+RK3568（`192.168.1.3`）对 RV1126B（`192.168.1.4`）实测 `rtsp_aac_wav_record_demo` 录制 5 秒：
+
+```text
+decodedPackets=234
+writtenFrames=239616
+poolDropped=0
+queueDropped=0
+```
+
+`./wsl-build.sh`（全 demo）与 `./wsl-build-ipc.sh`（RV1126B IPC）均通过。
+
+### Live555 IPv4 端口快速重启
+
+live555 默认在 `GenericMediaServer` 建立 RTSP 监听 socket 前关闭 `SO_REUSEADDR`。服务刚停后旧 IPv4 TCP
+连接可能仍处于 `TIME_WAIT`，于是 IPv4 `8554` 绑定失败；IPv6 socket 又可以成功，最终进程看似启动但只监听
+`:::8554`，IPv4 客户端被拒绝连接。
+
+两个板端静态库以 `ALLOW_RTSP_SERVER_PORT_REUSE=1` 重编译 `GenericMediaServer.o`，保留正常的
+`SO_REUSEADDR`。RV1126B 连续 TERM/立即重启后，`netstat -lnt` 已稳定同时显示：
+
+```text
+0.0.0.0:8554  LISTEN
+:::8554       LISTEN
+```
+
+该选项只允许同一服务快速重绑，不允许两个仍存活的 RTSP Server 共用端口。具体构建约束已写入
+`third_party/live555/README.md`。
