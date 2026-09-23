@@ -41,7 +41,14 @@ static int aac_decode_packet(void *implementation, const AudioEncodedPacket *pac
     }
     result = aacDecoder_DecodeFrame(decoder->decoder, decoder->pcmBuffer,
                                     (INT)decoder->pcmBufferSamples, 0);
-    if (!IS_OUTPUT_VALID(result)) {
+    /*
+     * IS_OUTPUT_VALID() 不等于“本 access unit 解码成功”：FDK 会在位流损坏时做错误隐藏，
+     * 并把 AAC_DEC_DECODE_FRAME_ERROR 一类结果也标为 output valid。对本项目的实时媒体
+     * 管线，这块 concealment PCM 不能伪装成正常帧继续送播放/录像；否则上层统计会显示
+     * 成功，实际听感却是连续杂音。严格只接受 AAC_DEC_OK，出错由有界队列丢当前 AU 并
+     * 等下一包恢复。
+     */
+    if (result != AAC_DEC_OK) {
         return -EIO;
     }
 

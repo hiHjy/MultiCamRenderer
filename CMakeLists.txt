@@ -235,6 +235,14 @@ set(MCR_RTSP_SERVER_SOURCES
     src/rtsp/server/Live555RtspServer.cpp
     src/rtsp/server/RtspAudioPublishSink.cpp
 )
+
+# 所有 RTSP 拉流 demo 共用同一组 source；AAC 接收 sink 在这里集中列出，避免某个
+# demo 更新 Live555RtspClient 后遗漏链接实现。
+set(MCR_RTSP_CLIENT_SOURCES
+    src/rtsp/client/Live555RtspClient.cpp
+    src/rtsp/client/AnnexBSink.cpp
+    src/rtsp/client/AacAudioSink.cpp
+)
 add_library(mcr_rtsp_server STATIC ${MCR_RTSP_SERVER_SOURCES})
 target_include_directories(mcr_rtsp_server
     PUBLIC
@@ -486,8 +494,7 @@ if(MCR_BUILD_DEMOS)
 
     mcr_add_executable(rtsp_mpp_decoder_demo
         demo/RtspMppDecoderDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         ${MCR_MPP_DECODER_SOURCES}
     )
     mcr_link_media(rtsp_mpp_decoder_demo)
@@ -497,15 +504,13 @@ if(MCR_BUILD_DEMOS)
     # RTP/服务端问题和播放器兼容性问题。
     mcr_add_executable(rtsp_annexb_record_demo
         demo/RtspAnnexBRecordDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
     )
     mcr_link_live555(rtsp_annexb_record_demo)
 
     mcr_add_executable(rtsp_stream_demo
         demo/RtspStreamDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
         src/core/memory/DmaAllocator.cpp
@@ -516,11 +521,40 @@ if(MCR_BUILD_DEMOS)
     mcr_link_media(rtsp_stream_demo)
     mcr_link_live555(rtsp_stream_demo)
 
+    # 接收 IPC 发布的 AAC audio track，并经项目正式 AudioPlaybackPipeline 解码写 ALSA。
+    mcr_add_executable(rtsp_audio_playback_demo
+        demo/RtspAudioPlaybackDemo.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
+        src/rtsp/client/RtspStream.cpp
+        src/core/stream/Stream.cpp
+        src/core/memory/DmaAllocator.cpp
+        src/core/memory/DmaBufferPool.cpp
+        src/core/hw/rga/RgaEngine.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    target_link_libraries(rtsp_audio_playback_demo PRIVATE mcr_audio_core)
+    mcr_link_media(rtsp_audio_playback_demo)
+    mcr_link_live555(rtsp_audio_playback_demo)
+    set_target_properties(rtsp_audio_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 音频故障隔离工具：RTSP AAC -> AudioDecoder -> WAV，不经过 ALSA。可随后用 aplay
+    # 回放同一文件，明确区分码流/解码问题与板端播放路由问题。
+    mcr_add_executable(rtsp_aac_wav_record_demo
+        demo/RtspAacWavRecordDemo.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
+    )
+    target_link_libraries(rtsp_aac_wav_record_demo PRIVATE mcr_audio_core)
+    mcr_link_live555(rtsp_aac_wav_record_demo)
+    set_target_properties(rtsp_aac_wav_record_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
     mcr_add_executable(stream_manager_demo
         demo/StreamManagerDemo.cpp
         src/core/stream/StreamManager.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
         src/core/common/FrameHub.cpp
@@ -569,8 +603,7 @@ if(MCR_BUILD_DEMOS)
     mcr_add_executable(rtsp_drm_sink_demo
         drm/rtsp_drm_sink_demo.cpp
         drm/drm_display.c
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/core/memory/DmaAllocator.cpp
         src/core/memory/DmaBufferPool.cpp
         src/core/hw/rga/RgaEngine.cpp
