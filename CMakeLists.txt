@@ -5,6 +5,10 @@ project(MultiCamRenderer LANGUAGES C CXX)
 option(MCR_BUILD_DEMOS "构建非 Qt 的 demo 与 DRM demo" ON)
 option(MCR_BUILD_QT "构建 Qt 应用与 Qt/RGA demo" OFF)
 option(MCR_BUILD_IPC_APP "构建 RV1126B IPC 双路 RTSP 应用" OFF)
+# IPC 默认使用 AVBR 参数组；CBR 参数组仍完整保留，可用 -DMCR_MPP_ENCODER_USE_AVBR=OFF 显式切换。
+# 两组参数彼此独立，调试 AVBR 不会意外改变 CBR 基线。
+option(MCR_MPP_ENCODER_USE_AVBR "IPC H264/H265 使用 AVBR 参数组" ON)
+option(MCR_MPP_ENCODER_DEBUG_IDR "编码实验：记录每组 MPP intra packet 的大小" OFF)
 # FreeType 目前只用于 OSD 的独立学习 demo。它依赖 RV1126B media_out 提供的动态库，
 # 因此不默认开启，避免没有 FreeType 的 RK3568 sysroot 受到影响。
 option(MCR_BUILD_FREETYPE_BITMAP_DEMO "构建 FreeType 字形 bitmap demo" OFF)
@@ -337,6 +341,16 @@ if(MCR_BUILD_IPC_APP)
     mcr_link_freetype(ipc_app)
     mcr_link_media(ipc_app)
     mcr_link_live555(ipc_app)
+    if(MCR_MPP_ENCODER_USE_AVBR)
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_USE_AVBR=1)
+    else()
+        # 显式传 0，避免 mpp_simple.c 的独立编译默认值覆盖 CMake 的 CBR 选择。
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_USE_AVBR=0)
+    endif()
+    if(MCR_MPP_ENCODER_DEBUG_IDR)
+        # 默认关闭，正常实时路径不生成关键帧统计日志代码。
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_DEBUG_IDR=1)
+    endif()
     # RV1126B 量产 rootfs 将 Rockchip 媒体运行库部署在此目录；交叉 SDK 中的
     # media_out 仅用于构建，不能把主机 SDK 的绝对路径写进目标程序。
     set_target_properties(ipc_app PROPERTIES

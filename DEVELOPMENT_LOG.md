@@ -4175,3 +4175,79 @@ live555 默认在 `GenericMediaServer` 建立 RTSP 监听 socket 前关闭 `SO_R
 
 该选项只允许同一服务快速重绑，不允许两个仍存活的 RTSP Server 共用端口。具体构建约束已写入
 `third_party/live555/README.md`。
+
+## 2026-09-24：RV1126B H265 大 IDR 的 CBR / VBR / AVBR 对照
+
+### 背景与目标
+
+此前 UDP 拉流排查已确认：静态画面时 H265 的完整 IDR（含 VPS/SPS/PPS）会异常偏大，数百个 RTP FU
+分片会在瞬间送入客户端 UDP 接收队列；只要丢掉其中一个分片，整张 IDR 就不可解码。这个问题与 RTP
+packetization 无关——RTP 本来就会把大 NALU 正确拆分——重点是减少单张关键帧的突发大小。
+
+本次只比较编码器输出，不让 UDP 丢包干扰结论：RV1126B 上以 TCP 拉取 `/main` 触发编码，并在 MPP packet
+callback 中记录**包含参数集的完整 IDR packet** 字节数。测试开关为
+`MCR_MPP_ENCODER_DEBUG_IDR=ON`；正常构建默认关闭，统计扫描与日志不会进入实时路径。
+
+### 固定测试条件
+
+| 项目 | 数值 |
+|---|---:|
+| 板端 | RV1126B（`192.168.1.4`） |
+| 视频 | H265 main，1920x1080，NV12，30 fps |
+| GOP | 30（约每秒一个 IDR） |
+| target bitrate | 5,054,400 bps（`Medium`） |
+| `qp_init` | `-1`（MPP 自适应决定初始 QP） |
+| 普通帧 QP 范围 | `qp_min=10`，`qp_max=48` |
+| I 帧 QP 范围 | `qp_min_i=10`，`qp_max_i=48` |
+| I/P QP 差 | `qp_ip=2` |
+
+CBR 保持原量产范围：`bps_min=4,738,500`（15/16 target），`bps_max=5,370,300`（17/16 target）。
+
+VBR 与 AVBR 对照均使用同一宽范围，避免把“范围更大”误当成模式差异：
+`bps_min=1,010,880`（20% target），`bps_max=6,065,280`（120% target）。两套 preset 还各自拥有
+`bps_target` 比例，当前均为 `1/1`；后续若把 AVBR target 调高，只改 AVBR 分支即可。
+
+### 实测结果（完整 MPP IDR packet）
+
+| 码控模式 | 静态画面稳定 IDR | 持续晃手动态画面稳定 IDR | 结论 |
+|---|---:|---:|---|
+| CBR | 236–266 KiB | 约 80–105 KiB | 基线；静态关键帧突发偏大。 |
+| VBR | 321–331 KiB | 108–137 KiB | 不适合此目标；静态峰值比 CBR 更大。 |
+| AVBR | **129–159 KiB**（偶有 174/190 KiB） | **56–75 KiB** | 最能压低单张 IDR 突发，但动态主观画质偏糊，不能直接作为正式默认。 |
+
+AVBR 动态切换进来的第一张 IDR 曾为 273 KiB；这是刚连接/场景状态转换时的过渡值，不与后续稳定段混在一起。
+同理，各次编码器刚初始化时的前一两张 IDR 不用于判断稳定策略。
+
+### 当前代码组织与后续调参原则
+
+`mpp_simple.c` 现在保留两套彼此独立的 `RkMppRateControlPreset`：
+
+```text
+MCR_MPP_ENCODER_USE_AVBR=ON（默认）  -> AVBR：当前 IPC 默认参数组
+MCR_MPP_ENCODER_USE_AVBR=OFF          -> CBR：保留的原量产 bps/QP 基线
+```
+
+这样再试 AVBR 的 target、min/max 或 QP 边界时，不会反复手改 CBR 分支，也不会意外改变 CBR 基线。
+
+### 最终默认选择与带宽观察
+
+后续将 AVBR 的 `bps_max` 从 120% target 提高到 156% target（7,884,864 bps），再把
+`qp_max` / `qp_max_i` 从实验值 35 恢复为与 CBR 相同的 48。恢复后的实际动态采样中，MPP
+报告的平均 QP 为 17--23、实时码率约 1.0--3.6 Mbps，均没有撞到 QP 或 `bps_max` 上限；因此 QP=35
+并不是此前主观画质差异的有效限制条件。
+
+更重要的是板端出口流量的实测对照：
+
+| 场景 | CBR | AVBR | 含义 |
+|---|---:|---:|---|
+| 静止画面 | 约 5 Mbps | 约 1 Mbps | CBR 会持续填满固定预算；AVBR 不会为没有新增画面信息的静态场景浪费网络带宽。 |
+| 正常动态 | 约 5 Mbps 固定预算 | 峰值约 3 Mbps | AVBR 仍保留质量预算，但实际复杂度未要求占满 5 Mbps。 |
+
+这不仅减少 IPC 对外带宽，也降低 NVR 多路汇聚时的交换机、网卡和录像写入压力。因此本项目默认切换为
+AVBR；CBR 保留为可复现实验的回退分支，而不是删除。
+
+此次拍摄电脑屏幕的纯白背景中，偶见会跳动的细小块状异常。该现象只在平坦高亮、摩尔纹很强的拍屏极端画面中
+容易暴露，正常场景中不明显；当前记录为 H265 量化/块划分伪影观察项，不据此继续牺牲 AVBR 的带宽收益。
+
+当前板端暂时运行 AVBR + IDR 调试版以便保留本次实验数据；结束参数实验后必须重新以
+`MCR_MPP_ENCODER_DEBUG_IDR=OFF` 构建，再替换量产自启动二进制。
