@@ -12,6 +12,7 @@
 
 #define ONVIF_DEVICE_NAMESPACE "http://www.onvif.org/ver10/device/wsdl"
 #define ONVIF_MEDIA_NAMESPACE "http://www.onvif.org/ver10/media/wsdl"
+#define ONVIF_MEDIA2_NAMESPACE "http://www.onvif.org/ver20/media/wsdl"
 #define ONVIF_WSDD_PORT 3702
 #define ONVIF_WSDD_MULTICAST_ADDRESS "239.255.255.250"
 #define ONVIF_NETWORK_VIDEO_TRANSMITTER "dn:NetworkVideoTransmitter"
@@ -227,11 +228,11 @@ int __tds__GetServices(struct soap *soap, struct _tds__GetServices *request,
     (void)request;
     if (config == NULL)
         return SOAP_FAULT;
-    services = (struct tds__Service *)soap_calloc(soap, 2 * sizeof(*services));
-    versions = (struct tt__OnvifVersion *)soap_calloc(soap, 2 * sizeof(*versions));
+    services = (struct tds__Service *)soap_calloc(soap, 3 * sizeof(*services));
+    versions = (struct tt__OnvifVersion *)soap_calloc(soap, 3 * sizeof(*versions));
     if (services == NULL || versions == NULL)
         return SOAP_EOM;
-    response->__sizeService = 2;
+    response->__sizeService = 3;
     response->Service = services;
     services[0].Namespace = soap_copy_text(soap, ONVIF_DEVICE_NAMESPACE);
     services[0].XAddr = soap_copy_text(soap, config->deviceServiceUrl);
@@ -243,8 +244,14 @@ int __tds__GetServices(struct soap *soap, struct _tds__GetServices *request,
     services[1].Version = &versions[1];
     versions[1].Major = 1;
     versions[1].Minor = 0;
+    services[2].Namespace = soap_copy_text(soap, ONVIF_MEDIA2_NAMESPACE);
+    services[2].XAddr = soap_copy_text(soap, config->media2ServiceUrl);
+    services[2].Version = &versions[2];
+    versions[2].Major = 20;
+    versions[2].Minor = 12;
     return services[0].Namespace != NULL && services[0].XAddr != NULL &&
-                   services[1].Namespace != NULL && services[1].XAddr != NULL
+           services[1].Namespace != NULL && services[1].XAddr != NULL &&
+           services[2].Namespace != NULL && services[2].XAddr != NULL
                ? SOAP_OK
                : SOAP_EOM;
 }
@@ -331,19 +338,54 @@ static int fill_h264_sub_configuration(struct soap *soap, struct tt__Profile *pr
     return SOAP_OK;
 }
 
+static int fill_h264_main_configuration(struct soap *soap, struct tt__Profile *profile)
+{
+    struct tt__VideoEncoderConfiguration *video =
+        (struct tt__VideoEncoderConfiguration *)soap_calloc(soap, sizeof(*video));
+    struct tt__VideoResolution *resolution =
+        (struct tt__VideoResolution *)soap_calloc(soap, sizeof(*resolution));
+    struct tt__VideoRateControl *rate_control =
+        (struct tt__VideoRateControl *)soap_calloc(soap, sizeof(*rate_control));
+    struct tt__H264Configuration *h264 =
+        (struct tt__H264Configuration *)soap_calloc(soap, sizeof(*h264));
+    if (video == NULL || resolution == NULL || rate_control == NULL || h264 == NULL)
+        return SOAP_EOM;
+    video->Name = soap_copy_text(soap, "main H265 1920x1080");
+    video->token = soap_copy_text(soap, "main_video_h265");
+    /* Media v1 tt__VideoEncoding defines only JPEG/MPEG4/H264. To allow Profile S clients
+     * to recognize the video track and obtain its 1080p resolution while streaming H.265 via RTSP SDP,
+     * declare H264 here for backward compatibility. Media2 provides native H265. */
+    video->Encoding = tt__VideoEncoding__H264;
+    video->Resolution = resolution;
+    video->Quality = 5.0F;
+    video->RateControl = rate_control;
+    video->H264 = h264;
+    video->UseCount = 1;
+    video->SessionTimeout = soap_copy_text(soap, "PT60S");
+    resolution->Width = 1920;
+    resolution->Height = 1080;
+    rate_control->FrameRateLimit = 30;
+    rate_control->EncodingInterval = 1;
+    rate_control->BitrateLimit = 4096;
+    h264->GovLength = 30;
+    h264->H264Profile = tt__H264Profile__High;
+    if (video->Name == NULL || video->token == NULL || video->SessionTimeout == NULL)
+        return SOAP_EOM;
+    profile->VideoEncoderConfiguration = video;
+    return SOAP_OK;
+}
+
 static int fill_media_profile(struct soap *soap, struct tt__Profile *profile,
-                              const char *token, const char *name, int is_h264)
+                              const char *token, const char *name, int is_sub)
 {
     profile->Name = soap_copy_text(soap, name);
     profile->token = soap_copy_text(soap, token);
     profile->fixed = soap_boolean(soap, xsd__boolean__true_);
     if (profile->Name == NULL || profile->token == NULL || profile->fixed == NULL)
         return SOAP_EOM;
-    if (fill_aac_configuration(soap, profile, is_h264 ? "sub_audio_aac" : "main_audio_aac") != SOAP_OK)
+    if (fill_aac_configuration(soap, profile, is_sub ? "sub_audio_aac" : "main_audio_aac") != SOAP_OK)
         return SOAP_EOM;
-    /* Media v1 has no H265 enum. Do not lie about main's codec: clients obtain
-     * its exact H265 SDP from the returned RTSP URI. Media2 adds H265 metadata later. */
-    return is_h264 ? fill_h264_sub_configuration(soap, profile) : SOAP_OK;
+    return is_sub ? fill_h264_sub_configuration(soap, profile) : fill_h264_main_configuration(soap, profile);
 }
 
 int __trt__GetServiceCapabilities(struct soap *soap,
@@ -433,6 +475,164 @@ int __trt__GetStreamUri(struct soap *soap, struct _trt__GetStreamUri *request,
         return SOAP_EOM;
     response->MediaUri = media_uri;
     return SOAP_OK;
+}
+
+/*
+ * ONVIF Media2 (ver20 Media) Service Implementation
+ */
+
+static struct tt__VideoEncoder2Configuration *fill_media2_video_encoder(
+    struct soap *soap, const char *token, const char *name,
+    const char *encoding, int width, int height, float fps, int bitrate_kbps)
+{
+    struct tt__VideoEncoder2Configuration *video =
+        (struct tt__VideoEncoder2Configuration *)soap_calloc(soap, sizeof(*video));
+    struct tt__VideoResolution2 *resolution =
+        (struct tt__VideoResolution2 *)soap_calloc(soap, sizeof(*resolution));
+    struct tt__VideoRateControl2 *rate_control =
+        (struct tt__VideoRateControl2 *)soap_calloc(soap, sizeof(*rate_control));
+    if (video == NULL || resolution == NULL || rate_control == NULL)
+        return NULL;
+    video->Name = soap_copy_text(soap, name);
+    video->token = soap_copy_text(soap, token);
+    video->UseCount = 1;
+    video->Encoding = soap_copy_text(soap, encoding);
+    video->Resolution = resolution;
+    video->RateControl = rate_control;
+    video->Quality = 5.0f;
+    resolution->Width = width;
+    resolution->Height = height;
+    rate_control->FrameRateLimit = fps;
+    rate_control->BitrateLimit = bitrate_kbps;
+    if (video->Name == NULL || video->token == NULL || video->Encoding == NULL)
+        return NULL;
+    return video;
+}
+
+static struct tt__AudioEncoder2Configuration *fill_media2_audio_encoder(
+    struct soap *soap, const char *token, const char *name,
+    const char *encoding, int bitrate_kbps, int sample_rate_khz)
+{
+    struct tt__AudioEncoder2Configuration *audio =
+        (struct tt__AudioEncoder2Configuration *)soap_calloc(soap, sizeof(*audio));
+    if (audio == NULL)
+        return NULL;
+    audio->Name = soap_copy_text(soap, name);
+    audio->token = soap_copy_text(soap, token);
+    audio->UseCount = 1;
+    audio->Encoding = soap_copy_text(soap, encoding);
+    audio->Bitrate = bitrate_kbps;
+    audio->SampleRate = sample_rate_khz;
+    if (audio->Name == NULL || audio->token == NULL || audio->Encoding == NULL)
+        return NULL;
+    return audio;
+}
+
+static int fill_media2_profile(struct soap *soap, struct ns1__MediaProfile *profile,
+                               const char *token, const char *name, int is_sub)
+{
+    struct ns1__ConfigurationSet *configs;
+    profile->Name = soap_copy_text(soap, name);
+    profile->token = soap_copy_text(soap, token);
+    profile->fixed = soap_boolean(soap, xsd__boolean__true_);
+    if (profile->Name == NULL || profile->token == NULL || profile->fixed == NULL)
+        return SOAP_EOM;
+
+    configs = (struct ns1__ConfigurationSet *)soap_calloc(soap, sizeof(*configs));
+    if (configs == NULL)
+        return SOAP_EOM;
+
+    if (is_sub) {
+        configs->VideoEncoder = fill_media2_video_encoder(
+            soap, "sub_video_h264", "sub H264 1280x720", "H264", 1280, 720, 30.0f, 2048);
+        configs->AudioEncoder = fill_media2_audio_encoder(
+            soap, "sub_audio_aac", "AAC-LC 48kHz", "MP4A-LATM", 128, 48);
+    } else {
+        configs->VideoEncoder = fill_media2_video_encoder(
+            soap, "main_video_h265", "main H265 1920x1080", "H265", 1920, 1080, 30.0f, 4096);
+        configs->AudioEncoder = fill_media2_audio_encoder(
+            soap, "main_audio_aac", "AAC-LC 48kHz", "MP4A-LATM", 128, 48);
+    }
+    if (configs->VideoEncoder == NULL || configs->AudioEncoder == NULL)
+        return SOAP_EOM;
+
+    profile->Configurations = configs;
+    return SOAP_OK;
+}
+
+int __ns1__GetServiceCapabilities(struct soap *soap,
+                                  struct _ns1__GetServiceCapabilities *request,
+                                  struct _ns1__GetServiceCapabilitiesResponse *response)
+{
+    struct ns1__Capabilities2 *capabilities;
+    struct ns1__ProfileCapabilities *profiles;
+    struct ns1__StreamingCapabilities *streaming;
+    (void)request;
+    capabilities = (struct ns1__Capabilities2 *)soap_calloc(soap, sizeof(*capabilities));
+    profiles = (struct ns1__ProfileCapabilities *)soap_calloc(soap, sizeof(*profiles));
+    streaming = (struct ns1__StreamingCapabilities *)soap_calloc(soap, sizeof(*streaming));
+    if (capabilities == NULL || profiles == NULL || streaming == NULL)
+        return SOAP_EOM;
+    profiles->MaximumNumberOfProfiles = (int *)soap_calloc(soap, sizeof(*profiles->MaximumNumberOfProfiles));
+    if (profiles->MaximumNumberOfProfiles == NULL)
+        return SOAP_EOM;
+    *profiles->MaximumNumberOfProfiles = 2;
+    streaming->RTSPStreaming = soap_boolean(soap, xsd__boolean__true_);
+    streaming->RTP_USCORERTSP_USCORETCP = soap_boolean(soap, xsd__boolean__true_);
+    if (streaming->RTSPStreaming == NULL || streaming->RTP_USCORERTSP_USCORETCP == NULL)
+        return SOAP_EOM;
+    capabilities->ProfileCapabilities = profiles;
+    capabilities->StreamingCapabilities = streaming;
+    response->Capabilities = capabilities;
+    return SOAP_OK;
+}
+
+int __ns1__GetProfiles(struct soap *soap, struct _ns1__GetProfiles *request,
+                       struct _ns1__GetProfilesResponse *response)
+{
+    struct ns1__MediaProfile *profiles;
+    if (request != NULL && request->Token != NULL && *request->Token != '\0') {
+        const int is_sub = strcmp(request->Token, "sub") == 0;
+        if (strcmp(request->Token, "main") != 0 && !is_sub)
+            return SOAP_FAULT;
+        profiles = (struct ns1__MediaProfile *)soap_calloc(soap, sizeof(*profiles));
+        if (profiles == NULL)
+            return SOAP_EOM;
+        if (fill_media2_profile(soap, profiles, is_sub ? "sub" : "main",
+                                is_sub ? "Sub Stream (H264)" : "Main Stream (H265)", is_sub) != SOAP_OK)
+            return SOAP_EOM;
+        response->__sizeProfiles = 1;
+        response->Profiles = profiles;
+        return SOAP_OK;
+    }
+
+    profiles = (struct ns1__MediaProfile *)soap_calloc(soap, 2 * sizeof(*profiles));
+    if (profiles == NULL)
+        return SOAP_EOM;
+    if (fill_media2_profile(soap, &profiles[0], "main", "Main Stream (H265)", 0) != SOAP_OK ||
+        fill_media2_profile(soap, &profiles[1], "sub", "Sub Stream (H264)", 1) != SOAP_OK) {
+        return SOAP_EOM;
+    }
+    response->__sizeProfiles = 2;
+    response->Profiles = profiles;
+    return SOAP_OK;
+}
+
+int __ns1__GetStreamUri(struct soap *soap, struct _ns1__GetStreamUri *request,
+                        struct _ns1__GetStreamUriResponse *response)
+{
+    const OnvifSoapServiceConfig *config = service_config(soap);
+    const char *rtsp_url;
+    if (config == NULL || request == NULL || request->ProfileToken == NULL)
+        return SOAP_FAULT;
+    if (strcmp(request->ProfileToken, "main") == 0)
+        rtsp_url = config->mainRtspUrl;
+    else if (strcmp(request->ProfileToken, "sub") == 0)
+        rtsp_url = config->subRtspUrl;
+    else
+        return SOAP_FAULT;
+    response->Uri = soap_copy_text(soap, rtsp_url);
+    return response->Uri != NULL ? SOAP_OK : SOAP_EOM;
 }
 
 static int probe_requests_this_device_type(const char *types)

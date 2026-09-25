@@ -14,6 +14,7 @@ namespace {
 
 constexpr const char kDeviceServicePath[] = "/onvif/device_service";
 constexpr const char kMediaServicePath[] = "/onvif/media_service";
+constexpr const char kMedia2ServicePath[] = "/onvif/media2_service";
 
 bool copyText(char* destination, std::size_t capacity, const std::string& text)
 {
@@ -269,6 +270,8 @@ bool OnvifServer::buildSoapConfig(const OnvifServerConfig& config, const Network
     deviceUrl << "http://" << identity.ipv4Address << ':' << config.deviceServicePort << kDeviceServicePath;
     std::ostringstream mediaUrl;
     mediaUrl << "http://" << identity.ipv4Address << ':' << config.deviceServicePort << kMediaServicePath;
+    std::ostringstream media2Url;
+    media2Url << "http://" << identity.ipv4Address << ':' << config.deviceServicePort << kMedia2ServicePath;
     const std::string serialNumber = "MCR-" + macAddressText(identity.macAddress);
     const std::string uuid = endpointUuid(identity.macAddress);
     const std::string scopes =
@@ -279,6 +282,7 @@ bool OnvifServer::buildSoapConfig(const OnvifServerConfig& config, const Network
     OnvifSoapServiceConfig soapConfig {};
     if (!copyText(soapConfig.deviceServiceUrl, sizeof(soapConfig.deviceServiceUrl), deviceUrl.str()) ||
         !copyText(soapConfig.mediaServiceUrl, sizeof(soapConfig.mediaServiceUrl), mediaUrl.str()) ||
+        !copyText(soapConfig.media2ServiceUrl, sizeof(soapConfig.media2ServiceUrl), media2Url.str()) ||
         !copyText(soapConfig.mainRtspUrl, sizeof(soapConfig.mainRtspUrl), config.mainRtspUrl) ||
         !copyText(soapConfig.subRtspUrl, sizeof(soapConfig.subRtspUrl), config.subRtspUrl) ||
         !copyText(soapConfig.endpointReference, sizeof(soapConfig.endpointReference), uuid) ||

@@ -55,9 +55,9 @@ awk '
         implemented["__trt__GetProfile"] = 1
         implemented["__trt__GetProfiles"] = 1
         implemented["__trt__GetStreamUri"] = 1
-        implemented["__tr2__GetServiceCapabilities"] = 1
-        implemented["__tr2__GetProfiles"] = 1
-        implemented["__tr2__GetStreamUri"] = 1
+        implemented["__ns1__GetServiceCapabilities"] = 1
+        implemented["__ns1__GetProfiles"] = 1
+        implemented["__ns1__GetStreamUri"] = 1
         print "/* Generated fallback handlers for currently unsupported ONVIF Device/Media operations. */"
         print "#include \"stdsoap2.h\""
     }

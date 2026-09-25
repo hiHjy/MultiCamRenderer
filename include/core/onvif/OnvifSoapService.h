@@ -20,6 +20,7 @@ enum {
 typedef struct OnvifSoapServiceConfig {
     char deviceServiceUrl[ONVIF_SOAP_URL_CAPACITY];
     char mediaServiceUrl[ONVIF_SOAP_URL_CAPACITY];
+    char media2ServiceUrl[ONVIF_SOAP_URL_CAPACITY];
     char mainRtspUrl[ONVIF_SOAP_URL_CAPACITY];
     char subRtspUrl[ONVIF_SOAP_URL_CAPACITY];
     char endpointReference[ONVIF_SOAP_ENDPOINT_CAPACITY];
