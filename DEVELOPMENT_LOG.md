@@ -4251,3 +4251,119 @@ AVBR；CBR 保留为可复现实验的回退分支，而不是删除。
 
 当前板端暂时运行 AVBR + IDR 调试版以便保留本次实验数据；结束参数实验后必须重新以
 `MCR_MPP_ENCODER_DEBUG_IDR=OFF` 构建，再替换量产自启动二进制。
+
+## 2026-09-25：音频运行期可靠性、诊断与断流恢复收尾
+
+### 目标
+
+音频主链已经能采集、AAC/Opus 编解码、RTSP 发布/接收和播放；本次不改变其数据流，专门补齐
+“发生异常时能知道、能安全跨过时间缺口、不会把短暂队列波动误判成播放饥饿”的运行期可靠性。
+
+### 1. ALSA 采集端：明确 10ms period 与 80ms hardware buffer
+
+`AudioCaptureConfig` 新增 `requestedBufferFrames`。默认 0 时不再依赖 ALSA 隐式的 buffer 大小，而是在
+`period_size_near()` 返回真实 period 后配置 `8 * period`；RV1126B 实测协商结果为：
+
+```text
+48000 Hz / mono / S16_LE
+period = 480 frames = 10ms
+buffer = 3840 frames = 80ms
+```
+
+80ms 是 ALSA DMA 环形缓冲提供给普通 Linux 调度的余量，不改变 Pipeline 的 10ms PCM 发布粒度，也不是
+网络 jitter buffer。`AudioCapture` 新增累计的 `xrunCount`、`recoveredErrorCount`、`fatalErrorCount`、
+`lastError` 和 `running` 状态；`IpcApp` 每 100ms 低频检查，只在计数变化或采集线程异常退出时记录日志。
+因此“RTSP 仍活着但采集线程已死”的情况不再静默。
+
+### 2. SIGUSR1 一次性音频快照
+
+为排查曾经出现过的“人声像怪兽、键盘声却正常”问题，新增 `AudioDiagnosticCapture`。向 IPC 发送 `SIGUSR1`
+后，主线程启动一次未来 30 秒的捕获：
+
+```text
+raw PCM hub  -> raw WAV
+AAC hub      -> ADTS .aac + 保留 PTS 的 .mcraudio
+```
+
+输出统一位于 `/root/audio-diagnostics/`，含同名 `.txt` 元数据与
+`README_AUDIO_DIAGNOSTIC.txt`；触发脚本为 `tools/capture_audio_snapshot.sh`。信号处理函数只置位，订阅、
+内存分配和文件写入均在主线程完成。板端快照已验证：约 30 秒、3000 个 10ms PCM block、1406 个 AAC packet、
+`timestampGaps=0`。
+
+这份诊断首先用于定位问题处于哪一段：raw WAV 已异常则是 ALSA/硬件采集侧；raw 正常而 AAC 异常则检查编码器；
+两者正常而客户端异常则检查 RTSP/RTP、解码或播放侧。
+
+### 3. 热路径收敛
+
+- 删除 APM 每个 10ms PCM block 的 `absolute_sample_sum()` 扫描及累计字段。默认 RTSP 还是 APM bypass，
+  这些统计没有运行价值；处理后的 frame/sample 总数仍保留。
+- `AudioAccessUnitQueue` 从 `std::vector` 改为 `std::deque`。满队列和出队均 `pop_front()`，不再搬移后续
+  `shared_ptr`；队列容量仍是很小的 8 AU，语义不变。
+- FDK-AAC Afterburner 实测后固定关闭。RV1126B 独占 64kbps mono AAC 20 秒：开启约 6.3% 单核、关闭约
+  4.3% 单核，输出分别 175185 / 175142 bytes，当前没有证明听感收益足以覆盖约 2% 单核的常驻成本。
+
+### 4. PCM 时间戳断裂：轻量 reset，而非 close/init
+
+此前 `EncoderNode` 发现输入 PCM timestamp 跳变后，会完整 `close -> calloc/open/configure -> init` AAC/Opus。
+真实跳变通常来自 XRUN 或队列丢帧，正是系统处于瞬时负载压力时；此时额外做销毁/分配/重配置没有必要。
+
+现在 `AudioEncoderOps` 增加 `reset()`：
+
+```text
+PCM 格式变化
+  -> 完整 close/init（旧 format 的 codec 不能继续使用）
+
+仅 timestamp 断裂、格式未变
+  AAC  -> 清应用层未满 1024-sample cache
+          + FDK AACENC_CONTROL_STATE(INIT_STATES | RESET_INBUFFER)
+          + 空 aacEncEncode() 立即应用内部 history reset
+  Opus -> 清未满包 cache + OPUS_RESET_STATE
+```
+
+若轻量 reset 意外失败，保留完整重建作为安全降级，不能继续将 PCM 送给状态未知的 codec。
+
+本次顺手修复 FDK-AAC 的边界：首次编码或 history reset 后，FDK 可能已经消费一组 1024 samples 但暂不输出
+access unit。旧代码仅在“有输出”时清 `cachedFrames`，导致下一轮 `writableFrames=0` 而空转；现已改为只要
+`aacEncEncode()` 成功返回，就释放本应用层的这组 cache。
+
+新增不依赖 ALSA 的 `audio_encoder_reset_demo`，在 RV1126B 实测：
+
+```text
+AAC : 断裂前半包 -> reset -> 断裂后完整包，packets=2，firstPts=9000000，PASS
+Opus: 断裂前半包 -> reset -> 断裂后完整包，packets=3，firstPts=9000000，PASS
+```
+
+首包 PTS 都来自断裂后的 PCM，证明没有把时间缺口两侧数据拼成一包。AAC 在 reset 后允许存在 codec 固有的
+priming delay，demo 连续送三组完整 AAC frame 来验证其恢复出包，不把这种正常行为误判为 reset 失败。
+
+### 5. 播放断流后的正确重预缓冲
+
+`AudioPlaybackPipeline::m_playbackStarted` 以前只在 `clearQueueLocked()` 时复位。Gemini 的建议指出播放实际
+XRUN 后应重新预缓冲，这个方向正确；但**不能**在 `m_queueCount == 0` 时直接复位：实时 10ms 一包的正常路径
+也可能让软件队列瞬间为空，届时会反复等待 80ms，造成周期性延迟和卡顿。
+
+因此底层新增 `audio_playback_write_pcm_ex()` 与 `AudioPlaybackWriteStatus`。只有 ALSA `-EPIPE` 或其它可恢复
+write 异常实际发生并被 `prepare/recover` 后，才将 `recoveredFromDiscontinuity` 交给播放管线：
+
+```text
+实际 ALSA 断流 -> 底层 recover 成功
+                -> PlaybackPipeline 置 m_playbackStarted=false
+                -> 后续音频重新积累 startupPrebufferDurationUs（默认 80ms）
+                -> 再起播
+```
+
+既避免“来一包播一包”后的连锁 XRUN，又不会把正常软件队列波动当成断流。
+
+### 6. 验证与部署状态
+
+- `./wsl-build-ipc.sh` 通过，`git diff --check` 通过；第三方 FDK/WebRTC 头文件仍有既有 unused 参数警告。
+- `audio_encoder_reset_demo` 已在 RV1126B (`192.168.1.4`) 运行通过。
+- 最新 `ipc_app` 已原子替换到 `/oem/usr/bin/multicam_ipc_app`，本轮测试后按要求没有替用户启动；重启服务或
+  执行开机脚本后即使用本版。
+
+### 后续审阅建议
+
+项目当前约 3.3 万行，不应逐行强记。音频审阅优先抓住：`AudioCapture -> raw PCM Hub -> (APM) -> EncoderNode ->
+RTSP`，以及 `RTSP -> Decoder -> AudioPlaybackPipeline` 两条主数据流；再阅读三个边界状态：PCM timestamp
+断裂、ALSA capture XRUN、ALSA playback XRUN。FDK/Opus/WebRTC 内部实现按输入、输出、线程与失败语义使用即可，
+不需要逐行背诵。

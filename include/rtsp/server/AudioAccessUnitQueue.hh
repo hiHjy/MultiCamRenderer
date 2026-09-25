@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -52,7 +53,8 @@ private:
 private:
     const size_t m_capacity;
     mutable std::mutex m_mutex;
-    std::vector<AccessUnit> m_queue;
+    /* push/pop 都只操作两端；deque 避免 vector 删除 begin() 时搬移后续 shared_ptr。 */
+    std::deque<AccessUnit> m_queue;
     std::vector<Reader> m_readers;
     uint64_t m_droppedAccessUnits = 0;
 };

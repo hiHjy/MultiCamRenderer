@@ -130,6 +130,7 @@ void audio_capture_config_init(AudioCaptureConfig *config) {
     config->requestedChannels = 1;
     config->requestedFormat = AUDIO_SAMPLE_FORMAT_S16_LE;
     config->requestedPeriodFrames = 480;
+    config->requestedBufferFrames = 0; /* open_auto() 内部换算为 8 x period。 */
 }
 
 void audio_capture_set_callback(AudioCapture *capture, AudioPcmCallback callback, void *userData) {
@@ -162,6 +163,25 @@ snd_pcm_uframes_t audio_capture_period_frames(const AudioCapture *capture) {
     return capture == NULL ? 0 : capture->periodFrames;
 }
 
+snd_pcm_uframes_t audio_capture_buffer_frames(const AudioCapture *capture) {
+    return capture == NULL ? 0 : capture->bufferFrames;
+}
+
+void audio_capture_get_statistics(const AudioCapture *capture, AudioCaptureStatistics *statistics) {
+    if (statistics == NULL) {
+        return;
+    }
+    memset(statistics, 0, sizeof(*statistics));
+    if (capture == NULL) {
+        return;
+    }
+    statistics->xrunCount = atomic_load(&capture->xrunCount);
+    statistics->recoveredErrorCount = atomic_load(&capture->recoveredErrorCount);
+    statistics->fatalErrorCount = atomic_load(&capture->fatalErrorCount);
+    statistics->lastError = atomic_load(&capture->lastError);
+    statistics->running = atomic_load(&capture->running) ? 1 : 0;
+}
+
 static void *capture_thread_main(void *argument) {
     AudioCapture *capture = (AudioCapture *)argument;
 
@@ -175,8 +195,16 @@ static void *capture_thread_main(void *argument) {
             break;
         }
         if (frames == -EPIPE) {
+            int prepareResult;
             fprintf(stderr, "AudioCapture: ALSA capture XRUN, recovering\n");
-            snd_pcm_prepare(capture->pcmHandle);
+            atomic_fetch_add(&capture->xrunCount, 1);
+            prepareResult = snd_pcm_prepare(capture->pcmHandle);
+            if (prepareResult < 0) {
+                atomic_store(&capture->lastError, prepareResult);
+                atomic_fetch_add(&capture->fatalErrorCount, 1);
+                break;
+            }
+            atomic_fetch_add(&capture->recoveredErrorCount, 1);
             capture->clockInitialized = 0;
             continue;
         }
@@ -184,8 +212,11 @@ static void *capture_thread_main(void *argument) {
             const int recovered = snd_pcm_recover(capture->pcmHandle, (int)frames, 0);
             if (recovered < 0) {
                 fprintf(stderr, "AudioCapture: read failed permanently: %s\n", snd_strerror(recovered));
+                atomic_store(&capture->lastError, recovered);
+                atomic_fetch_add(&capture->fatalErrorCount, 1);
                 break;
             }
+            atomic_fetch_add(&capture->recoveredErrorCount, 1);
             capture->clockInitialized = 0;
             continue;
         }
@@ -227,6 +258,7 @@ int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *con
     unsigned int sampleRate;
     unsigned int channels;
     snd_pcm_uframes_t periodFrames;
+    snd_pcm_uframes_t bufferFrames;
     int direction = 0;
     int result;
 
@@ -236,6 +268,10 @@ int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *con
     memset(capture, 0, sizeof(*capture));
     atomic_init(&capture->stopRequested, false);
     atomic_init(&capture->running, false);
+    atomic_init(&capture->xrunCount, 0);
+    atomic_init(&capture->recoveredErrorCount, 0);
+    atomic_init(&capture->fatalErrorCount, 0);
+    atomic_init(&capture->lastError, 0);
 
     audio_capture_config_init(&effectiveConfig);
     if (config != NULL) {
@@ -280,7 +316,23 @@ int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *con
         (result = snd_pcm_hw_params_set_channels_near(capture->pcmHandle, hardwareParams,
                                                       &channels)) < 0 ||
         (result = snd_pcm_hw_params_set_period_size_near(capture->pcmHandle, hardwareParams,
-                                                         &periodFrames, &direction)) < 0 ||
+                                                          &periodFrames, &direction)) < 0) {
+        fprintf(stderr, "AudioCapture: configure %s failed: %s\n",
+                capture->deviceInfo.alsaName, snd_strerror(result));
+        audio_capture_close(capture);
+        return result;
+    }
+
+    /* period_size_near() 可能把 period 调成驱动支持值；默认 buffer 必须据此重新计算，
+       才能保证仍是 8 个实际 period，而不是 8 个“请求的” period。 */
+    bufferFrames = effectiveConfig.requestedBufferFrames == 0
+                       ? periodFrames * 8
+                       : effectiveConfig.requestedBufferFrames;
+    if (bufferFrames < periodFrames * 2) {
+        bufferFrames = periodFrames * 2;
+    }
+    if ((result = snd_pcm_hw_params_set_buffer_size_near(capture->pcmHandle, hardwareParams,
+                                                          &bufferFrames)) < 0 ||
         (result = snd_pcm_hw_params(capture->pcmHandle, hardwareParams)) < 0 ||
         (result = snd_pcm_prepare(capture->pcmHandle)) < 0) {
         fprintf(stderr, "AudioCapture: configure %s failed: %s\n",
@@ -293,6 +345,7 @@ int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *con
     capture->actualFormat.channels = (uint16_t)channels;
     capture->actualFormat.sampleFormat = sample_format_from_alsa(alsaFormat);
     capture->periodFrames = periodFrames;
+    capture->bufferFrames = bufferFrames;
     capture->bufferBytes = (size_t)periodFrames * channels * sizeof(int16_t);
     capture->buffer = (uint8_t *)calloc(1, capture->bufferBytes);
     if (capture->buffer == NULL) {
@@ -301,13 +354,14 @@ int audio_capture_open_auto(AudioCapture *capture, const AudioCaptureConfig *con
     }
 
     fprintf(stdout,
-            "AudioCapture: selected %s [%s / %s], PCM=%uHz %uch S16_LE period=%lu\n",
+            "AudioCapture: selected %s [%s / %s], PCM=%uHz %uch S16_LE period=%lu buffer=%lu\n",
             capture->deviceInfo.alsaName,
             capture->deviceInfo.cardId,
             capture->deviceInfo.pcmName,
             capture->actualFormat.sampleRate,
             capture->actualFormat.channels,
-            (unsigned long)capture->periodFrames);
+            (unsigned long)capture->periodFrames,
+            (unsigned long)capture->bufferFrames);
     return 0;
 }
 

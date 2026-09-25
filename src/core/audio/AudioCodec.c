@@ -87,6 +87,14 @@ int audio_encoder_flush(AudioEncoder *encoder) {
     return encoder->ops->flush(encoder->implementation);
 }
 
+int audio_encoder_reset(AudioEncoder *encoder) {
+    if (encoder == NULL || encoder->implementation == NULL || encoder->ops == NULL ||
+        encoder->ops->reset == NULL) {
+        return -ENOTSUP;
+    }
+    return encoder->ops->reset(encoder->implementation);
+}
+
 void audio_encoder_close(AudioEncoder *encoder) {
     if (encoder == NULL) {
         return;

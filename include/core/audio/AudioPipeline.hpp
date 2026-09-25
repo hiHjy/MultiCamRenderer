@@ -112,6 +112,8 @@ public:
     void stopCapture();
     bool isCaptureRunning() const;
     AudioPcmFormat captureFormat() const;
+    /* ALSA XRUN/recover/线程退出状态；IPC App 应低频检查，不在采集回调里同步写日志。 */
+    AudioCaptureStatistics captureStatistics() const;
 
     /* 订阅 raw PCM，或订阅某个 APM 配置产生的 PCM。回调运行在 Hub 发布线程，必须快速返回。 */
     AudioSubscription subscribePcm(const AudioPcmRequest& request, PcmCallback callback);

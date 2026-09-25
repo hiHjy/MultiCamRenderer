@@ -61,7 +61,21 @@ typedef struct AudioCaptureConfig {
     /* 期望的周期帧数，决定回调频率和延迟。默认 480 帧 = 48kHz 下 10ms。
        APM 要求帧数是 sampleRate/100 的整数倍（10ms 对齐），10ms 正好满足。 */
     snd_pcm_uframes_t requestedPeriodFrames;
+    /*
+     * 期望的 ALSA hardware buffer 总帧数。0 表示内部按 8 个 period（48kHz 下 80ms）
+     * 设置；这给普通 CFS 调度留出余量，同时不把采集端延迟堆到数百毫秒。
+     */
+    snd_pcm_uframes_t requestedBufferFrames;
 } AudioCaptureConfig;
+
+/* 采集运行状态：由音频健康检查读取，所有计数均为自 open 后的累计值。 */
+typedef struct AudioCaptureStatistics {
+    uint64_t xrunCount;          /* snd_pcm_readi() 返回 -EPIPE 的次数。 */
+    uint64_t recoveredErrorCount;/* 通过 snd_pcm_prepare/recover 成功恢复的次数。 */
+    uint64_t fatalErrorCount;    /* 无法 recover、采集线程退出的次数。 */
+    int lastError;               /* 最近一次 ALSA 负 errno；0 表示尚未出现错误。 */
+    int running;                 /* 采集线程当前是否仍在运行。 */
+} AudioCaptureStatistics;
 
 #ifndef __cplusplus
 typedef struct AudioCapture {
@@ -77,8 +91,8 @@ typedef struct AudioCapture {
        只靠标志位是叫不醒阻塞在驱动里的 readi 的。 */
     atomic_bool stopRequested;
 
-    /* 运行状态标志。start 置 true、线程退出置 false。
-       注意：目前只写不读（外部没有消费者），保留作为状态观察点。 */
+    /* 运行状态标志。start 置 true、线程退出置 false；AudioPipeline / IPC App 的
+       健康检查读取它，以便采集线程异常退出不再静默。 */
     atomic_bool running;
 
     /* 数据回调及其上下文，由 audio_capture_set_callback 设置；NULL 表示不推送。 */
@@ -94,6 +108,9 @@ typedef struct AudioCapture {
 
     /* 实际协商成功的周期帧数。每次 readi 读这么多帧，也是 buffer 的容量依据。 */
     snd_pcm_uframes_t periodFrames;
+
+    /* ALSA 最终协商出的 DMA 环形缓冲总帧数；不是本进程临时 PCM buffer 的大小。 */
+    snd_pcm_uframes_t bufferFrames;
 
     /* 采集缓冲区，大小 = periodFrames * channels * sizeof(int16_t)。
        回调收到的 frame.data 就指向这里，所以回调返回后数据失效。 */
@@ -122,6 +139,12 @@ typedef struct AudioCapture {
     /* 采集线程是否已创建。start 用它防止重复启动（已启动返回 -EBUSY），
        stop 用它判断是否需要 join。 */
     int threadCreated;
+
+    /* 采集线程与健康检查线程之间的无锁累计状态。 */
+    atomic_uint_fast64_t xrunCount;
+    atomic_uint_fast64_t recoveredErrorCount;
+    atomic_uint_fast64_t fatalErrorCount;
+    atomic_int lastError;
 } AudioCapture;
 #else
 /* C++ 侧不直接依赖 C11 atomic/pthread 字段；必须经下方 API 操作这个 C 对象。 */
@@ -151,6 +174,8 @@ AudioCapture *audio_capture_create(void);
 void audio_capture_destroy(AudioCapture *capture);
 AudioPcmFormat audio_capture_actual_format(const AudioCapture *capture);
 snd_pcm_uframes_t audio_capture_period_frames(const AudioCapture *capture);
+snd_pcm_uframes_t audio_capture_buffer_frames(const AudioCapture *capture);
+void audio_capture_get_statistics(const AudioCapture *capture, AudioCaptureStatistics *statistics);
 
 /* 启动采集线程。要求已 open_auto 成功。重复启动返回 -EBUSY。 */
 int audio_capture_start(AudioCapture *capture);

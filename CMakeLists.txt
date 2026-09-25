@@ -300,6 +300,7 @@ add_library(mcr_audio_core STATIC
     src/core/audio/AudioPacketFile.c
     src/core/audio/AudioFrame.cpp
     src/core/audio/AudioPipeline.cpp
+    src/core/audio/AudioDiagnosticCapture.cpp
     src/core/audio/AudioPlaybackPipeline.cpp
 )
 target_include_directories(mcr_audio_core
@@ -380,6 +381,13 @@ if(MCR_BUILD_DEMOS)
     mcr_add_executable(audio_frame_pool_demo demo/AudioFramePoolDemo.cpp)
     target_link_libraries(audio_frame_pool_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_frame_pool_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖 ALSA：验证 AAC/Opus 在 PCM 时间轴断裂时轻量 reset 后，不会跨缺口拼包。
+    mcr_add_executable(audio_encoder_reset_demo demo/AudioEncoderResetDemo.c)
+    target_link_libraries(audio_encoder_reset_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_encoder_reset_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 

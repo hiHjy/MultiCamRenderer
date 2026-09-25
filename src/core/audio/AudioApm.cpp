@@ -35,16 +35,6 @@ bool same_format(const AudioPcmFormat &left, const AudioPcmFormat &right) {
            left.sampleFormat == right.sampleFormat;
 }
 
-uint64_t absolute_sample_sum(const int16_t *samples, size_t sampleCount) {
-    uint64_t total = 0;
-
-    for (size_t index = 0; index < sampleCount; ++index) {
-        const int32_t sample = samples[index];
-        total += static_cast<uint64_t>(sample < 0 ? -sample : sample);
-    }
-    return total;
-}
-
 /* AGC2 的参数范围（见上游 api/audio/audio_processing.h 的 GainController2）。 */
 constexpr int kMaxGainDbLimit = 50;
 constexpr int kHeadroomDbLimit = 31;
@@ -228,10 +218,6 @@ extern "C" int audio_apm_process_capture(AudioApm *apm,
         *output = *input;
         implementation->statistics.processedFrames += input->frames;
         implementation->statistics.processedSamples += input->frames * apm->format.channels;
-        implementation->statistics.inputAbsoluteSampleSum += absolute_sample_sum(
-            inputSamples, input->frames * apm->format.channels);
-        implementation->statistics.outputAbsoluteSampleSum += absolute_sample_sum(
-            inputSamples, input->frames * apm->format.channels);
         return 0;
     }
 
@@ -258,10 +244,6 @@ extern "C" int audio_apm_process_capture(AudioApm *apm,
     output->data = reinterpret_cast<const uint8_t *>(outputSamples);
     implementation->statistics.processedFrames += input->frames;
     implementation->statistics.processedSamples += input->frames * apm->format.channels;
-    implementation->statistics.inputAbsoluteSampleSum += absolute_sample_sum(
-        inputSamples, input->frames * apm->format.channels);
-    implementation->statistics.outputAbsoluteSampleSum += absolute_sample_sum(
-        outputSamples, input->frames * apm->format.channels);
     return 0;
 }
 

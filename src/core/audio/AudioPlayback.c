@@ -226,10 +226,16 @@ int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig 
     return 0;
 }
 
-int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame) {
+int audio_playback_write_pcm_ex(AudioPlayback *playback,
+                                const AudioPcmFrame *frame,
+                                AudioPlaybackWriteStatus *status) {
     const int16_t *samples;
     const int16_t *playbackSamples;
     size_t writtenFrames = 0;
+
+    if (status != NULL) {
+        memset(status, 0, sizeof(*status));
+    }
 
     if (playback == NULL || frame == NULL || frame->data == NULL || frame->frames == 0 ||
         playback->pcmHandle == NULL || playback->conversionBuffer == NULL ||
@@ -263,8 +269,15 @@ int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame
             playbackSamples + writtenFrames * playback->actualFormat.channels,
             frame->frames - writtenFrames);
         if (result == -EPIPE) {
+            int prepareResult;
             fprintf(stderr, "AudioPlayback: ALSA playback XRUN, recovering\n");
-            snd_pcm_prepare(playback->pcmHandle);
+            if (status != NULL) {
+                status->recoveredFromDiscontinuity = 1;
+            }
+            prepareResult = snd_pcm_prepare(playback->pcmHandle);
+            if (prepareResult < 0) {
+                return prepareResult;
+            }
             continue;
         }
         if (result < 0) {
@@ -272,6 +285,9 @@ int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame
             if (recovered < 0) {
                 fprintf(stderr, "AudioPlayback: write failed permanently: %s\n", snd_strerror(recovered));
                 return recovered;
+            }
+            if (status != NULL) {
+                status->recoveredFromDiscontinuity = 1;
             }
             continue;
         }
@@ -281,6 +297,10 @@ int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame
         writtenFrames += (size_t)result;
     }
     return 0;
+}
+
+int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame) {
+    return audio_playback_write_pcm_ex(playback, frame, NULL);
 }
 
 void audio_playback_close(AudioPlayback *playback) {

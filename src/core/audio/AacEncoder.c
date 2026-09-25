@@ -66,6 +66,10 @@ static int emit_access_unit(AudioAacEncoder *encoder)
     if (result != AACENC_OK) {
         return -EIO;
     }
+    /* FDK 在首次编码或刚 reset history 后可能已消费 1024 samples、但暂未输出 access
+       unit。无论是否有输出，这组输入都已归属底层，应用层 cache 必须释放；否则下一次
+       writableFrames 会变成 0，aac_push_pcm() 会原地空转。 */
+    encoder->cachedFrames = 0;
     if (outputArguments.numOutBytes <= 0) {
         return 0;
     }
@@ -79,7 +83,6 @@ static int emit_access_unit(AudioAacEncoder *encoder)
                                                 encoder->inputFormat.sampleRate);
     packet.sourceFormat = encoder->inputFormat;
 
-    encoder->cachedFrames = 0;
     return encoder->owner->callback == NULL
         ? 0
         : encoder->owner->callback(&packet, encoder->owner->callbackUserData);
@@ -138,6 +141,29 @@ static int aac_flush(void *implementation)
     return emit_access_unit(encoder);
 }
 
+static int aac_reset(void *implementation)
+{
+    AudioAacEncoder *encoder = (AudioAacEncoder *)implementation;
+
+    if (encoder == NULL || encoder->encoder == NULL) {
+        return -EINVAL;
+    }
+
+    /* 先丢弃应用层尚未凑齐的一组 1024 samples，绝不把时间缺口两侧的 PCM 混成一包。 */
+    encoder->cachedFrames = 0;
+    encoder->cachedTimestampUs = 0;
+
+    /* FDK-AAC 不是只有 pcmCache：psychoacoustic 等模块也持有 history。官方
+       CONTROL_STATE 能在不释放 handle 的前提下清所有 history 与内部 input buffer；
+       随后的空 encode 立即执行该重置，而不是拖到下一包音频。 */
+    if (aacEncoder_SetParam(encoder->encoder, AACENC_CONTROL_STATE,
+                            AACENC_INIT_STATES | AACENC_RESET_INBUFFER) != AACENC_OK
+        || aacEncEncode(encoder->encoder, NULL, NULL, NULL, NULL) != AACENC_OK) {
+        return -EIO;
+    }
+    return 0;
+}
+
 static void aac_close(void *implementation)
 {
     AudioAacEncoder *encoder = (AudioAacEncoder *)implementation;
@@ -156,6 +182,7 @@ static void aac_close(void *implementation)
 static const AudioEncoderOps kAacEncoderOps = {
     .pushPcm = aac_push_pcm,
     .flush = aac_flush,
+    .reset = aac_reset,
     .close = aac_close,
 };
 
@@ -191,7 +218,9 @@ int audio_aac_encoder_create(AudioEncoder *owner,
         || aacEncoder_SetParam(encoder->encoder, AACENC_CHANNELMODE, channel_mode(inputFormat->channels)) != AACENC_OK
         || aacEncoder_SetParam(encoder->encoder, AACENC_BITRATE, config->bitrate) != AACENC_OK
         || aacEncoder_SetParam(encoder->encoder, AACENC_TRANSMUX, TT_MP4_RAW) != AACENC_OK
-        || aacEncoder_SetParam(encoder->encoder, AACENC_AFTERBURNER, 1) != AACENC_OK
+        /* 板端 A/B：64kbps mono 下 Afterburner 额外约 2% 单核，输出体积几乎相同；
+           目前没有证明其听感收益足以抵消常驻计算，因此固定关闭。 */
+        || aacEncoder_SetParam(encoder->encoder, AACENC_AFTERBURNER, 0) != AACENC_OK
         || aacEncEncode(encoder->encoder, NULL, NULL, NULL, NULL) != AACENC_OK) {
         aac_close(encoder);
         return -EINVAL;

@@ -30,6 +30,9 @@ typedef struct AudioEncoderConfig {
 typedef struct AudioEncoderOps {
     int (*pushPcm)(void *implementation, const AudioPcmFrame *frame);
     int (*flush)(void *implementation);
+    /* 丢弃未凑满的一包 PCM，并复位 codec 的跨帧历史；不释放 encoder 句柄或 buffer。
+       仅适用于 PCM 格式不变、但时间轴发生断裂的场景。 */
+    int (*reset)(void *implementation);
     void (*close)(void *implementation);
 } AudioEncoderOps;
 
@@ -50,6 +53,8 @@ int audio_encoder_init(AudioEncoder *encoder,
                        const AudioPcmFormat *inputFormat);
 int audio_encoder_push_pcm(AudioEncoder *encoder, const AudioPcmFrame *frame);
 int audio_encoder_flush(AudioEncoder *encoder);
+/* 轻量处理时间戳断裂。输入格式变化仍必须 close 后 init 新格式。 */
+int audio_encoder_reset(AudioEncoder *encoder);
 void audio_encoder_close(AudioEncoder *encoder);
 
 #ifdef __cplusplus

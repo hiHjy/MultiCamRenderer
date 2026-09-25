@@ -425,6 +425,7 @@ public:
         m_running = false;
         m_stopRequested = false;
         audio_encoder_close(&m_encoder);
+        m_encoderReady = false;
         m_haveExpectedTimestamp = false;
     }
 
@@ -490,23 +491,43 @@ private:
     {
         const int result = audio_encoder_init(&m_encoder, &m_config, &format);
         if (result < 0) {
+            m_encoderReady = false;
             m_lastError = "audio_encoder_init 失败: " + std::to_string(result);
             return false;
         }
+        m_encoderReady = true;
         return true;
     }
 
-    void resetEncoderForDiscontinuity(const AudioPcmFormat& format)
+    bool recreateEncoderForFormatChange(const AudioPcmFormat& format)
     {
-        /* 清掉 Opus 内部尚未凑满的一部分 PCM，绝不能跨时间缺口拼成同一个压缩包。 */
+        /* sampleRate / channels / sample format 变化时，旧 codec 配置已不再适用，
+           这里仍必须完整重建。 */
         audio_encoder_close(&m_encoder);
+        m_encoderReady = false;
         audio_encoder_set_packet_callback(&m_encoder, &EncoderNode::onEncodedPacket, this);
         if (!initializeEncoderLocked(format)) {
             LOG_ERROR("EncoderNode", m_lastError);
-        } else {
-            LOG_WARN("EncoderNode", "检测到 PCM 时间戳不连续，已重建编码器并丢弃未完成压缩包");
+            return false;
         }
         m_haveExpectedTimestamp = false;
+        return true;
+    }
+
+    bool resetEncoderForTimestampDiscontinuity()
+    {
+        /* 格式没有改变时不释放 handle：AAC 清本地/internel history，Opus 清 predictor
+           state；两者都会丢弃未凑满的一包 PCM，绝不跨时间缺口拼包。 */
+        if (audio_encoder_reset(&m_encoder) == 0) {
+            m_haveExpectedTimestamp = false;
+            LOG_WARN("EncoderNode", "检测到 PCM 时间戳不连续，已轻量复位编码器并丢弃未完成压缩包");
+            return true;
+        }
+
+        /* 轻量 reset 意外失败时保持旧的可靠降级路径：完整重建，不能继续拿状态未知的
+           encoder 送 PCM。 */
+        LOG_WARN("EncoderNode", "轻量复位编码器失败，回退完整重建");
+        return recreateEncoderForFormatChange(m_format);
     }
 
     void workerMain()
@@ -523,13 +544,17 @@ private:
                 m_queue.pop_front();
             }
 
-            if (!samePcmFormat(frame->format, m_format)) {
+            if (!m_encoderReady || !samePcmFormat(frame->format, m_format)) {
                 LOG_WARN("EncoderNode", "PCM 格式变化，重建编码器");
-                resetEncoderForDiscontinuity(frame->format);
+                if (!recreateEncoderForFormatChange(frame->format)) {
+                    continue;
+                }
                 m_format = frame->format;
             } else if (m_haveExpectedTimestamp
                        && isTimestampDiscontinuous(m_expectedTimestampUs, frame->timestampUs)) {
-                resetEncoderForDiscontinuity(frame->format);
+                if (!resetEncoderForTimestampDiscontinuity()) {
+                    continue;
+                }
             }
 
             const AudioPcmFrame input = frame->pcmView();
@@ -562,6 +587,7 @@ private:
     uint64_t m_droppedInputFrames = 0;
     uint64_t m_droppedOutputPacketsByPool = 0;
     bool m_haveExpectedTimestamp = false;
+    bool m_encoderReady = false;
     bool m_stopRequested = false;
     bool m_running = false;
     std::string m_lastError;
@@ -716,13 +742,23 @@ void AudioPipeline::stopCapture()
 bool AudioPipeline::isCaptureRunning() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_captureRunning;
+    AudioCaptureStatistics statistics {};
+    audio_capture_get_statistics(m_capture, &statistics);
+    return m_captureRunning && statistics.running != 0;
 }
 
 AudioPcmFormat AudioPipeline::captureFormat() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_captureFormat;
+}
+
+AudioCaptureStatistics AudioPipeline::captureStatistics() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    AudioCaptureStatistics statistics {};
+    audio_capture_get_statistics(m_capture, &statistics);
+    return statistics;
 }
 
 /*

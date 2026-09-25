@@ -6,7 +6,6 @@
 AudioAccessUnitQueue::AudioAccessUnitQueue(size_t capacity)
     : m_capacity(capacity == 0 ? 1 : capacity)
 {
-    m_queue.reserve(m_capacity);
 }
 
 bool AudioAccessUnitQueue::push(EncodedAudioPacketPtr packet)
@@ -18,7 +17,7 @@ bool AudioAccessUnitQueue::push(EncodedAudioPacketPtr packet)
     std::lock_guard<std::mutex> lock(m_mutex);
     bool dropped = false;
     if (m_queue.size() == m_capacity) {
-        m_queue.erase(m_queue.begin());
+        m_queue.pop_front();
         ++m_droppedAccessUnits;
         dropped = true;
     }
@@ -34,7 +33,7 @@ bool AudioAccessUnitQueue::pop(AccessUnit& accessUnit)
         return false;
     }
     accessUnit = std::move(m_queue.front());
-    m_queue.erase(m_queue.begin());
+    m_queue.pop_front();
     return true;
 }
 

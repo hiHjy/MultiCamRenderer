@@ -120,6 +120,19 @@ static int opus_flush(void *implementation) {
     return result;
 }
 
+static int opus_reset(void *implementation) {
+    AudioOpusEncoder *encoder = (AudioOpusEncoder *)implementation;
+
+    if (encoder == NULL || encoder->opus == NULL) {
+        return -EINVAL;
+    }
+    /* 丢弃未满包 PCM，并将 Opus predictor/entropy state 还原成 freshly-created 状态。
+       配置、packetBuffer 与已分配的 PCM cache 全部保留。 */
+    encoder->cachedFrames = 0;
+    encoder->cachedTimestampUs = 0;
+    return opus_encoder_ctl(encoder->opus, OPUS_RESET_STATE) == OPUS_OK ? 0 : -EIO;
+}
+
 static void opus_close(void *implementation) {
     AudioOpusEncoder *encoder = (AudioOpusEncoder *)implementation;
     if (encoder == NULL) {
@@ -134,6 +147,7 @@ static void opus_close(void *implementation) {
 static const AudioEncoderOps kOpusEncoderOps = {
     .pushPcm = opus_push_pcm,
     .flush = opus_flush,
+    .reset = opus_reset,
     .close = opus_close,
 };
 

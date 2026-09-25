@@ -19,7 +19,6 @@
 #include "AudioCapture.h"
 
 #include <errno.h>
-#include <math.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -347,17 +346,7 @@ int main(int argc, char **argv) {
            (unsigned long long)context.writtenFrames,
            sampleRate != 0 ? (double)context.writtenFrames / (double)sampleRate : 0.0,
            outputPath);
-    if (statistics.processedSamples != 0) {
-        const double inputMean = (double)statistics.inputAbsoluteSampleSum /
-                                 (double)statistics.processedSamples;
-        const double outputMean = (double)statistics.outputAbsoluteSampleSum /
-                                  (double)statistics.processedSamples;
-        const double gain = inputMean > 0.0 ? outputMean / inputMean : 0.0;
-        printf("AudioCaptureApmPcmDemo: APM inputMean=%.1f outputMean=%.1f gain=%.2fx (%.1f dB)\n",
-               inputMean,
-               outputMean,
-               gain,
-               gain > 0.0 ? 20.0 * log10(gain) : 0.0);
-    }
+    printf("AudioCaptureApmPcmDemo: APM processedSamples=%llu\n",
+           (unsigned long long)statistics.processedSamples);
     return 0;
 }

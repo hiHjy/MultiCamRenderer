@@ -66,12 +66,10 @@ typedef struct AudioApmConfig {
     int enableTransientSuppression;
 } AudioApmConfig;
 
-/* 用于运行期健康检查的累计电平，不持有任何 PCM 数据。 */
+/* APM 已处理的累计量；不在实时路径额外扫描 PCM 计算响度。 */
 typedef struct AudioApmStatistics {
     uint64_t processedFrames;
     uint64_t processedSamples;
-    uint64_t inputAbsoluteSampleSum;
-    uint64_t outputAbsoluteSampleSum;
 } AudioApmStatistics;
 
 typedef struct AudioApm {

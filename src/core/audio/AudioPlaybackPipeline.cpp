@@ -310,10 +310,22 @@ bool AudioPlaybackPipeline::ensureDecoder(const EncodedAudioPacket& packet)
 
 bool AudioPlaybackPipeline::playPcm(const AudioPcmFrame& frame)
 {
-    const int result = audio_playback_write_pcm(&m_playback, &frame);
+    AudioPlaybackWriteStatus writeStatus {};
+    const int result = audio_playback_write_pcm_ex(&m_playback, &frame, &writeStatus);
     if (result < 0) {
         setError("写入 ALSA 失败: " + std::to_string(result));
         return false;
+    }
+    if (writeStatus.recoveredFromDiscontinuity != 0) {
+        /* 这里才是“饥饿”的可靠证据：ALSA 已经真的断流并被 prepare/recover。
+           不能根据 m_queueCount 暂时为 0 判断，否则正常每 10ms 来一包时也可能反复
+           回到预缓冲，造成周期性加延迟。 */
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_playbackStarted = false;
+        }
+        LOG_WARN("AudioPlaybackPipeline", "检测到 ALSA 播放断流，下一段音频将重新预缓冲 "
+                                            << m_config.startupPrebufferDurationUs / 1000 << "ms");
     }
     m_playedPcmFrames += frame.frames;
     return true;

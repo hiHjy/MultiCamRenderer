@@ -1,4 +1,5 @@
 #include "CamManager.hpp"
+#include "AudioDiagnosticCapture.hpp"
 #include "AudioPipeline.hpp"
 #include "IspController.hpp"
 #include "Live555RtspServer.hh"
@@ -25,10 +26,16 @@ constexpr int kCameraBufferCount = 6;
 constexpr char kOsdFontPath[] = "/oem/usr/share/fonts/DejaVuSans.ttf";
 
 volatile std::sig_atomic_t g_stopRequested = 0;
+volatile std::sig_atomic_t g_audioSnapshotRequested = 0;
 
-extern "C" void handleSignal(int)
+extern "C" void handleSignal(int signalNumber)
 {
-    g_stopRequested = 1;
+    if (signalNumber == SIGUSR1) {
+        // signal handler 只能置位；订阅、分配内存、写文件都由 main 线程完成。
+        g_audioSnapshotRequested = 1;
+    } else {
+        g_stopRequested = 1;
+    }
 }
 
 } // namespace
@@ -37,6 +44,7 @@ int main()
 {
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+    std::signal(SIGUSR1, handleSignal);
 
     IspController ispController;
     if (!ispController.start()) {
@@ -46,6 +54,7 @@ int main()
     CamManager cameraManager;
     Live555RtspServer rtspServer;
     AudioPipeline audioPipeline;
+    AudioDiagnosticCapture audioDiagnosticCapture;
 
     // 音频采集与 AAC-LC 编码独立于 main/sub 视频分辨率：整台 IPC 只采集、编码一次，
     // Server 再将同一份不可变 AAC 包分发到两个 URL 的独立 audio track queue。
@@ -163,10 +172,44 @@ int main()
                            << " main=" << rtspServer.rtspURL("main")
                            << " sub=" << rtspServer.rtspURL("sub"));
 
-    while (g_stopRequested == 0)
+    /* 音频采集发生 XRUN 时可能成功恢复，也可能线程最终退出。前者至少留下一条
+       运行期证据，后者必须明确报错；不能让 RTSP 仍活着、音频却静默消失。 */
+    AudioCaptureStatistics lastAudioCaptureStatistics = audioPipeline.captureStatistics();
+    while (g_stopRequested == 0) {
+        if (g_audioSnapshotRequested != 0) {
+            g_audioSnapshotRequested = 0;
+            if (!audioDiagnosticCapture.startOneShot(audioPipeline)) {
+                LOG_WARN("IpcApp", "忽略 SIGUSR1 音频快照请求: "
+                                       << audioDiagnosticCapture.lastError());
+            }
+        }
+
+        const AudioCaptureStatistics audioStatistics = audioPipeline.captureStatistics();
+        const bool recoveredChanged =
+            audioStatistics.xrunCount != lastAudioCaptureStatistics.xrunCount ||
+            audioStatistics.recoveredErrorCount != lastAudioCaptureStatistics.recoveredErrorCount;
+        const bool captureStopped = lastAudioCaptureStatistics.running != 0 &&
+                                    audioStatistics.running == 0;
+        const bool fatalChanged =
+            audioStatistics.fatalErrorCount != lastAudioCaptureStatistics.fatalErrorCount;
+        if (captureStopped || fatalChanged) {
+            LOG_ERROR("IpcApp", "音频采集已异常停止"
+                                     << " xrun=" << audioStatistics.xrunCount
+                                     << " recovered=" << audioStatistics.recoveredErrorCount
+                                     << " fatal=" << audioStatistics.fatalErrorCount
+                                     << " lastAlsaError=" << audioStatistics.lastError);
+        } else if (recoveredChanged) {
+            LOG_WARN("IpcApp", "音频采集出现并已恢复的 ALSA 异常"
+                                    << " xrun=" << audioStatistics.xrunCount
+                                    << " recovered=" << audioStatistics.recoveredErrorCount
+                                    << " lastAlsaError=" << audioStatistics.lastError);
+        }
+        lastAudioCaptureStatistics = audioStatistics;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     LOG_INFO("IpcApp", "收到退出信号，正在停止 IPC RTSP 服务");
+    audioDiagnosticCapture.cancel();
     rtspServer.stop();
     audioPublishSink.reset();
     audioPipeline.stopCapture();

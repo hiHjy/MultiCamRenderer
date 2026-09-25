@@ -25,6 +25,12 @@ typedef struct AudioPlaybackConfig {
     snd_pcm_uframes_t requestedStartThresholdFrames;
 } AudioPlaybackConfig;
 
+/* 单次 write 的运行期事件。它不改变 write 成功/失败的返回值，只让上层能区分
+   “正常写入成功”和“ALSA 曾断流、底层已 prepare/recover 后写入成功”。 */
+typedef struct AudioPlaybackWriteStatus {
+    int recoveredFromDiscontinuity;
+} AudioPlaybackWriteStatus;
+
 typedef struct AudioPlayback {
     snd_pcm_t *pcmHandle;
     AudioDeviceInfo deviceInfo;
@@ -38,6 +44,11 @@ typedef struct AudioPlayback {
 int audio_playback_discover_default_device(AudioDeviceInfo *deviceInfo);
 void audio_playback_config_init(AudioPlaybackConfig *config);
 int audio_playback_open_auto(AudioPlayback *playback, const AudioPlaybackConfig *config);
+/* 扩展版 write：status 非 NULL 时报告本次是否发生并恢复了 ALSA XRUN/挂起等断流。 */
+int audio_playback_write_pcm_ex(AudioPlayback *playback,
+                                const AudioPcmFrame *frame,
+                                AudioPlaybackWriteStatus *status);
+/* 普通调用不关心断流状态时使用此兼容接口。 */
 int audio_playback_write_pcm(AudioPlayback *playback, const AudioPcmFrame *frame);
 void audio_playback_close(AudioPlayback *playback);
 
