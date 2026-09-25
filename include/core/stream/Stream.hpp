@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DmaBufferPool.hpp"
+#include "AudioTypes.h"
 #include "VideoFrame.hpp"
 #include "VideoCodec.hpp"
 
@@ -47,6 +48,12 @@ public:
     // packet 的 lease 会在最后一个使用者释放后，把 DMA buffer 归还给对应 pool。
     bool tryGetFrame(FramePacket& packet);
 
+    // 注册压缩音频包观察者。回调由底层 source 的收包线程同步调用；packet.data 只在
+    // 回调返回前有效。需要异步解码、落盘或播放时，观察者必须先复制到自己的有界队列
+    // 或 EncodedAudioPacketPool，绝不能持有 packet.data。
+    using AudioPacketCallback = std::function<void(const AudioEncodedPacket& packet)>;
+    void setAudioPacketCallback(AudioPacketCallback callback);
+
     int streamId() const;
     std::string lastError() const;
 
@@ -55,8 +62,13 @@ protected:
     // 传入 2，以吸收轻微调度抖动，同时保持显示追赶最新画面；录像不经过此队列。
     explicit Stream(size_t readyQueueCapacity);
 
-    // 派生类从网络回调进入这里。data 只需要在本函数返回前有效；DecodeWorker 会复制。后续如果加录像应该从这里入手
-    void onPacket(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs);
+    // 派生类从网络回调进入这里。data 只需要在本函数返回前有效；DecodeWorker 会复制。
+    // 视频录像等需要压缩 H264/H265 的功能也应从这个边界接入。
+    void onVideoPacket(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs);
+
+    // 派生类收到完整音频 access unit 后进入这里。基类不对音频解码或排队：不同上层
+    // 可能要 RTSP 原样转发、通话 APM 或本地播放，因此只同步转交给已注册的观察者。
+    void onAudioPacket(const AudioEncodedPacket& packet);
 
     bool startDecodeWorker();
     void stopDecodeWorker();
@@ -112,6 +124,9 @@ private:
     mutable std::mutex m_readyMutex;
     std::deque<FramePacket> m_readyQueue;
     std::function<void()> m_frameReadyCallback;
+
+    mutable std::mutex m_audioCallbackMutex;
+    AudioPacketCallback m_audioPacketCallback;
 
     mutable std::mutex m_runtimeStateMutex;
     RuntimeStateCallback m_runtimeStateCallback;

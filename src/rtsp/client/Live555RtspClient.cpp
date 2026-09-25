@@ -1,5 +1,6 @@
 #include "Live555RtspClient.hh"
 
+#include "AacAudioSink.hh"
 #include "AnnexBSink.hh"
 
 #include <BasicUsageEnvironment.hh>
@@ -11,11 +12,15 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace {
 
 constexpr unsigned kMaxReceivedNaluBytes = 2U * 1024U * 1024U;
+// 128kbps AAC-LC 单 AU 通常只有数百字节；64 KiB 是明确的防御上限，避免异常 SDP/RTP
+// 令 live555 收包线程无界分配。超过时 AacAudioSink 会报告截断并终止本轮收包。
+constexpr unsigned kMaxReceivedAacAccessUnitBytes = 64U * 1024U;
 // 1080p H265 的单个 IDR 往往会拆成数百个 UDP RTP 包。默认 socket 接收缓冲很容易
 // 小于一个 IDR 的突发量；丢任一 FU 分片都会令整条 IDR NALU 失效。
 constexpr unsigned kUdpRtpReceiveBufferBytes = 4U * 1024U * 1024U;
@@ -36,9 +41,39 @@ bool codecFromSubsession(const MediaSubsession& subsession, VideoCodec& codec)
     return false;
 }
 
+bool aacFormatFromSubsession(const MediaSubsession& subsession, AudioPcmFormat& format)
+{
+    if (std::strcmp(subsession.mediumName(), "audio") != 0
+        || std::strcmp(subsession.codecName(), "MPEG4-GENERIC") != 0) {
+        return false;
+    }
+
+    const unsigned sampleRate = subsession.rtpTimestampFrequency();
+    const unsigned channels = subsession.numChannels();
+    if (sampleRate == 0 || channels == 0 || channels > UINT16_MAX) {
+        return false;
+    }
+
+    format.sampleRate = sampleRate;
+    format.channels = static_cast<uint16_t>(channels);
+    format.sampleFormat = AUDIO_SAMPLE_FORMAT_S16_LE;
+    return true;
+}
+
 } // namespace
 
 struct Live555RtspClient::Impl {
+    enum class TrackKind {
+        Video,
+        AacAudio,
+    };
+
+    struct TrackInfo {
+        TrackKind kind = TrackKind::Video;
+        VideoCodec videoCodec = VideoCodec::H264;
+        AudioPcmFormat audioFormat {};
+    };
+
     struct PullClientState {
         ~PullClientState()
         {
@@ -51,8 +86,9 @@ struct Live555RtspClient::Impl {
         MediaSubsessionIterator* iterator = nullptr;
         MediaSession* session = nullptr;
         MediaSubsession* subsession = nullptr;
-        VideoCodec selectedCodec = VideoCodec::H264;
         bool hasSelectedVideo = false;
+        bool hasSelectedAudio = false;
+        std::unordered_map<MediaSubsession*, TrackInfo> selectedTracks;
     };
 
     class Client final : public RTSPClient {
@@ -79,10 +115,11 @@ struct Live555RtspClient::Impl {
     bool start(const std::string& url,
                AnnexBNaluCallback naluCallback,
                bool requestRtpOverTcp,
-               StateCallback stateCallback)
+               StateCallback stateCallback,
+               AudioAccessUnitCallback audioCallback)
     {
-        if (url.empty() || !naluCallback) {
-            const std::string message = "RTSP URL 或 NALU 回调为空";
+        if (url.empty() || (!naluCallback && !audioCallback)) {
+            const std::string message = "RTSP URL 或媒体回调为空";
             setError(message);
             if (stateCallback) {
                 stateCallback(State::Error, message);
@@ -95,6 +132,7 @@ struct Live555RtspClient::Impl {
             std::lock_guard<std::mutex> lock(lifecycleMutex);
             url_ = url;
             naluCallback_ = std::move(naluCallback);
+            audioCallback_ = std::move(audioCallback);
             stateCallback_ = std::move(stateCallback);
             requestRtpOverTcp_ = requestRtpOverTcp;
             codec_.store(VideoCodec::H264);
@@ -291,18 +329,29 @@ struct Live555RtspClient::Impl {
         }
 
         MediaSubsession& subsession = *clientRef.state.subsession;
-        // readSource() 产生已完成 RTP 解包/分片重组的帧；AnnexBSink 负责补 Annex-B 起始码。
-        subsession.sink = AnnexBSink::createNew(
-            clientRef.envir(),
-            clientRef.state.selectedCodec,
-            naluCallback_,
-            [this](const std::string& message) {
-                reportError(message);
-                requestEventLoopExit();
-            },
-            kMaxReceivedNaluBytes);
+        const auto trackIt = clientRef.state.selectedTracks.find(&subsession);
+        if (trackIt == clientRef.state.selectedTracks.end()) {
+            reportError("SETUP 完成后找不到对应媒体轨道");
+            requestEventLoopExit();
+            return;
+        }
+
+        const TrackInfo& track = trackIt->second;
+        const auto reportSinkError = [this](const std::string& message) {
+            reportError(message);
+            requestEventLoopExit();
+        };
+        // readSource() 已完成 RTP 解包/分片重组。视频 sink 追加 Annex-B start code；AAC
+        // sink 原样交付 AAC access unit。两者都只在 live555 事件线程同步调用上层。
+        if (track.kind == TrackKind::Video) {
+            subsession.sink = AnnexBSink::createNew(clientRef.envir(), track.videoCodec, naluCallback_,
+                                                     reportSinkError, kMaxReceivedNaluBytes);
+        } else {
+            subsession.sink = AacAudioSink::createNew(clientRef.envir(), track.audioFormat, audioCallback_,
+                                                       reportSinkError, kMaxReceivedAacAccessUnitBytes);
+        }
         if (subsession.sink == nullptr) {
-            reportError("创建 AnnexBSink 失败");
+            reportError(track.kind == TrackKind::Video ? "创建 AnnexBSink 失败" : "创建 AacAudioSink 失败");
             requestEventLoopExit();
             return;
         }
@@ -327,12 +376,24 @@ struct Live555RtspClient::Impl {
     {
         while ((clientRef.state.subsession = clientRef.state.iterator->next()) != nullptr) {
             MediaSubsession& subsession = *clientRef.state.subsession;
-            VideoCodec codec;
-            if (!codecFromSubsession(subsession, codec)) {
-                continue;
-            }
-            if (clientRef.state.hasSelectedVideo) {
-                // 一个 RtspStream 对应一路视频；多视频 track 应创建多个客户端实例。
+            TrackInfo track {};
+            VideoCodec videoCodec {};
+            AudioPcmFormat audioFormat {};
+            if (codecFromSubsession(subsession, videoCodec)) {
+                if (clientRef.state.hasSelectedVideo || !naluCallback_) {
+                    // 一个 RtspStream 对应一路视频；多视频 track 应创建多个客户端实例。
+                    continue;
+                }
+                track.kind = TrackKind::Video;
+                track.videoCodec = videoCodec;
+            } else if (audioCallback_ && aacFormatFromSubsession(subsession, audioFormat)) {
+                if (clientRef.state.hasSelectedAudio) {
+                    // 当前客户端只接一条 AAC 音轨；多语言/多音轨选择策略以后再单独增加。
+                    continue;
+                }
+                track.kind = TrackKind::AacAudio;
+                track.audioFormat = audioFormat;
+            } else {
                 continue;
             }
             // 按 SDP 在本地创建 RTP/RTCP 接收链路；UDP 模式下也会在此申请本地接收端口。
@@ -349,9 +410,13 @@ struct Live555RtspClient::Impl {
                 increaseReceiveBufferTo(clientRef.envir(), socket, kUdpRtpReceiveBufferBytes);
             }
 
-            clientRef.state.selectedCodec = codec;
-            clientRef.state.hasSelectedVideo = true;
-            codec_.store(codec);
+            clientRef.state.selectedTracks.emplace(&subsession, track);
+            if (track.kind == TrackKind::Video) {
+                clientRef.state.hasSelectedVideo = true;
+                codec_.store(track.videoCodec);
+            } else {
+                clientRef.state.hasSelectedAudio = true;
+            }
 
             // 请求服务端为该 track 建立传输会话：
             // UDP 时携带本地 RTP/RTCP 端口；TCP 时请求 RTP over RTSP interleaved。
@@ -359,8 +424,8 @@ struct Live555RtspClient::Impl {
             return;
         }
 
-        if (!clientRef.state.hasSelectedVideo) {
-            reportError("RTSP 流中没有 H264/H265 视频轨道");
+        if (!clientRef.state.hasSelectedVideo && !clientRef.state.hasSelectedAudio) {
+            reportError("RTSP 流中没有可用的 H264/H265 视频或 AAC 音频轨道");
             requestEventLoopExit();
             return;
         }
@@ -452,6 +517,7 @@ struct Live555RtspClient::Impl {
 
     std::string url_;
     AnnexBNaluCallback naluCallback_;
+    AudioAccessUnitCallback audioCallback_;
     StateCallback stateCallback_;
     bool requestRtpOverTcp_ = false;
     std::string lastError_;
@@ -470,12 +536,14 @@ Live555RtspClient::~Live555RtspClient()
 bool Live555RtspClient::start(const std::string& url,
                               AnnexBNaluCallback naluCallback,
                               bool requestRtpOverTcp,
-                              StateCallback stateCallback)
+                              StateCallback stateCallback,
+                              AudioAccessUnitCallback audioCallback)
 {
     return impl_->start(url,
                         std::move(naluCallback),
                         requestRtpOverTcp,
-                        std::move(stateCallback));
+                        std::move(stateCallback),
+                        std::move(audioCallback));
 }
 
 void Live555RtspClient::stop()

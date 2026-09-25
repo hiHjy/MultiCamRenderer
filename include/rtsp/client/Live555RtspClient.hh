@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "AudioTypes.h"
 #include "VideoCodec.hpp"
 
 // 单路 RTSP 拉流封装。它只完成 RTSP/RTP 和 NALU 重组，不做 access unit 组帧，
@@ -29,6 +30,10 @@ public:
                                                    uint8_t* data,
                                                    size_t size,
                                                    uint64_t timestampUs)>;
+
+    // AAC RTP 解包后的完整 access unit。packet.data 仅在回调期间有效；sourceFormat 和
+    // frameSamples 来自 SDP，供 AudioPlaybackPipeline/后续 RTP 转发建立准确时钟。
+    using AudioAccessUnitCallback = std::function<void(const AudioEncodedPacket& packet)>;
     using StateCallback = std::function<void(State state, const std::string& message)>;
 
     Live555RtspClient();
@@ -42,7 +47,8 @@ public:
     bool start(const std::string& url,
                AnnexBNaluCallback naluCallback,
                bool requestRtpOverTcp = false,
-               StateCallback stateCallback = {});
+               StateCallback stateCallback = {},
+               AudioAccessUnitCallback audioCallback = {});
     void stop();
 
     bool isRunning() const;

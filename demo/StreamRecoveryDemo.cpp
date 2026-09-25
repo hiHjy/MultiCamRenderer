@@ -31,7 +31,7 @@ public:
 
     void inject(VideoCodec codec, const std::vector<uint8_t>& annexB, uint64_t timestampUs)
     {
-        onPacket(codec, annexB.data(), annexB.size(), timestampUs);
+        onVideoPacket(codec, annexB.data(), annexB.size(), timestampUs);
     }
 };
 
@@ -74,7 +74,7 @@ int main()
         return 2;
     }
 
-    // 这里故意将三个 H264 NALU 合在一次 onPacket()，验证恢复等待期会拆完整 Annex-B
+    // 这里故意将三个 H264 NALU 合在一次 onVideoPacket()，验证恢复等待期会拆完整 Annex-B
     // access unit，而不是只检查第一个 SPS 后永久等待 PPS/IDR。
     const std::vector<uint8_t> combinedRecoveryAccessUnit {
         0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0xF4, 0x05, 0x01, 0xEC,

@@ -3,11 +3,51 @@
 #include "Log.hpp"
 #include "mpp_simple.h"
 
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <utility>
 
+#ifndef MCR_MPP_ENCODER_DEBUG_IDR
+#define MCR_MPP_ENCODER_DEBUG_IDR 0
+#endif
+
 namespace {
+
+#if MCR_MPP_ENCODER_DEBUG_IDR
+// MPP 输出为 Annex-B。只在调试编译中扫描整组 packet，避免生产编码回调增加任何工作。
+// H264 IDR 的 nal_unit_type 为 5；H265 的 IDR_W_RADL / IDR_N_LP 为 19 / 20。
+bool containsIdrNalu(MppCodec codec, const uint8_t* data, size_t size)
+{
+    if (data == nullptr || size < 5) {
+        return false;
+    }
+
+    for (size_t index = 0; index + 4 < size; ++index) {
+        size_t headerOffset = 0;
+        if (data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1) {
+            headerOffset = index + 3;
+        } else if (index + 4 < size && data[index] == 0 && data[index + 1] == 0
+                   && data[index + 2] == 0 && data[index + 3] == 1) {
+            headerOffset = index + 4;
+        } else {
+            continue;
+        }
+
+        if (headerOffset >= size) {
+            break;
+        }
+        if (codec == MppCodec::H264 && (data[headerOffset] & 0x1F) == 5) {
+            return true;
+        }
+        if (codec == MppCodec::H265 && ((data[headerOffset] >> 1) & 0x3F) >= 19
+            && ((data[headerOffset] >> 1) & 0x3F) <= 20) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 const char* bitratePresetName(MppBitratePreset preset)
 {
@@ -105,7 +145,6 @@ struct MppEncoder::Impl {
 
         rk_mpp_encoder_set_packet_callback(&encoder, &Impl::packetCallback, this);
         initialized = true;
-        headerWritten = false;
         lastError.clear();
         return true;
     }
@@ -119,22 +158,6 @@ struct MppEncoder::Impl {
         std::memset(&encoder, 0, sizeof(encoder));
         initialized = false;
         callbackOk = true;
-        headerWritten = false;
-    }
-
-    bool ensureHeaderWritten()
-    {
-        if (headerWritten)
-            return true;
-
-        callbackOk = true;
-        if (rk_mpp_encoder_write_header(&encoder) != 0) {
-            setError("rk_mpp_encoder_write_header 失败");
-            return false;
-        }
-
-        headerWritten = true;
-        return checkCallbackOk();
     }
 
     bool sendFrame(const VideoFrame& frame, bool eos)
@@ -144,8 +167,6 @@ struct MppEncoder::Impl {
             return false;
         }
         if (!validateFrame(frame))
-            return false;
-        if (!ensureHeaderWritten())
             return false;
 
         callbackOk = true;
@@ -276,6 +297,18 @@ private:
         packet.isKeyFrame = isIntra != 0;
         packet.eos = eos != 0;
 
+#if MCR_MPP_ENCODER_DEBUG_IDR
+        // 这组 packet 含参数集和 IDR 时才输出一行。直接写 stderr 并 flush，后台重定向
+        // 到日志文件时也能立即采样；这段代码在宏关闭时完全不参与生产路径。
+        if (containsIdrNalu(packet.codec, packet.data, packet.size)) {
+            std::fprintf(stderr,
+                         "[MppEncoder IDR debug] codec=%s bytes=%zu ptsUs=%llu mppIntra=%d\n",
+                         mppCodecName(packet.codec), packet.size,
+                         static_cast<unsigned long long>(packet.timestampUs), isIntra != 0 ? 1 : 0);
+            std::fflush(stderr);
+        }
+#endif
+
         if (!self->callback(packet)) {
             self->callbackOk = false;
             self->setError("MppEncoder packet callback 返回失败");
@@ -292,7 +325,6 @@ private:
     PacketCallback callback;
     bool initialized = false;
     bool callbackOk = true;
-    bool headerWritten = false;
     std::string lastError;
 };
 

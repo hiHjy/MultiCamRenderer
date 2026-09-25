@@ -22,10 +22,85 @@
 #define printf(...) do { if (0) fprintf(stdout, __VA_ARGS__); } while (0)
 #endif
 
+/*
+ * 构建期 RC 模式选择。独立编译默认 AVBR；CMake 为 IPC 显式传入 0 或 1，
+ * 因此仍可稳定切换回 CBR。
+ */
+#ifndef MCR_MPP_ENCODER_USE_AVBR
+#define MCR_MPP_ENCODER_USE_AVBR 1
+#endif
+
+/*
+ * 仅用于编码参数实验：从 MPP packet metadata 读取实际平均 QP 与瞬时 bps。
+ * 正常构建关闭；不能用配置中的 QP/bps 代替这两个实际运行值。
+ */
+#ifndef MCR_MPP_ENCODER_DEBUG_IDR
+#define MCR_MPP_ENCODER_DEBUG_IDR 0
+#endif
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
 #define RKMPP_ALIGN(value, align) (((value) + (align) - 1) & ~((align) - 1))
+
+/*
+ * 两组码控参数必须独立维护，不能为了试 AVBR 去改 CBR 基线。
+ * bitrate 的 min/target/max 由上层传入的 enc->bps 乘本组比例推导；QP 越大压缩越狠、画质越低。
+ */
+typedef struct RkMppRateControlPreset {
+    MppEncRcMode mode;
+    int bps_target_numerator;
+    int bps_target_denominator;
+    int bps_min_numerator;
+    int bps_min_denominator;
+    int bps_max_numerator;
+    int bps_max_denominator;
+    int qp_init;
+    int qp_min;
+    int qp_max;
+    int qp_min_i;
+    int qp_max_i;
+    int qp_ip;
+} RkMppRateControlPreset;
+
+#if MCR_MPP_ENCODER_USE_AVBR
+/*
+ * AVBR 当前基线：静态可显著降低码率，动态允许最高 target 的 156%。
+ * QP 范围先与 CBR 保持一致；实测 QP=35 没有命中，故不作为默认限制。
+ */
+static const RkMppRateControlPreset kRkMppRateControlPreset = {
+    .mode = MPP_ENC_RC_MODE_AVBR,
+    .bps_target_numerator = 1,
+    .bps_target_denominator = 1,
+    .bps_min_numerator = 1,
+    .bps_min_denominator = 5,
+    .bps_max_numerator = 39,
+    .bps_max_denominator = 25,
+    .qp_init = -1,
+    .qp_min = 10,
+    .qp_max = 48,
+    .qp_min_i = 10,
+    .qp_max_i = 48,
+    .qp_ip = 2,
+};
+#else
+/* 正式 CBR 基线：围绕 target 的约 ±6.25% 波动。 */
+static const RkMppRateControlPreset kRkMppRateControlPreset = {
+    .mode = MPP_ENC_RC_MODE_CBR,
+    .bps_target_numerator = 1,
+    .bps_target_denominator = 1,
+    .bps_min_numerator = 15,
+    .bps_min_denominator = 16,
+    .bps_max_numerator = 17,
+    .bps_max_denominator = 16,
+    .qp_init = -1,
+    .qp_min = 10,
+    .qp_max = 48,
+    .qp_min_i = 10,
+    .qp_max_i = 48,
+    .qp_ip = 2,
+};
+#endif
 
 /*
  * 这是一个“尽量容易看懂”的单线程 MPP 解码示例。
@@ -763,6 +838,10 @@ static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
     RK_S64 pts_us = 0;
     int eos = 0;
     int is_intra = 0;
+#if MCR_MPP_ENCODER_DEBUG_IDR
+    RK_S32 average_qp = -1;
+    RK_S32 bps_rt = -1;
+#endif
 
     if (!enc || !packet)
         return -1;
@@ -774,7 +853,21 @@ static int rk_mpp_encoder_emit_packet(RkMppEncoder *enc,
     if (mpp_packet_has_meta(packet)) {
         MppMeta meta = mpp_packet_get_meta(packet);
         (void)mpp_meta_get_s32(meta, KEY_OUTPUT_INTRA, &is_intra);
+#if MCR_MPP_ENCODER_DEBUG_IDR
+        (void)mpp_meta_get_s32(meta, KEY_ENC_AVERAGE_QP, &average_qp);
+        (void)mpp_meta_get_s32(meta, KEY_ENC_BPS_RT, &bps_rt);
+#endif
     }
+
+#if MCR_MPP_ENCODER_DEBUG_IDR
+    // 只记录完整 intra packet；参数集独立输出时不混入这条统计。
+    if (!is_header && is_intra) {
+        fprintf(stderr,
+                "[RKMPP Encoder RC debug] codec=%d bytes=%zu ptsUs=%lld avgQp=%d bpsRt=%d\n",
+                enc->type, size, (long long)pts_us, average_qp, bps_rt);
+        fflush(stderr);
+    }
+#endif
 
     if (size > 0 && enc->f_out)
         fwrite(data, 1, size, enc->f_out);
@@ -834,6 +927,7 @@ static int rk_mpp_encoder_prepare(RkMppEncoder *enc)
 {
     MPP_RET ret = MPP_OK;
     MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+    int target_bps;
 
     ret = mpp_create(&enc->ctx, &enc->mpi);
     if (ret) {
@@ -865,23 +959,29 @@ static int rk_mpp_encoder_prepare(RkMppEncoder *enc)
     mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:ver_stride", enc->v_stride);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "prep:format", enc->fmt);
 
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:mode", kRkMppRateControlPreset.mode);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_num", enc->fps);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_in_denorm", 1);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_flex", 0);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_num", enc->fps);
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:fps_out_denorm", 1);
+    target_bps = enc->bps * kRkMppRateControlPreset.bps_target_numerator
+                 / kRkMppRateControlPreset.bps_target_denominator;
     mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:gop", enc->gop);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_target", enc->bps);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_max", enc->bps * 17 / 16);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_min", enc->bps * 15 / 16);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_init", -1);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max", 48);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min", 10);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max_i", 48);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min_i", 10);
-    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_ip", 2);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_target", target_bps);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_max",
+                          target_bps * kRkMppRateControlPreset.bps_max_numerator
+                          / kRkMppRateControlPreset.bps_max_denominator);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:bps_min",
+                          target_bps * kRkMppRateControlPreset.bps_min_numerator
+                          / kRkMppRateControlPreset.bps_min_denominator);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_init", kRkMppRateControlPreset.qp_init);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max", kRkMppRateControlPreset.qp_max);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min", kRkMppRateControlPreset.qp_min);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_max_i", kRkMppRateControlPreset.qp_max_i);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_min_i", kRkMppRateControlPreset.qp_min_i);
+    mpp_enc_cfg_set_s32(enc->enc_cfg, "rc:qp_ip", kRkMppRateControlPreset.qp_ip);
 
     mpp_enc_cfg_set_s32(enc->enc_cfg, "codec:type", enc->type);
     if (enc->type == MPP_VIDEO_CodingAVC) {
@@ -1020,7 +1120,7 @@ int rk_mpp_encoder_request_idr(RkMppEncoder *enc)
         printf("MPP_ENC_SET_IDR_FRAME failed ret=%d\n", ret);
         return -1;
     }
-
+	fprintf(stdout, "<mpp_simple.c> (rk_mpp_encoder_request_idr) 请求IDR成功\n");
     return 0;
 }
 

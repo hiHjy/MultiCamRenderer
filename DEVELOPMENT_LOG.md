@@ -3377,3 +3377,993 @@ git diff --check
 ```
 
 RV1126B `ipc_app` 与 RK3568 非 Qt 目标均交叉构建通过。
+
+## 2026-09-19
+
+### 音频模块已知问题汇总
+
+音频模块（`src/core/audio/` 与 `demo/audio_*`）在 `feature/audio-core` 上完成了 WebRTC APM 2.1
+（AGC2）接入和两块板子的实机调音，可用的配置结论已经写在 `docs/audio_astats_and_apm_notes.md`。
+这里只集中记录**目前仍未解决**的问题，避免后面重复排查。
+
+> 这几个问题同时收口在项目根目录的 `KNOWN_ISSUES.md`，并会随修复情况更新；本节是当天排查过程的
+> 快照，两者不一致时以 `KNOWN_ISSUES.md` 为准。
+
+#### 1. RV1126B 播放通路只支持双声道（驱动层限制，应用层不迁就）
+
+现象：RV1126B 上任何**单声道**播放都是静音，双声道正常。板端实测：
+
+```text
+aplay -D plughw:0,0 -v generated.wav                  -> channels : 1    静音
+aplay -D plughw:0,0 -v generated-long-48k-stereo.wav  -> channels : 2    有声
+speaker-test -D plughw:0,0 -c 1 -t sine -f 1000 -l 1  -> 静音
+speaker-test -D plughw:0,0 -c 2 -t sine -f 1000 -l 1  -> 有声
+```
+
+同一个 `generated.wav` 在 RK3568 上播放正常，所以不是文件本身或 ALSA 工具的问题。
+
+根因定位到 SDK 驱动（`sysdrv/source/kernel/sound/soc/`）：
+
+| 文件 | 角色 | 声道声明 |
+| --- | --- | --- |
+| `codecs/rk3506_codec.c` | 麦克风 ADC（`audio_codec` / `audio_codec_pmu`） | **只有 `.capture` 1~2ch，没有 `.playback`** |
+| `codecs/rk_dsm.c` | 喇叭功放（`acdcdig_dsm`） | `.playback` **2~2** |
+| `rockchip/rockchip_sai.c` | CPU DAI（`sai2`，TDM 控制器） | `.playback` 1~512 |
+
+这条 `multicodecs` 链路上唯一能出声的 DAI 是 DSM 功放，而它物理上就是双声道时隙。
+
+但 **DSM 的 2 声道约束没有传到 ALSA 层**。板端 `hw:0,0` 报的是：
+
+```text
+CHANNELS: [1 512]
+```
+
+512 来自 `rockchip_sai.c:1407`（SAI 的 TDM 能力），ASoC 没能把它和 DSM 的 2~2 求成交集。
+后果是 ALSA 的 plug 层认为单声道属于「设备原生支持」，**不做 upmix**，单声道样本被原样送进驱动。
+而 `rk_dsm_hw_params()` 从头到尾没有读过 `params_channels()`，它只按采样率配时钟、按格式配位宽，
+I2S 接收固定按双时隙配置 —— 单声道数据进了双时隙帧，结果是静音。
+
+**结论与决定：** 这是驱动/机器驱动的缺陷，不是应用该绕的坑。**不在 `AudioPlayback` 里加
+「一律请求双声道」这类迁就逻辑**，`audio_playback_config_init()` 保持 1 声道默认值，
+`audio_playback_open_auto()` 依旧按调用方请求的声道数协商。后续要么等 Rockchip 修（让 DSM 的
+声道约束正确暴露，或在 `rk_dsm_hw_params()` 里按 `params_channels()` 配置），要么在板级 ALSA
+配置（`asound.conf` 的 plug 层）里显式约束，而不是改应用。
+
+> 曾经在 `AudioPlayback.c` 里试过「优先请求双声道」，已回退。
+
+#### 2. RK3568 播放 XRUN 风暴（未定位）
+
+`audio_opus_playback_demo` 在 RK3568 上播放 4.94 秒的 Opus 文件：
+
+```text
+247 个包 / 246 次 XRUN / 829ms 跑完        （正常应约 4940ms）
+```
+
+XRUN 是 ALSA 的缓冲区跑穿。播放方向是 underrun：DMA 把缓冲里的数据读完了，应用还没送来新的；
+采集方向是 overrun：应用取得太慢，新数据覆盖旧数据。两个方向都返回 `-EPIPE`（`-32`）。
+
+写入循环里的调试输出呈**严格奇偶交替**：
+
+```text
+write#0 ret=960  state=RUNNING
+write#1 ret=-32  state=XRUN
+write#2 ret=960  state=RUNNING
+write#3 ret=-32  state=XRUN
+```
+
+之所以是「跑完」而不是「卡住」，是因为现有代码在 `-EPIPE` 分支里调 `snd_pcm_prepare()` 把缓冲区
+整个清空后立刻重试，缓冲永远填不满，`snd_pcm_writei` 也就永远不阻塞。
+
+已排除的因素：同一块板、同一组 ALSA 参数（period 960 / buffer 3840）下，最小测试程序 `alsapb`
+走 `plughw:1,0` 是 **0 XRUN / 5000.2ms**，走 `default` 是 2 XRUN / 4970ms。设备和参数都没问题，
+问题出在 demo 的播放路径里，但具体是哪一处还没查到就暂停了。
+
+**待办：** 用同一份 Opus 文件跑 `alsapb` 复现，再逐步收敛到 `AudioPlayback` / `AudioDecoder`
+的具体分支。
+
+#### 3. RV1126B 的 codec 控件会被关流和上电流程重置
+
+每次采集/播放结束后，ACodec 的数字增益和开关会被复位，实测掉 **17dB**：
+
+```text
+Digital Gain       -> 0     (-95dB)
+PGA Gain           -> 16    （原本 31）
+ADC Switch         -> off
+DAC Digital Volume -> 0     （静音）
+```
+
+板端脚本（`/root/audio-test/apm-listen.sh`）每轮开录前都重设一遍。这不是麦克风或硬件问题，
+早期「麦克风偏置没打开」的结论已经被推翻。
+
+#### 4. 底噪问题不能靠调增益解决
+
+板端实测：`fixedDigitalGainDb = 30` 时各项指标都变好（峰值 -6.3 dBFS、零削顶），但再往上到 40
+就过载削顶。关键在于**补电平的同时底噪同步放大**，听感是「响但糊」。
+
+最终采用**不加增益 + 降噪 High + 高通**，听感明显优于原始采集。详见
+`docs/audio_astats_and_apm_notes.md`。
+
+#### 5. `Power Amplifier` 控件会让 amixer / alsactl 直接 abort
+
+DSM 的 `Power Amplifier` 是 `SOC_ENUM_EXT`，读 TLV 时返回 `EINVAL`，`amixer` 和 `alsactl` 会直接
+中止。为此单独写了 `ctldump`（只做 `SNDRV_CTL_IOCTL_ELEM_*` 的裸调用）供板端列控件和读写。
+另外这个开关是 DAPM 托管的，写进去会立刻被拉回 `off`，只在播放期间为 `on`。
+
+#### 附：一个还没解释的现象
+
+`speaker-test` 打印的 `Time per period` 和理论周期时长对不上：单声道 period 4096 帧在 48kHz 下
+应该是 85.3ms，实测报 **1.408s**；双声道 period 2048 帧应该是 42.7ms，实测报 **5.888s**。两个数都
+远大于理论值，但双声道确实听得到正常声音。这可能是 `speaker-test` 自身的计时口径问题，也可能是
+驱动侧时钟或周期上报有偏差，**尚未查证**，先记在这里。
+
+### 本次验证
+
+试改「优先请求双声道」时交叉构建通过；按要求回退后重新构建，仍然通过：
+
+```bash
+git checkout -- src/core/audio/AudioPlayback.c          # 回退迁就逻辑
+cmake --build build/rv1126b-aarch64 \
+      --target audio_opus_playback_demo audio_capture_apm_pcm_demo
+```
+
+`git status` 现在只剩 `include/core/audio/AudioCapture.h`（注释补充）和未跟踪的
+`docs/audio_astats_and_apm_notes.md`。
+
+### RV1126B 单声道播放无声：定位与 ALSA 规避（2026-09-19）
+
+这一问题的现象很明确：RV1126B 可以正常采集 48 kHz 单声道 PCM，录出的
+`test_c1.wav` 在 Windows 上播放也有声音；但板端直接播放同一份单声道 WAV 没有声音。把内容转成
+双声道后，板端立即可以正常播放。因此问题不在 Opus、APM、录音数据或应用层 PCM 队列，而在板端的
+ALSA 硬件播放通道约束。
+
+复现命令：
+
+```bash
+arecord -D default -f S16_LE -c 1 -r 48000 -d 5 -t wav test_c1.wav
+aplay test_c1.wav                     # 原始系统：无声
+```
+
+#### 1. 驱动侧事实
+
+SDK 中实际有相关源码；不是没有 RV1126B 音频驱动源码：
+
+```text
+sysdrv/source/kernel/sound/soc/codecs/rk_dsm.c
+sysdrv/source/kernel/sound/soc/codecs/rk3506_codec.c
+sysdrv/source/kernel/sound/soc/rockchip/rockchip_sai.c
+sysdrv/source/kernel/sound/soc/rockchip/rockchip_multicodecs.c
+```
+
+板端声卡是 `rockchiprv1126b`，machine driver 是 `rk-multicodecs`。DSM codec 的 playback
+DAI 明确声明为 `channels_min = 2`、`channels_max = 2`，即模拟输出硬件本质上是双声道；但
+machine driver / SAI 的运行时能力把通道范围暴露得过宽，原生单声道可以一路走到硬件路径，结果没有
+正确复制到左右声道，表现为静音。采集通道正常，不代表播放单声道也正确。
+
+`rk_dsm_hw_params()` 只配置采样率、采样格式和固定双 slot，并未按 `params_channels()` 建立正确的
+播放通道约束；`rk-multicodecs` 也没有补这一约束。这是 BSP 驱动能力描述与实际硬件能力不一致的问题。
+
+可选的内核长期修复是只对 playback 的 `.startup` 增加 ALSA channels min/max = 2 约束，让原生
+`hw:0,0` 直接拒绝 mono；但该修复本身不会把 mono 自动扩成 stereo，仍需要 ALSA plug 或应用做路由。
+它需要重编内核和刷固件，当前不作为恢复声音的前提。
+
+#### 2. 最终采用：板级 ALSA plug 自动 mono -> stereo
+
+不修改通用 `AudioPlayback`，也不要求所有调用者伪造双声道。应用仍可以按真实音频内容请求 mono；板级
+`default` PCM 使用 ALSA `plug` 在输出端把 mono 复制到左右两个硬件通道，stereo 则保持双声道原样输出。
+
+配置已放入 RV1126B SDK：
+
+```text
+/home/hjy/2026-07-18/rv1126b_linux_ipc_xiaoyu/project/app/etc/asound.conf
+```
+
+内容如下：
+
+```conf
+pcm.!default {
+    type plug
+    slave {
+        pcm "hw:0,0"
+        channels 2
+    }
+    route_policy duplicate
+}
+```
+
+选择 `/etc/asound.conf`，而不是改 `/usr/share/alsa/alsa.conf`：主 ALSA 配置会自动 include
+`/etc/asound.conf`，SDK 的 `project/app/etc/` 又会随 rootfs 打包到目标机 `/etc/`。当前运行板也已安装
+同一份配置；后续构建整体固件时会自然带上，无需再手工处理。
+
+#### 3. 验证结果
+
+在带该配置的环境下执行 `aplay -v test_c1.wav`，ALSA 明确打印路由表：
+
+```text
+Transformation table:
+0 <- 0
+1 <- 0
+```
+
+即单声道输入的第 0 路被复制到硬件左、右声道；实听恢复正常。双声道素材走 2ch 硬件路径也已验证有声。
+这证明它是可撤销、低风险的板级兼容层处理，不是把问题掩盖在 Opus 或应用代码中。
+
+#### 4. 与 APM 调试的边界
+
+此前两天还同时进行了 APM 2.1（AGC2）与底噪调试。当前策略是不启用自适应数字增益，保留高等级降噪和
+高通；原因是低信噪比下单纯拉高增益会同时放大底噪，不能解决听感问题。该工作与本节的 mono 无声是两个
+独立问题：前者影响录音响度和噪声，后者是播放端通道路由错误。详细参数与 astats 数据见
+`docs/audio_astats_and_apm_notes.md`。
+
+#### 5. 后续事项
+
+- `KNOWN_ISSUES.md` 的 RV1126B 单声道 playback 条目仍保留为 BSP 驱动缺陷；状态应理解为“驱动未修、
+  板级 ALSA 配置已完成可靠规避”。
+- 若后续维护 BSP 内核，可给 `rk-multicodecs` playback 加双声道硬约束，避免原生 `hw:0,0` 被错误地当成
+  支持单声道；届时仍保留 `default` plug，保证通用应用的 mono 兼容性。
+- codec 控件在设备 power transition 后会重置（数字增益、PGA、ADC/DAC 开关），这与本问题独立，采集测试
+  脚本仍需在每轮开始前重设必要控件。
+
+### 音频核心链路、AEC3 与 PlaybackManager 落地（2026-09-19）
+
+本次把之前归档中的 ALSA/Opus 原型收敛为项目内的 `core/audio` 基座。原则是：C 层保留可独立板测的
+设备与编解码能力；以后 RTSP、WebRTC 与 App 只通过薄 C++ 封装使用，不把 ALSA 或 WebRTC C++ 类型泄露到
+业务层。
+
+#### 1. 上下行职责收敛
+
+上行管理器原名 `AudioInputManager`，已更名为 `AudioCaptureManager`，避免 input 语义不清。它的常态数据流为：
+
+```text
+AudioCapture (ALSA, 48kHz/mono/S16_LE, 10ms)
+    -> [可选] AudioApm
+    -> AudioEncoder（当前 Opus，后续可扩展 G.711/AAC）
+    -> AudioEncodedPacket callback
+```
+
+下行新增 `AudioPlaybackManager`，它是业务/网络层唯一入口；`AudioPlayback` 仍只是同步写 ALSA 的底层工具，
+不对外承担线程或队列职责：
+
+```text
+有序编码音频包
+    -> AudioPlaybackManager::enqueue_packet()
+    -> 有界编码包队列
+    -> 唯一播放线程
+    -> AudioDecoder（当前 Opus）
+    -> 10ms PCM reference + AudioPlayback/ALSA
+```
+
+`AudioPlaybackManager` 不处理 RTP 乱序、PLC 或 jitter buffer；这些属于将来的 RTSP/WebRTC 通话接收层。
+它默认只留 8 个 20ms Opus 包，满时淘汰最旧包以控制实时延迟。
+
+#### 2. ALSA 启动 XRUN 与解决
+
+首次板测使用 10ms period、40ms ALSA 环形缓冲时出现连续 XRUN。原因不是 Opus 解码丢包：声卡在收到第一段
+10ms PCM 后立即按硬件时钟消耗样本；如果后续 `snd_pcm_writei()` 稍晚，缓冲见底即发生 underrun (`-EPIPE`)。
+声卡不会等待下一包，因为等待会停止硬件播放时钟。
+
+最终 PlaybackManager 采用两层本地保护：
+
+```text
+ALSA hardware buffer: 8 x 10ms = 80ms
+首次出声前预填：  3 x 20ms Opus = 约 60ms
+```
+
+这只是声卡启动与调度余量，不是网络 jitter buffer，也不做网络包重排。RV1126B 实测同一份 5.88 秒录音：
+
+```text
+入队 294 包 / 解码 294 包 / 播放 282240 PCM frames
+队列淘汰 0 / ALSA 写失败 0 / XRUN 0
+```
+
+新增 `demo/AudioPlaybackManagerDemo.c`，会按 packet 文件中的相对 PTS 节奏入队，能测试真实的播放线程与
+短队列；旧 `audio_opus_playback_demo` 保留为直接解码播放诊断工具。
+
+#### 3. WebRTC APM 与 AEC3 的运行期边界
+
+`AudioApm` 保持 C ABI，但内部使用 webrtc-audio-processing 2.1。总开关为：
+
+```c
+AudioApmConfig::enableAudioProcessing
+```
+
+默认值改为 **0**。监控 RTSP 音频的目标是保留环境声，默认不应使用语音降噪、高通或增益：
+
+```text
+RTSP 监控默认：采集 -> 原始 PCM -> Opus -> RTSP
+```
+
+通话开始时调用：
+
+```c
+audio_capture_manager_request_echo_cancellation(&captureManager, 1);
+```
+
+采集线程会在下一个 10ms 安全边界重建为 `AEC3 + 高通 + 降噪`；播放线程不直接操作 APM，而是把即将写 ALSA
+的每个 10ms PCM 复制给 `AudioCaptureManager` 的 reference queue。通话结束传 `0`，恢复为原始 PCM 直通。
+真正通话接入前仍需依据播放链路实测填写 `aecStreamDelayMs`；当前 `0` 仅表示尚未标定，不代表真实声学延迟。
+
+当 APM 关闭时，采集线程不创建 `webrtc::AudioProcessing`，也不调用 bypass 处理；PCM 直接进入预热/编码路径。
+当 APM/AEC 开启时，预热期的 PCM 虽然不编码输出，仍要送入 APM，以便降噪和回声消除器完成内部状态收敛。
+
+#### 4. 采集启动预热
+
+`AudioCaptureManagerConfig::warmupDiscardDurationMs` 默认 500ms。每次采集启动，或 APM/AEC 模式重建后：
+
+```text
+前 500ms：不送编码器、不推网络
+APM 关闭：直接丢原始 PCM
+APM 开启：送 APM 内部收敛，但丢其输出
+500ms 后：开始正常编码
+```
+
+这样可以屏蔽 ALSA/模拟麦克风启动瞬态与 APM 冷启动音色跳变，而不会把首批突兀音频推上 RTSP。RV1126B 2 秒
+短录实测仅输出 69 个 20ms Opus 包，符合约 0.5 秒预热后再开始输出的预期。
+
+#### 5. A/B 听感与验证工具
+
+新增 `demo/AudioApmAbTest.sh`。它使用 `AudioCaptureApmPcmDemo` 在**同一次**采集中分别保存原始 PCM 与 APM
+处理后 PCM，再按“原始 -> APM”顺序 `aplay`。刻意不经过 Opus，避免编码器成为 A/B 比较变量：
+
+```bash
+sh demo/AudioApmAbTest.sh 12
+```
+
+APM/AEC 专用 demo（`audio_capture_apm_pcm_demo`、`audio_apm_gain_demo`、`audio_apm_aec_smoke_demo`）均显式打开
+`enableAudioProcessing`，不会因产品默认关闭 APM 而退化为原始 PCM。
+
+#### 6. 本次构建与板测
+
+- `./wsl-build.sh`：通过。
+- `./wsl-build-rv1126b.sh`：通过。
+- RV1126B `audio_apm_aec_smoke_demo`：AEC3 reverse/capture 连续 200 个 10ms block 成功。
+- `git diff --check`：通过。
+
+构建仍会显示 webrtc-audio-processing 上游头文件中的 unused-parameter warning；它来自第三方头文件，不影响本次
+目标代码构建，暂不在项目内 patch 上游库。
+
+#### 7. 后续计划
+
+1. 先逐段 review 当前 C 音频全链路；
+2. 在 C core 之上做薄 C++ RAII 封装（无异常，显式错误与 callback），让 RTSP/App 不直接调用 C 函数；
+3. 再接 RTSP 音频收发；jitter buffer、RTP 时序、PLC 留在协议/通话层实现；
+4. 最后用真实扬声器/麦克风链路标定 AEC stream delay 与听感。
+
+### C++ AudioPipeline / PlaybackPipeline 重构与实时内存打磨（2026-09-21）
+
+本次不接 RTSP、不接 WebRTC 协议层，先把项目内音频的“媒体图”收敛成能独立复用、可板测的
+C++ 基座。此前的 `AudioCaptureManager` / `AudioPlaybackManager` C 实现可以完成板测，但把采集、
+APM、Opus、队列、播放/AEC reference 固定串成一条链，不能表达未来实际需要的多支路：例如监控
+RTSP 需要原始 PCM，通话支路需要 AEC/降噪后的 PCM；二者不应因为通话建立而互相重启或中断。
+
+重构完成后核查确认：旧 C manager 已没有 App、RTSP 或 IPC 调用点，只剩各自的旧 demo。因此本次直接删除
+`AudioCaptureManager` / `AudioPlaybackManager` 及其 demo，而不是让两套音频架构长期并存。保留的 C 层只有
+可独立复用的同步媒体工具，所有新的业务链路只从 C++ pipeline 进入。
+
+#### 1. 分层原则与新上行图
+
+底层 C 文件只保留同步、单职责媒体工具：
+
+```text
+AudioCapture      : ALSA -> PCM callback
+AudioApm          : PCM -> PCM
+AudioEncoder      : PCM -> EncodedAudioPacket
+AudioDecoder      : EncodedAudioPacket -> PCM
+AudioPlayback     : PCM -> ALSA
+```
+
+它们不理解 RTSP、WebRTC、Hub 或业务线程。`AudioPipeline` 是 App 显式拥有的 C++ 上行入口，
+不是全局单例：App 在生命周期内 `startCapture()` / `stopCapture()`，未来 RTSP、录音或通话模块按需
+保存订阅句柄。
+
+```text
+C AudioCapture（唯一采集线程，干净 PCM）
+    -> rawPcmHub
+       ├-> raw PCM subscriber
+       ├-> EncoderNode(raw) -> EncodedPacketHub -> RTSP/录制等 subscriber
+       └-> ApmNode -> processedPcmHub
+                       -> EncoderNode(APM) -> EncodedPacketHub -> 通话上行 subscriber
+```
+
+`AudioFrame` / `EncodedAudioPacket` 在 C 回调边界复制数据并拥有其生命周期；Hub 只分发
+`shared_ptr<const ...>`，不做编码、网络 I/O、磁盘 I/O 或阻塞等待。每个 APM / Encoder Node 有自己的
+worker 和 5 帧（默认约 50ms）有界输入队列；满时淘汰旧帧，EncoderNode 发现时间戳缺口后重建编码器，
+确保不会把缺口两端的 PCM 拼成同一个 20ms Opus 包。
+
+APM 是一条可选支路，而非采集设备的全局状态。因此未来创建/结束通话只会增加/撤销 APM 支路；raw
+RTSP 支路持续运行，不会出现“通话一来监控音频断一下”的耦合问题。
+
+#### 2. Hub 发布路径：订阅变更写时复制
+
+初版 `AudioHub::publish()` 为了避免持锁调用外部 callback，每个 10ms PCM 都临时构造
+`std::vector<Callback>` 快照。这一语义正确，但只要有订阅者就会在发布热路径分配/释放 callback 数组。
+
+现改为写时复制快照：
+
+```text
+subscribe/reset
+    -> 持 State::mutex 改订阅表
+    -> 重建 immutable CallbackSnapshot
+
+publish（每 10ms）
+    -> 持 mutex 复制 shared_ptr<const CallbackSnapshot>
+    -> 解锁
+    -> 遍历不可变快照调用 callback
+```
+
+因此 callback 的 `std::function` 拷贝和 vector 分配只发生在订阅变化时；发布路径保留原有并发语义：
+取消订阅和 publish 并发时，已经取到快照的当前一轮 callback 允许执行一次，Node 自己通过运行状态拒绝
+停止后的入队。这既不会自锁，也不会让热路径逐帧 malloc。
+
+#### 3. AudioFrame / EncodedAudioPacket payload pool
+
+48kHz 单声道 S16 的 10ms PCM 是 960 bytes。初版每帧存在两层频繁申请：`make_shared<AudioFrame>`
+的对象/控制块，以及 `samples.resize()` 的 payload vector；APM 输出和 Opus packet 也有同类行为。
+
+新增：
+
+```text
+AudioFramePool
+EncodedAudioPacketPool
+```
+
+每个 pool 默认预分配 32 个对象和 payload buffer，并实际用于：
+
+```text
+raw capture PCM              -> raw AudioFramePool
+每个 ApmNode 输出 PCM         -> 该 Node 的 AudioFramePool
+每个 EncoderNode 输出编码包    -> 该 Node 的 EncodedAudioPacketPool
+```
+
+池满不等待下游归还：立即丢当前实时帧/包，累计计数并在第 1 次及此后每 100 次输出 WARN。这样下游持帧
+过久不会反压 ALSA 采集或解码/编码 worker。PCM 丢失会自然形成 EncoderNode 的时间戳缺口，沿用既有的
+安全重建策略。
+
+需要明确的边界：pool 已消除 `AudioFrame` / `EncodedAudioPacket` 对象和 payload vector 的高频申请；
+由于公开数据流仍使用标准 `shared_ptr`，每次借出时仍有一个标准库 control block。要把它也归零必须把
+所有 Hub API 改成自定义 intrusive lease，复杂度和生命周期风险明显增加，当前不做。后续只有在长时间
+profiling 证明它是热点时再评估。
+
+新增 `audio_frame_pool_demo`，不依赖声卡，验证 PCM / packet pool 的三条不变式：对象借出时不重复使用、
+池满返回空且不阻塞、最后一个 `shared_ptr` 释放后归还并复用同一 payload 地址。
+
+#### 4. C++ 唯一扬声器消费者
+
+新增 `AudioPlaybackPipeline`。它代表 App 内唯一的物理扬声器消费者；一个运行实例只接受一种输入模式，
+不能把两条没有统一时钟的 PCM 和压缩包流直接混到同一个设备：
+
+```cpp
+bool start(const AudioPlaybackPipelineConfig&);
+void stop();
+bool push(AudioFramePtr pcm);
+bool push(EncodedAudioPacketPtr packet);
+```
+
+```text
+push(PCM)     -> 固定容量播放队列 -> playback worker -> AudioPlayback -> ALSA
+push(packet)  -> 固定容量播放队列 -> playback worker -> AudioDecoder -> AudioPlayback -> ALSA
+```
+
+`push()` 只移动 `shared_ptr` 到预分配 ring queue 并唤醒 worker；不会在网络/调用线程执行 Opus 解码或
+`snd_pcm_writei()`。播放队列默认最多 100ms，既按总时长限制也按 16 项硬上限限制；满时淘汰最旧项。
+它不是 jitter buffer，不处理 RTP 乱序、丢包补偿或混音；这些以后属于 RTSP/WebRTC 通话层。
+
+压缩包路径按 `EncodedAudioPacket::codec` 创建/切换 `AudioDecoder`。decoder 使用 packet 的
+`sourceFormat` 解码，随后由 `AudioPlayback` 处理 mono/stereo 设备转换；不能假设 ALSA 实际通道数就是
+Opus 源通道数。
+
+未来 AEC 的 reference 应由 playback worker 在“真正写 ALSA 前”将同一份 decoded PCM 投递到通话支路
+的 reference queue。此次先不接这一回调，避免在 capture C++ 图尚未接入通话协议前重新产生 manager
+之间的反向耦合。
+
+#### 5. ALSA 起播阈值与 XRUN 排查
+
+新 PCM 直放 demo 首测出现连续 XRUN。根因不是 queue 或解码失败：ALSA 默认可能在第一段 10ms PCM 写入
+后就开始消耗，软件侧即使已积累 60ms 也尚未写进硬件 buffer；普通 Linux 调度稍晚一个 period 即触发
+underrun。
+
+`AudioPlayback` 增加 `requestedStartThresholdFrames`：默认自动使用 `bufferFrames - periodFrames`，并设置
+`avail_min = periodFrames`。对 RV1126B 的 48kHz / 10ms period 配置，实际为：
+
+```text
+hardware buffer = 3840 frames = 80ms
+ALSA start threshold = 3360 frames = 70ms
+AudioPlaybackPipeline startup prebuffer = 80ms
+```
+
+worker 开始后先快速把预填充写入 ALSA，再由硬件起播；声卡和软件队列都有明确调度余量。首次仍出现一次
+XRUN 的原因是 PCM demo 使用连续 `sleep_for(10ms)`，每轮普通线程唤醒误差会累计，3 秒后供给慢于硬件。
+demo 已改为 `sleep_until()` 按绝对媒体时间追赶，复测 XRUN 为 0。实际 capture 以 ALSA frame 时钟产出，
+不应使用累积 sleep 的方式模拟。
+
+#### 6. 本次 demo 与 RV1126B 验证
+
+新增：
+
+```text
+audio_pipeline_demo
+    raw PCM -> raw Opus，另挂 APM -> Opus；中途取消 APM 支路
+
+audio_pipeline_stress_demo
+    连续创建/销毁 APM -> Opus 支路，同时 raw -> Opus 常驻
+
+audio_frame_pool_demo
+    不依赖声卡的 PCM/packet pool 容量与复用验证
+
+audio_playback_pipeline_pcm_demo [seconds]
+    440Hz PCM 音调 -> C++ playback pipeline -> ALSA
+
+audio_playback_pipeline_opus_demo [file]
+    .mcropus -> C++ playback pipeline -> Opus decoder -> ALSA
+```
+
+RV1126B（`root@192.168.1.4`）实测：
+
+```text
+audio_frame_pool_demo
+    PASS：PCM/packet 均完成满池丢弃与 payload 地址复用验证
+
+audio_pipeline_demo 8
+    raw PCM = 100 frame/s，raw Opus = 50 packet/s；4 秒取消 APM 支路后，
+    raw Opus 仍从 199 连续增长到 400，APM 停在 174，PASS
+
+audio_pipeline_stress_demo 4
+    4 轮 APM -> Opus 创建/销毁全部 PASS；raw Opus 连续增长到 342
+
+audio_playback_pipeline_pcm_demo 3
+    accepted=300，dropped=0，playedFrames=144000，playbackFailures=0，XRUN=0
+
+板端新录 pipeline-test.mcropus 后 audio_playback_pipeline_opus_demo
+    inputPackets=174，accepted=174，dropped=0，decoded=174，playedFrames=167040，
+    decodeFailures=0，PASS
+```
+
+`./wsl-build.sh` 与 `./wsl-build-rv1126b.sh` 均通过，`git diff --check` 通过。
+
+#### 7. 后续优化与接入顺序
+
+1. 先以 `AudioPipeline` 接 RTSP 音频的 raw -> Opus subscription；不要让 RTSP 直接操作 ALSA/APM。
+2. WebRTC / 对讲接入时，在独立通话支路订阅 APM -> Opus，并把下行 decoded PCM 作为 AEC reference
+   投递；jitter buffer、PLC、RTP 时钟都放在协议层。
+3. `AudioDecoderOps` 未来增加通用 `reset()`。同一 PCM 格式发生时间戳缺口时，Opus 实现可清空项目自己的
+   partial PCM cache 并调用 `OPUS_RESET_STATE`；格式变化仍需 close/init。当前 close/init 逻辑正确且只在
+   丢帧时发生，不是性能热点。
+4. 在真实 RTSP + 通话并发、长时间运行后用 perf/heap profile 判断是否需要自定义 intrusive lease；在没有
+   数据前不把标准 `shared_ptr` 替换成高风险的自定义引用计数。
+5. 不重新引入把采集、APM、编码、播放固定串联的 manager；新的业务需求必须通过 `AudioPipeline` 的订阅
+   支路或 `AudioPlaybackPipeline` 的唯一扬声器入口表达，避免双架构再次并存。
+
+#### 8. 旧 C manager 清理
+
+在完成 C++ 上/下行管线的板端回归后，检查全仓调用点：`AudioCaptureManager` / `AudioPlaybackManager` 已仅被
+自身源码、头文件和两个历史 demo 使用，没有被 IPC App、RTSP server 或其他业务模块依赖。因此删除：
+
+```text
+include/core/audio/AudioCaptureManager.h
+include/core/audio/AudioPlaybackManager.h
+src/core/audio/AudioCaptureManager.c
+src/core/audio/AudioPlaybackManager.c
+demo/AudioCaptureOpusDemo.c
+demo/AudioPlaybackManagerDemo.c
+```
+
+同时从 CMake 和 RV1126B 构建脚本移除对应 target。`AudioPipelineDemo` / `AudioPipelineStressDemo` /
+`AudioFramePoolDemo` 覆盖新上行图，`AudioPlaybackPipelinePcmDemo` / `AudioPlaybackPipelineOpusDemo` 覆盖新的
+唯一扬声器入口；已有 `.opus` packet 文件仍可用两个 Opus playback demo 回归，不为清理旧 manager 新增重复 demo。
+
+## 2026-09-23
+
+### AAC-LC RTSP 音频接入、按客户端启停与接口收口
+
+本次把 IPC 的音频从“录音/编码 demo 闭环”接入正式的多路 RTSP Server。目标不是让每一路视频各自
+编码一份音频，而是让整台 IPC 的单路麦克风 PCM 只编码一次，再安全扇出给 `/main`、`/sub` 及其多个
+客户端。
+
+#### 1. 最终推流链路
+
+```text
+ALSA Capture（实际协商 PCM：当前 RV1126B 为 48kHz / mono / S16_LE）
+  -> AudioPipeline raw PCM Hub
+  -> 一个 AAC EncoderNode（仅有音频客户端时存在）
+  -> RtspAudioPublishSink
+  -> Live555RtspServer::pushAacAccessUnit()
+  -> /main AudioAccessUnitQueue
+  -> /sub  AudioAccessUnitQueue
+  -> 各 URL 的 AacAudioSubsession / AudioAccessUnitSource
+  -> MPEG4-GENERIC RTP（AAC-hbr）
+```
+
+`/main` 与 `/sub` queue 内只各自复制 `EncodedAudioPacketPtr`，共同引用同一份不可变 AAC payload；不复制
+压缩字节。进入 live555 `FramedSource` 时才有一次必要的 payload copy 到 live555 的 RTP 发送缓冲。当前
+128 kbit/s AAC 的数据量很小，这一次拷贝不是热点。
+
+每个 AAC AU 精确覆盖 1024 samples。`AudioAccessUnitSource` 用 `frameSamples` 推进 RTP 时间线，不能长期
+累计整数微秒时长，避免 `1024 / 48000 = 21.333...ms` 的取整漂移。
+
+#### 2. 不再让 App 手填编码器细节
+
+此前 `IpcApp.cpp` 需要手动填写：
+
+```cpp
+bitrate = 64000;
+frameSamples = 1024;
+maxPacketBytes = 2048;
+rtspAudio.pcmFormat = audioPipeline.captureFormat();
+```
+
+这会让业务层同时知道 AAC 的帧规范、包池大小、实际 PCM 与 SDP 细节，职责不合理。现在新增：
+
+```cpp
+enum class AudioBitratePreset { Low, Medium, High };
+
+pipeline.subscribeEncoded(AUDIO_CODEC_AAC, AudioBitratePreset::High, callback);
+pipeline.getEncodedStreamInfo(AUDIO_CODEC_AAC, AudioBitratePreset::High, info);
+```
+
+Pipeline 内部统一映射策略：
+
+| codec | Low | Medium | High（IPC 默认） |
+| --- | ---: | ---: | ---: |
+| AAC-LC | 64 kbit/s | 96 kbit/s | 128 kbit/s |
+| Opus VOIP | 16 kbit/s | 32 kbit/s | 64 kbit/s |
+
+AAC 内部固定 1024 samples；Opus 内部固定为 20ms。`AudioEncodedStreamInfo` 从已启动 Capture 读取真实协商的
+PCM 格式，同时携带 codec、码率、frameSamples。RTSP Server 用这份描述生成 SDP `rtpmap/config` 与 RTP
+clock，避免出现“设备实际 44.1kHz，但 SDP 硬编码宣称 48kHz”的格式契约错误。
+
+#### 3. 无客户端时不编码
+
+新增 `RtspAudioPublishSink`，由 `/main`、`/sub` 共同持有。它维护“有音频 PLAY 客户端的 URL 数”，而不是
+给每一个 client 创建订阅：
+
+```text
+任一 URL audio client：0 -> 1
+  -> live555 事件线程只调用 RtspAudioPublishSink::setStreamActive(true)
+  -> Sink 的控制 worker 调用 AudioPipeline::subscribeEncoded()
+  -> 创建一份 AAC EncoderNode；首包约一个 AAC AU（约 21ms）后可发送
+
+第二个及后续 client / 另一 URL 加入
+  -> 只增加引用计数，不重复创建编码器
+
+全部 URL audio client：1 -> 0
+  -> 先清理各自的 AudioAccessUnitQueue
+  -> Sink worker reset AudioSubscription
+  -> AAC EncoderNode 自动停止、析构；ALSA 原始 PCM 采集仍持续运行
+```
+
+创建/销毁编码器绝不在 live555 event-loop 执行；事件线程只改轻量状态、唤醒 Sink worker。这样不会因 FDK-AAC
+初始化或 `AudioPipeline` 订阅操作阻塞 RTSP 收发。Sink 的编码回调使用独立 `DispatchState`，不捕获 Sink 的
+裸 `this`；退订/析构时先关闭 dispatch，再取消 Hub 回调，避免已取得的 Hub callback snapshot 访问悬空对象。
+
+AAC-LC 不需要像视频 IDR 一样为新 client 请求关键帧：AAC AudioSpecificConfig 已通过 SDP 发送，下一包新的
+AAC access unit 即可解码。
+
+#### 4. 热路径与可观测性
+
+`Live555RtspServer::pushAacAccessUnit()` 原先每个 AAC 包都创建 `std::vector<PublishStreamPtr>` 快照。48kHz
+AAC 每秒约 47 包，虽小但会造成不必要的堆申请。由于 Server 运行期间禁止 `addStream()`，现在在注册 URL 时
+预先建立 `m_aacPublishStreams`，发送路径只在 Server 锁保护下遍历稳定表，不再逐 AU 分配 vector。
+
+补齐 APM Node 与 EncoderNode 的 PCM 输入队列溢出统计：队列满时淘汰最旧 10ms PCM 以追实时；首次及每 100
+次输出 WARN。EncoderNode 随后会从 PCM timestamp 缺口识别不连续并重建 codec 状态，不能跨时间缺口拼出同一
+个 AAC/Opus 包。
+
+板测期间发现日志条件必须排除零值：`droppedCount % 100 == 0` 在零时也成立，会导致没有丢帧却每 10ms 刷
+WARN。已修成 `droppedCount != 0 && (...)`，防止日志本身成为实时线程噪声。
+
+#### 5. RV1126B 实测
+
+使用 `root@192.168.1.4`，临时运行新 `ipc_app`，测试结束后恢复 `/oem/usr/bin/multicam_ipc_app` 原自启版本：
+
+```text
+空闲启动
+  AudioCapture: PCM=48000Hz 1ch S16_LE period=480
+  未出现 RtspAudioPublishSink “启动 AAC”日志，证明无人时不编码
+
+ffprobe TCP 拉 /main 音频
+  首个 client -> 启动一次 AAC-LC bitrate=128000
+  RTP PTS: 0, 1024, 2048, ...
+  client 退出 -> 停止一次 AAC 编码
+
+main + sub 重叠拉流
+  main 首先启动 AAC 一次
+  sub 加入不产生第二次 AAC 启动
+  两路退出后只停止一次 AAC 编码
+  main 收到 255 包，sub 收到 204 包
+```
+
+`cmake --build build/rv1126b-aarch64 --target ipc_app` 与 `./wsl-build.sh` 均通过，`git diff --check` 通过。
+
+#### 6. 后续边界
+
+- 监控 RTSP 目前采用 AAC-LC；Opus 编码支路仍保留给 WebRTC/对讲和相关 demo。
+- RTSP AAC queue 默认 8 AU，最坏约 171ms；正常 live555 会即时消费。若后续实测要更低延迟，可评估降到
+  4 AU（约 85ms），但不应无界堆积。
+- 若 AAC EncoderNode 运行期创建失败，Sink 会保留错误；在全部 client 离开、下一次 0->1 时允许重新尝试，
+  不把一次临时失败固化为永久不可恢复状态。
+
+### MPP 实时首包 PTS 修复与 RTSP 客户端 AAC 接收
+
+#### 1. 发现：初始化阶段发送独立 MPP header 是实时 RTP 的错误路径
+
+此前 `MppEncoder::sendFrame()` 第一次送帧前会调用 `rk_mpp_encoder_write_header()`，底层实际执行
+`MPP_ENC_GET_HDR_SYNC`。该调用会同步触发 packet callback，并产出一份单独的参数集：H264 为 SPS/PPS，
+H265 为 VPS/SPS/PPS。MPP 给这份配置数据的 PTS 固定为 `0`，它不是一张真实输入图像的编码结果。
+
+随后第一张真实帧才携带 V4L2 单调时钟 PTS。在 RTSP 推流中将两者直接相继送入 RTP，会形成：
+
+```text
+独立 VPS/SPS/PPS (PTS = 0)
+  -> 第一张真实 IDR (PTS = 当前单调时钟，可能已运行数万秒)
+```
+
+这会污染视频 RTP 时间线。客户端日志中出现过视频起始时间与音频相差数万秒，根因就是这里，不能通过
+播放器侧修复。
+
+为确认 MPP 的实际行为，临时探针分别比较“只送第一张真实帧”和“先 `GET_HDR_SYNC` 再送真实帧”：
+
+```text
+H264 只送真实首帧：SPS(7), PPS(8), SEI(6), IDR(5)，PTS=真实帧 PTS
+H265 只送真实首帧：VPS(32), SPS(33), PPS(34), SEI(39), IDR(19)，PTS=真实帧 PTS
+
+显式 GET_HDR_SYNC：仅参数集，PTS=0
+后续真实 IDR：仅 SEI/IDR（参数集已被前一包提前拿走）
+```
+
+因此正式修复（commit `3c4d8f6`）是删除 `MppEncoder` 的 `ensureHeaderWritten()` 与
+`headerWritten` 状态；保留 MPP 的 `MPP_ENC_HEADER_MODE_EACH_IDR` 配置，让每个 IDR 自身携带参数集。
+`rk_mpp_encoder_write_header()` C 接口仍保留给文件封装或底层诊断，但明确禁止在实时 RTP 首包路径调用。
+
+RV1126B 实测更新后的 `/oem/usr/bin/multicam_ipc_app`：
+
+```text
+[RKMPP Encoder] frame=1 ... header=0 intra=1
+ffprobe(TCP): video start_time=0.033356, audio start_time=0.000000
+```
+
+不再出现 `header=1` 的独立 PTS=0 包，也不再有数万秒的音视频起点错位。
+
+这项修复不等同于解决所有 UDP 首帧问题：静态画面下 H265 IDR 仍可能很大，默认 UDP 客户端接收缓冲不足时
+丢失任意 RTP FU 分片，依然会出现 `SPS/PPS does not exist`。TCP 验证正常；提高客户端 UDP 接收缓冲也可
+验证该现象。这是首张大 IDR 的传输突发问题，应作为独立事项处理，不能再归因到 header PTS。
+
+#### 2. RTSP 客户端接收 AAC audio track
+
+commit `5e65246` 将拉流端从“只识别一条 H264/H265 视频轨”扩展为可同时接收一条 AAC-LC 音轨：
+
+```text
+DESCRIBE SDP
+  -> Live555RtspClient 识别 MPEG4-GENERIC audio subsession
+  -> SETUP/PLAY 与视频 track 一样建立 RTP 接收链路
+  -> AacAudioSink 收到完整 AAC access unit
+  -> Stream::onAudioPacket()
+  -> 上层 AudioPlaybackPipeline / 录像等自行复制到有界队列
+```
+
+`AacAudioSink` 只交付压缩 access unit、SDP 协商出的 PCM 格式、1024 samples 与 presentation timestamp；它不在
+live555 事件线程解码或写声卡。`Stream` 的音频回调只借用 packet payload，异步消费者必须用
+`EncodedAudioPacketPool` 或自己的有界队列取得所有权，这与视频 NALU 回调的生命周期纪律一致。
+
+新增两个诊断 demo：
+
+- `rtsp_aac_wav_record_demo`：RTSP AAC -> FDK-AAC -> WAV，同时保存 ADTS 码流，隔离 RTP/AAC 与 ALSA 问题；
+- `rtsp_audio_playback_demo`：RTSP AAC -> `AudioPlaybackPipeline` -> ALSA。
+
+RK3568（`192.168.1.3`）对 RV1126B（`192.168.1.4`）实测 `rtsp_aac_wav_record_demo` 录制 5 秒：
+
+```text
+decodedPackets=234
+writtenFrames=239616
+poolDropped=0
+queueDropped=0
+```
+
+`./wsl-build.sh`（全 demo）与 `./wsl-build-ipc.sh`（RV1126B IPC）均通过。
+
+### Live555 IPv4 端口快速重启
+
+live555 默认在 `GenericMediaServer` 建立 RTSP 监听 socket 前关闭 `SO_REUSEADDR`。服务刚停后旧 IPv4 TCP
+连接可能仍处于 `TIME_WAIT`，于是 IPv4 `8554` 绑定失败；IPv6 socket 又可以成功，最终进程看似启动但只监听
+`:::8554`，IPv4 客户端被拒绝连接。
+
+两个板端静态库以 `ALLOW_RTSP_SERVER_PORT_REUSE=1` 重编译 `GenericMediaServer.o`，保留正常的
+`SO_REUSEADDR`。RV1126B 连续 TERM/立即重启后，`netstat -lnt` 已稳定同时显示：
+
+```text
+0.0.0.0:8554  LISTEN
+:::8554       LISTEN
+```
+
+该选项只允许同一服务快速重绑，不允许两个仍存活的 RTSP Server 共用端口。具体构建约束已写入
+`third_party/live555/README.md`。
+
+## 2026-09-24：RV1126B H265 大 IDR 的 CBR / VBR / AVBR 对照
+
+### 背景与目标
+
+此前 UDP 拉流排查已确认：静态画面时 H265 的完整 IDR（含 VPS/SPS/PPS）会异常偏大，数百个 RTP FU
+分片会在瞬间送入客户端 UDP 接收队列；只要丢掉其中一个分片，整张 IDR 就不可解码。这个问题与 RTP
+packetization 无关——RTP 本来就会把大 NALU 正确拆分——重点是减少单张关键帧的突发大小。
+
+本次只比较编码器输出，不让 UDP 丢包干扰结论：RV1126B 上以 TCP 拉取 `/main` 触发编码，并在 MPP packet
+callback 中记录**包含参数集的完整 IDR packet** 字节数。测试开关为
+`MCR_MPP_ENCODER_DEBUG_IDR=ON`；正常构建默认关闭，统计扫描与日志不会进入实时路径。
+
+### 固定测试条件
+
+| 项目 | 数值 |
+|---|---:|
+| 板端 | RV1126B（`192.168.1.4`） |
+| 视频 | H265 main，1920x1080，NV12，30 fps |
+| GOP | 30（约每秒一个 IDR） |
+| target bitrate | 5,054,400 bps（`Medium`） |
+| `qp_init` | `-1`（MPP 自适应决定初始 QP） |
+| 普通帧 QP 范围 | `qp_min=10`，`qp_max=48` |
+| I 帧 QP 范围 | `qp_min_i=10`，`qp_max_i=48` |
+| I/P QP 差 | `qp_ip=2` |
+
+CBR 保持原量产范围：`bps_min=4,738,500`（15/16 target），`bps_max=5,370,300`（17/16 target）。
+
+VBR 与 AVBR 对照均使用同一宽范围，避免把“范围更大”误当成模式差异：
+`bps_min=1,010,880`（20% target），`bps_max=6,065,280`（120% target）。两套 preset 还各自拥有
+`bps_target` 比例，当前均为 `1/1`；后续若把 AVBR target 调高，只改 AVBR 分支即可。
+
+### 实测结果（完整 MPP IDR packet）
+
+| 码控模式 | 静态画面稳定 IDR | 持续晃手动态画面稳定 IDR | 结论 |
+|---|---:|---:|---|
+| CBR | 236–266 KiB | 约 80–105 KiB | 基线；静态关键帧突发偏大。 |
+| VBR | 321–331 KiB | 108–137 KiB | 不适合此目标；静态峰值比 CBR 更大。 |
+| AVBR | **129–159 KiB**（偶有 174/190 KiB） | **56–75 KiB** | 最能压低单张 IDR 突发，但动态主观画质偏糊，不能直接作为正式默认。 |
+
+AVBR 动态切换进来的第一张 IDR 曾为 273 KiB；这是刚连接/场景状态转换时的过渡值，不与后续稳定段混在一起。
+同理，各次编码器刚初始化时的前一两张 IDR 不用于判断稳定策略。
+
+### 当前代码组织与后续调参原则
+
+`mpp_simple.c` 现在保留两套彼此独立的 `RkMppRateControlPreset`：
+
+```text
+MCR_MPP_ENCODER_USE_AVBR=ON（默认）  -> AVBR：当前 IPC 默认参数组
+MCR_MPP_ENCODER_USE_AVBR=OFF          -> CBR：保留的原量产 bps/QP 基线
+```
+
+这样再试 AVBR 的 target、min/max 或 QP 边界时，不会反复手改 CBR 分支，也不会意外改变 CBR 基线。
+
+### 最终默认选择与带宽观察
+
+后续将 AVBR 的 `bps_max` 从 120% target 提高到 156% target（7,884,864 bps），再把
+`qp_max` / `qp_max_i` 从实验值 35 恢复为与 CBR 相同的 48。恢复后的实际动态采样中，MPP
+报告的平均 QP 为 17--23、实时码率约 1.0--3.6 Mbps，均没有撞到 QP 或 `bps_max` 上限；因此 QP=35
+并不是此前主观画质差异的有效限制条件。
+
+更重要的是板端出口流量的实测对照：
+
+| 场景 | CBR | AVBR | 含义 |
+|---|---:|---:|---|
+| 静止画面 | 约 5 Mbps | 约 1 Mbps | CBR 会持续填满固定预算；AVBR 不会为没有新增画面信息的静态场景浪费网络带宽。 |
+| 正常动态 | 约 5 Mbps 固定预算 | 峰值约 3 Mbps | AVBR 仍保留质量预算，但实际复杂度未要求占满 5 Mbps。 |
+
+这不仅减少 IPC 对外带宽，也降低 NVR 多路汇聚时的交换机、网卡和录像写入压力。因此本项目默认切换为
+AVBR；CBR 保留为可复现实验的回退分支，而不是删除。
+
+此次拍摄电脑屏幕的纯白背景中，偶见会跳动的细小块状异常。该现象只在平坦高亮、摩尔纹很强的拍屏极端画面中
+容易暴露，正常场景中不明显；当前记录为 H265 量化/块划分伪影观察项，不据此继续牺牲 AVBR 的带宽收益。
+
+当前板端暂时运行 AVBR + IDR 调试版以便保留本次实验数据；结束参数实验后必须重新以
+`MCR_MPP_ENCODER_DEBUG_IDR=OFF` 构建，再替换量产自启动二进制。
+
+## 2026-09-25：音频运行期可靠性、诊断与断流恢复收尾
+
+### 目标
+
+音频主链已经能采集、AAC/Opus 编解码、RTSP 发布/接收和播放；本次不改变其数据流，专门补齐
+“发生异常时能知道、能安全跨过时间缺口、不会把短暂队列波动误判成播放饥饿”的运行期可靠性。
+
+### 1. ALSA 采集端：明确 10ms period 与 80ms hardware buffer
+
+`AudioCaptureConfig` 新增 `requestedBufferFrames`。默认 0 时不再依赖 ALSA 隐式的 buffer 大小，而是在
+`period_size_near()` 返回真实 period 后配置 `8 * period`；RV1126B 实测协商结果为：
+
+```text
+48000 Hz / mono / S16_LE
+period = 480 frames = 10ms
+buffer = 3840 frames = 80ms
+```
+
+80ms 是 ALSA DMA 环形缓冲提供给普通 Linux 调度的余量，不改变 Pipeline 的 10ms PCM 发布粒度，也不是
+网络 jitter buffer。`AudioCapture` 新增累计的 `xrunCount`、`recoveredErrorCount`、`fatalErrorCount`、
+`lastError` 和 `running` 状态；`IpcApp` 每 100ms 低频检查，只在计数变化或采集线程异常退出时记录日志。
+因此“RTSP 仍活着但采集线程已死”的情况不再静默。
+
+### 2. SIGUSR1 一次性音频快照
+
+为排查曾经出现过的“人声像怪兽、键盘声却正常”问题，新增 `AudioDiagnosticCapture`。向 IPC 发送 `SIGUSR1`
+后，主线程启动一次未来 30 秒的捕获：
+
+```text
+raw PCM hub  -> raw WAV
+AAC hub      -> ADTS .aac + 保留 PTS 的 .mcraudio
+```
+
+输出统一位于 `/root/audio-diagnostics/`，含同名 `.txt` 元数据与
+`README_AUDIO_DIAGNOSTIC.txt`；触发脚本为 `tools/capture_audio_snapshot.sh`。信号处理函数只置位，订阅、
+内存分配和文件写入均在主线程完成。板端快照已验证：约 30 秒、3000 个 10ms PCM block、1406 个 AAC packet、
+`timestampGaps=0`。
+
+这份诊断首先用于定位问题处于哪一段：raw WAV 已异常则是 ALSA/硬件采集侧；raw 正常而 AAC 异常则检查编码器；
+两者正常而客户端异常则检查 RTSP/RTP、解码或播放侧。
+
+### 3. 热路径收敛
+
+- 删除 APM 每个 10ms PCM block 的 `absolute_sample_sum()` 扫描及累计字段。默认 RTSP 还是 APM bypass，
+  这些统计没有运行价值；处理后的 frame/sample 总数仍保留。
+- `AudioAccessUnitQueue` 从 `std::vector` 改为 `std::deque`。满队列和出队均 `pop_front()`，不再搬移后续
+  `shared_ptr`；队列容量仍是很小的 8 AU，语义不变。
+- FDK-AAC Afterburner 实测后固定关闭。RV1126B 独占 64kbps mono AAC 20 秒：开启约 6.3% 单核、关闭约
+  4.3% 单核，输出分别 175185 / 175142 bytes，当前没有证明听感收益足以覆盖约 2% 单核的常驻成本。
+
+### 4. PCM 时间戳断裂：轻量 reset，而非 close/init
+
+此前 `EncoderNode` 发现输入 PCM timestamp 跳变后，会完整 `close -> calloc/open/configure -> init` AAC/Opus。
+真实跳变通常来自 XRUN 或队列丢帧，正是系统处于瞬时负载压力时；此时额外做销毁/分配/重配置没有必要。
+
+现在 `AudioEncoderOps` 增加 `reset()`：
+
+```text
+PCM 格式变化
+  -> 完整 close/init（旧 format 的 codec 不能继续使用）
+
+仅 timestamp 断裂、格式未变
+  AAC  -> 清应用层未满 1024-sample cache
+          + FDK AACENC_CONTROL_STATE(INIT_STATES | RESET_INBUFFER)
+          + 空 aacEncEncode() 立即应用内部 history reset
+  Opus -> 清未满包 cache + OPUS_RESET_STATE
+```
+
+若轻量 reset 意外失败，保留完整重建作为安全降级，不能继续将 PCM 送给状态未知的 codec。
+
+本次顺手修复 FDK-AAC 的边界：首次编码或 history reset 后，FDK 可能已经消费一组 1024 samples 但暂不输出
+access unit。旧代码仅在“有输出”时清 `cachedFrames`，导致下一轮 `writableFrames=0` 而空转；现已改为只要
+`aacEncEncode()` 成功返回，就释放本应用层的这组 cache。
+
+新增不依赖 ALSA 的 `audio_encoder_reset_demo`，在 RV1126B 实测：
+
+```text
+AAC : 断裂前半包 -> reset -> 断裂后完整包，packets=2，firstPts=9000000，PASS
+Opus: 断裂前半包 -> reset -> 断裂后完整包，packets=3，firstPts=9000000，PASS
+```
+
+首包 PTS 都来自断裂后的 PCM，证明没有把时间缺口两侧数据拼成一包。AAC 在 reset 后允许存在 codec 固有的
+priming delay，demo 连续送三组完整 AAC frame 来验证其恢复出包，不把这种正常行为误判为 reset 失败。
+
+### 5. 播放断流后的正确重预缓冲
+
+`AudioPlaybackPipeline::m_playbackStarted` 以前只在 `clearQueueLocked()` 时复位。Gemini 的建议指出播放实际
+XRUN 后应重新预缓冲，这个方向正确；但**不能**在 `m_queueCount == 0` 时直接复位：实时 10ms 一包的正常路径
+也可能让软件队列瞬间为空，届时会反复等待 80ms，造成周期性延迟和卡顿。
+
+因此底层新增 `audio_playback_write_pcm_ex()` 与 `AudioPlaybackWriteStatus`。只有 ALSA `-EPIPE` 或其它可恢复
+write 异常实际发生并被 `prepare/recover` 后，才将 `recoveredFromDiscontinuity` 交给播放管线：
+
+```text
+实际 ALSA 断流 -> 底层 recover 成功
+                -> PlaybackPipeline 置 m_playbackStarted=false
+                -> 后续音频重新积累 startupPrebufferDurationUs（默认 80ms）
+                -> 再起播
+```
+
+既避免“来一包播一包”后的连锁 XRUN，又不会把正常软件队列波动当成断流。
+
+### 6. 验证与部署状态
+
+- `./wsl-build-ipc.sh` 通过，`git diff --check` 通过；第三方 FDK/WebRTC 头文件仍有既有 unused 参数警告。
+- `audio_encoder_reset_demo` 已在 RV1126B (`192.168.1.4`) 运行通过。
+- 最新 `ipc_app` 已原子替换到 `/oem/usr/bin/multicam_ipc_app`，本轮测试后按要求没有替用户启动；重启服务或
+  执行开机脚本后即使用本版。
+
+### 后续审阅建议
+
+项目当前约 3.3 万行，不应逐行强记。音频审阅优先抓住：`AudioCapture -> raw PCM Hub -> (APM) -> EncoderNode ->
+RTSP`，以及 `RTSP -> Decoder -> AudioPlaybackPipeline` 两条主数据流；再阅读三个边界状态：PCM timestamp
+断裂、ALSA capture XRUN、ALSA playback XRUN。FDK/Opus/WebRTC 内部实现按输入、输出、线程与失败语义使用即可，
+不需要逐行背诵。

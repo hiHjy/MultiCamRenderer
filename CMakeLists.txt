@@ -5,6 +5,10 @@ project(MultiCamRenderer LANGUAGES C CXX)
 option(MCR_BUILD_DEMOS "构建非 Qt 的 demo 与 DRM demo" ON)
 option(MCR_BUILD_QT "构建 Qt 应用与 Qt/RGA demo" OFF)
 option(MCR_BUILD_IPC_APP "构建 RV1126B IPC 双路 RTSP 应用" OFF)
+# IPC 默认使用 AVBR 参数组；CBR 参数组仍完整保留，可用 -DMCR_MPP_ENCODER_USE_AVBR=OFF 显式切换。
+# 两组参数彼此独立，调试 AVBR 不会意外改变 CBR 基线。
+option(MCR_MPP_ENCODER_USE_AVBR "IPC H264/H265 使用 AVBR 参数组" ON)
+option(MCR_MPP_ENCODER_DEBUG_IDR "编码实验：记录每组 MPP intra packet 的大小" OFF)
 # FreeType 目前只用于 OSD 的独立学习 demo。它依赖 RV1126B media_out 提供的动态库，
 # 因此不默认开启，避免没有 FreeType 的 RK3568 sysroot 受到影响。
 option(MCR_BUILD_FREETYPE_BITMAP_DEMO "构建 FreeType 字形 bitmap demo" OFF)
@@ -37,6 +41,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/codec"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -62,6 +67,12 @@ if(MCR_MEDIA_ROOT)
     set(MCR_RGA_LIBRARY "${MCR_MEDIA_ROOT}/lib/librga.so")
     set(MCR_DRM_LIBRARY "${MCR_MEDIA_ROOT}/lib/libdrm.so")
     set(MCR_RKAIQ_LIBRARY "${MCR_MEDIA_ROOT}/lib/librkaiq.so")
+    set(MCR_ALSA_INCLUDE_DIR "${MCR_MEDIA_ROOT}/include")
+    set(MCR_ALSA_LIBRARY "${MCR_MEDIA_ROOT}/root/usr/lib/libasound.so.2.0.0")
+    if(NOT EXISTS "${MCR_ALSA_INCLUDE_DIR}/alsa/asoundlib.h" OR
+       NOT EXISTS "${MCR_ALSA_LIBRARY}")
+        message(FATAL_ERROR "MCR_MEDIA_ROOT 缺少 ALSA 开发文件或动态库")
+    endif()
 else()
     set(MCR_MPP_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/rockchip")
     set(MCR_DRM_INCLUDE_DIR "${MCR_SYSROOT}/usr/include/libdrm")
@@ -70,7 +81,33 @@ else()
     find_library(MCR_MPP_LIBRARY NAMES rockchip_mpp REQUIRED)
     find_library(MCR_RGA_LIBRARY NAMES rga REQUIRED)
     find_library(MCR_DRM_LIBRARY NAMES drm REQUIRED)
+    set(MCR_ALSA_INCLUDE_DIR "${MCR_SYSROOT}/usr/include")
+    find_library(MCR_ALSA_LIBRARY NAMES asound REQUIRED)
 endif()
+
+# Opus 与 WebRTC APM 都以"头文件 + 预编译静态库"的形式入库（同 third_party/live555）。
+# 源码在 ~/third_party-src/ 下，用 tools/build-third-party.sh 重新生成。
+set(MCR_THIRD_PARTY_ARCH "${MCR_LIVE555_TARGET}" CACHE STRING "第三方预编译库的目标板（rk3568 / rv1126b）")
+set_property(CACHE MCR_THIRD_PARTY_ARCH PROPERTY STRINGS rk3568 rv1126b)
+
+set(MCR_OPUS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/include")
+set(MCR_OPUS_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libopus.a")
+set(MCR_FDK_AAC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fdk-aac/include")
+set(MCR_FDK_AAC_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fdk-aac/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libfdk-aac.a")
+set(MCR_WEBRTC_APM_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/include")
+set(MCR_WEBRTC_APM_LIBRARY
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc-audio-processing/lib/aarch64-${MCR_THIRD_PARTY_ARCH}/libmcr_webrtc_apm.a")
+
+foreach(mcr_prebuilt IN ITEMS "${MCR_OPUS_LIBRARY}" "${MCR_FDK_AAC_LIBRARY}" "${MCR_WEBRTC_APM_LIBRARY}")
+    if(NOT EXISTS "${mcr_prebuilt}")
+        message(FATAL_ERROR
+            "缺少预编译库 ${mcr_prebuilt}\n"
+            "请先运行 tools/build-third-party.sh 生成。")
+    endif()
+endforeach()
 
 foreach(live555_library IN ITEMS liveMedia groupsock BasicUsageEnvironment UsageEnvironment)
     if(NOT EXISTS "${MCR_LIVE555_LIBRARY_DIR}/lib${live555_library}.a")
@@ -109,6 +146,32 @@ function(mcr_link_drm target)
         "${MCR_DRM_LIBRARY}"
         Threads::Threads
     )
+endfunction()
+
+function(mcr_link_alsa target)
+    target_include_directories(${target} PRIVATE "${MCR_ALSA_INCLUDE_DIR}")
+    target_link_libraries(${target} PRIVATE "${MCR_ALSA_LIBRARY}" Threads::Threads)
+endfunction()
+
+# Opus 与 WebRTC APM 的预编译静态库。用法同 mcr_link_live555 / mcr_link_freetype：
+# third_party 下只放头文件和库，链接细节收在这里。
+function(mcr_link_audio_deps target)
+    target_include_directories(${target} PRIVATE
+        "${MCR_OPUS_INCLUDE_DIR}"
+        "${MCR_FDK_AAC_INCLUDE_DIR}"
+        "${MCR_WEBRTC_APM_INCLUDE_DIR}"
+    )
+    target_link_libraries(${target} PRIVATE
+        "${MCR_WEBRTC_APM_LIBRARY}"
+        "${MCR_OPUS_LIBRARY}"
+        "${MCR_FDK_AAC_LIBRARY}"
+        Threads::Threads
+        m
+        rt
+    )
+    # WebRTC 2.1 / Abseil 要求 C++17；RK3568 的 GCC 10.4 默认还是 C++14，
+    # 不显式声明会在 std::optional 上成片报错。
+    target_compile_features(${target} PRIVATE cxx_std_17)
 endfunction()
 
 function(mcr_link_live555 target)
@@ -169,8 +232,20 @@ endfunction()
 set(MCR_RTSP_SERVER_SOURCES
     src/rtsp/server/AnnexBFrameQueue.cpp
     src/rtsp/server/AnnexBSource.cpp
+    src/rtsp/server/AudioAccessUnitQueue.cpp
+    src/rtsp/server/AudioAccessUnitSource.cpp
+    src/rtsp/server/AacAudioSubsession.cpp
     src/rtsp/server/VideoSubsession.cpp
     src/rtsp/server/Live555RtspServer.cpp
+    src/rtsp/server/RtspAudioPublishSink.cpp
+)
+
+# 所有 RTSP 拉流 demo 共用同一组 source；AAC 接收 sink 在这里集中列出，避免某个
+# demo 更新 Live555RtspClient 后遗漏链接实现。
+set(MCR_RTSP_CLIENT_SOURCES
+    src/rtsp/client/Live555RtspClient.cpp
+    src/rtsp/client/AnnexBSink.cpp
+    src/rtsp/client/AacAudioSink.cpp
 )
 add_library(mcr_rtsp_server STATIC ${MCR_RTSP_SERVER_SOURCES})
 target_include_directories(mcr_rtsp_server
@@ -210,6 +285,39 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
 
+# C 层只保留同步、单职责媒体工具；C++ AudioPipeline 在其上组织 Hub/Node 图。
+add_library(mcr_audio_core STATIC
+    src/core/audio/AudioCapture.c
+    src/core/audio/AudioApm.cpp
+    src/core/audio/AudioCodec.c
+    src/core/audio/AacCodec.c
+    src/core/audio/AacEncoder.c
+    src/core/audio/OpusEncoder.c
+    src/core/audio/AudioDecoder.c
+    src/core/audio/AacDecoder.c
+    src/core/audio/OpusDecoder.c
+    src/core/audio/AudioPlayback.c
+    src/core/audio/AudioPacketFile.c
+    src/core/audio/AudioFrame.cpp
+    src/core/audio/AudioPipeline.cpp
+    src/core/audio/AudioDiagnosticCapture.cpp
+    src/core/audio/AudioPlaybackPipeline.cpp
+)
+target_include_directories(mcr_audio_core
+    PUBLIC ${MCR_PROJECT_INCLUDE_DIRS}
+    PRIVATE "${MCR_ALSA_INCLUDE_DIR}"
+)
+target_compile_options(mcr_audio_core PRIVATE -Wall -Wextra)
+mcr_link_audio_deps(mcr_audio_core)
+target_link_libraries(mcr_audio_core PUBLIC
+    "${MCR_ALSA_LIBRARY}"
+    Threads::Threads
+)
+
+# RTSP AAC subsession 通过 AudioAac 的 AudioSpecificConfig 生成 SDP；声明为 PUBLIC 后，
+# 凡是链接 mcr_rtsp_server 的 demo 都会自动带上该实现，不会出现静态库链接顺序遗漏。
+target_link_libraries(mcr_rtsp_server PUBLIC mcr_audio_core)
+
 if(MCR_BUILD_IPC_APP)
     mcr_add_executable(ipc_app
         app/IpcApp.cpp
@@ -226,12 +334,24 @@ if(MCR_BUILD_IPC_APP)
         src/core/hw/rga/RgaEngine.cpp
         ${MCR_MPP_DECODER_SOURCES}
     )
+    # mcr_rtsp_server 公开依赖 mcr_audio_core（AAC SDP 与 source 所需）；IPC 本身也通过
+    # 这条传递依赖使用 AudioPipeline，避免在每个 app 重复列同一个音频库。
     target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
     target_include_directories(ipc_app PRIVATE "${MCR_RKAIQ_INCLUDE_DIR}")
     target_link_libraries(ipc_app PRIVATE "${MCR_RKAIQ_LIBRARY}")
     mcr_link_freetype(ipc_app)
     mcr_link_media(ipc_app)
     mcr_link_live555(ipc_app)
+    if(MCR_MPP_ENCODER_USE_AVBR)
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_USE_AVBR=1)
+    else()
+        # 显式传 0，避免 mpp_simple.c 的独立编译默认值覆盖 CMake 的 CBR 选择。
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_USE_AVBR=0)
+    endif()
+    if(MCR_MPP_ENCODER_DEBUG_IDR)
+        # 默认关闭，正常实时路径不生成关键帧统计日志代码。
+        target_compile_definitions(ipc_app PRIVATE MCR_MPP_ENCODER_DEBUG_IDR=1)
+    endif()
     # RV1126B 量产 rootfs 将 Rockchip 媒体运行库部署在此目录；交叉 SDK 中的
     # media_out 仅用于构建，不能把主机 SDK 的绝对路径写进目标程序。
     set_target_properties(ipc_app PROPERTIES
@@ -241,6 +361,112 @@ if(MCR_BUILD_IPC_APP)
 endif()
 
 if(MCR_BUILD_DEMOS)
+
+    # C++ AudioPipeline 图验证：raw PCM 分发、raw->Opus 与 APM->Opus 并发；运行中取消
+    # APM 支路，确认不会干扰 raw 编码支路。
+    mcr_add_executable(audio_pipeline_demo demo/AudioPipelineDemo.cpp)
+    target_link_libraries(audio_pipeline_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pipeline_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 反复挂载/释放 APM->Opus 支路，同时维持 raw->Opus。验证订阅 RAII 与 Node 生命周期。
+    mcr_add_executable(audio_pipeline_stress_demo demo/AudioPipelineStressDemo.cpp)
+    target_link_libraries(audio_pipeline_stress_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pipeline_stress_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖声卡：验证 PCM/压缩包池的满池丢弃与 payload buffer 复用语义。
+    mcr_add_executable(audio_frame_pool_demo demo/AudioFramePoolDemo.cpp)
+    target_link_libraries(audio_frame_pool_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_frame_pool_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖 ALSA：验证 AAC/Opus 在 PCM 时间轴断裂时轻量 reset 后，不会跨缺口拼包。
+    mcr_add_executable(audio_encoder_reset_demo demo/AudioEncoderResetDemo.c)
+    target_link_libraries(audio_encoder_reset_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_encoder_reset_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # C++ 唯一扬声器消费端：一条验证 PCM 直放，另一条验证 .mcropus -> 解码 -> ALSA。
+    mcr_add_executable(audio_playback_pipeline_pcm_demo demo/AudioPlaybackPipelinePcmDemo.cpp)
+    target_link_libraries(audio_playback_pipeline_pcm_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_playback_pipeline_pcm_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    mcr_add_executable(audio_playback_pipeline_opus_demo demo/AudioPlaybackPipelineOpusDemo.cpp)
+    target_link_libraries(audio_playback_pipeline_opus_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_playback_pipeline_opus_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 用实际麦克风驱动 AudioPipeline 的 AAC-LC 支路，并异步写入 demo packet 文件。
+    mcr_add_executable(audio_capture_aac_demo demo/AudioCaptureAacDemo.cpp)
+    target_link_libraries(audio_capture_aac_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_capture_aac_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不经过 Opus/APM 的 raw PCM 文件闭环，用于隔离板级采集、播放与全双工问题。
+    mcr_add_executable(audio_pcm_capture_demo demo/AudioPcmCaptureDemo.cpp)
+    target_link_libraries(audio_pcm_capture_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pcm_capture_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    mcr_add_executable(audio_pcm_playback_demo demo/AudioPcmPlaybackDemo.cpp)
+    target_link_libraries(audio_pcm_playback_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_pcm_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 采集与播放直通闭环：麦克风采集 PCM 并实时送入播放管线推至扬声器。
+    mcr_add_executable(audio_capture_and_playback demo/audio_capture_and_playback.cpp)
+    target_link_libraries(audio_capture_and_playback PRIVATE mcr_audio_core)
+    set_target_properties(audio_capture_and_playback PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+    add_custom_target(audio_capture_and_playback_demo DEPENDS audio_capture_and_playback)
+
+    # 采集 -> APM(AGC) -> 写 WAV，不经过 Opus。用于直接听/量 AGC 处理后的效果，
+    # 例如判断板端麦克风电平偏低时 AGC 究竟能补回多少 dB。
+    mcr_add_executable(audio_capture_apm_pcm_demo demo/AudioCaptureApmPcmDemo.c)
+    target_link_libraries(audio_capture_apm_pcm_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_capture_apm_pcm_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 读取已有 .mcropus packet 文件，完成 Opus -> PCM -> ALSA 播放闭环。
+    mcr_add_executable(audio_opus_playback_demo demo/AudioOpusPlaybackDemo.c)
+    target_link_libraries(audio_opus_playback_demo PRIVATE mcr_audio_core)
+    set_target_properties(audio_opus_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖 ALSA 设备的 WebRTC AGC 自检：用固定低电平 PCM 验证处理后的实际增益。
+    mcr_add_executable(audio_apm_gain_demo demo/AudioApmGainDemo.c)
+    target_link_libraries(audio_apm_gain_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_apm_gain_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 不依赖声卡的 AEC3 调用自检：验证 10ms reverse reference 与 capture 能被同一 APM
+    # 实例正确处理；不用于评价真实声学消回声效果。
+    mcr_add_executable(audio_apm_aec_smoke_demo demo/AudioApmAecSmokeDemo.c)
+    target_link_libraries(audio_apm_aec_smoke_demo PRIVATE mcr_audio_core m)
+    set_target_properties(audio_apm_aec_smoke_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 板端诊断工具：不修改 mixer，只列出 codec 实际提供的采集/播放控件与当前值。
+    mcr_add_executable(audio_mixer_inspect_demo demo/AudioMixerInspectDemo.c)
+    mcr_link_alsa(audio_mixer_inspect_demo)
+    set_target_properties(audio_mixer_inspect_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
     mcr_add_executable(mpp_decoder_demo
         demo/mpp_decoder_demo.cpp
         src/core/memory/DmaAllocator.cpp
@@ -290,8 +516,7 @@ if(MCR_BUILD_DEMOS)
 
     mcr_add_executable(rtsp_mpp_decoder_demo
         demo/RtspMppDecoderDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         ${MCR_MPP_DECODER_SOURCES}
     )
     mcr_link_media(rtsp_mpp_decoder_demo)
@@ -301,15 +526,13 @@ if(MCR_BUILD_DEMOS)
     # RTP/服务端问题和播放器兼容性问题。
     mcr_add_executable(rtsp_annexb_record_demo
         demo/RtspAnnexBRecordDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
     )
     mcr_link_live555(rtsp_annexb_record_demo)
 
     mcr_add_executable(rtsp_stream_demo
         demo/RtspStreamDemo.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
         src/core/memory/DmaAllocator.cpp
@@ -320,11 +543,40 @@ if(MCR_BUILD_DEMOS)
     mcr_link_media(rtsp_stream_demo)
     mcr_link_live555(rtsp_stream_demo)
 
+    # 接收 IPC 发布的 AAC audio track，并经项目正式 AudioPlaybackPipeline 解码写 ALSA。
+    mcr_add_executable(rtsp_audio_playback_demo
+        demo/RtspAudioPlaybackDemo.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
+        src/rtsp/client/RtspStream.cpp
+        src/core/stream/Stream.cpp
+        src/core/memory/DmaAllocator.cpp
+        src/core/memory/DmaBufferPool.cpp
+        src/core/hw/rga/RgaEngine.cpp
+        ${MCR_MPP_DECODER_SOURCES}
+    )
+    target_link_libraries(rtsp_audio_playback_demo PRIVATE mcr_audio_core)
+    mcr_link_media(rtsp_audio_playback_demo)
+    mcr_link_live555(rtsp_audio_playback_demo)
+    set_target_properties(rtsp_audio_playback_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
+    # 音频故障隔离工具：RTSP AAC -> AudioDecoder -> WAV，不经过 ALSA。可随后用 aplay
+    # 回放同一文件，明确区分码流/解码问题与板端播放路由问题。
+    mcr_add_executable(rtsp_aac_wav_record_demo
+        demo/RtspAacWavRecordDemo.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
+    )
+    target_link_libraries(rtsp_aac_wav_record_demo PRIVATE mcr_audio_core)
+    mcr_link_live555(rtsp_aac_wav_record_demo)
+    set_target_properties(rtsp_aac_wav_record_demo PROPERTIES
+        INSTALL_RPATH "/oem/usr/lib"
+    )
+
     mcr_add_executable(stream_manager_demo
         demo/StreamManagerDemo.cpp
         src/core/stream/StreamManager.cpp
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
         src/core/common/FrameHub.cpp
@@ -373,8 +625,7 @@ if(MCR_BUILD_DEMOS)
     mcr_add_executable(rtsp_drm_sink_demo
         drm/rtsp_drm_sink_demo.cpp
         drm/drm_display.c
-        src/rtsp/client/Live555RtspClient.cpp
-        src/rtsp/client/AnnexBSink.cpp
+        ${MCR_RTSP_CLIENT_SOURCES}
         src/core/memory/DmaAllocator.cpp
         src/core/memory/DmaBufferPool.cpp
         src/core/hw/rga/RgaEngine.cpp

@@ -491,10 +491,29 @@ bool Stream::OutputLayout::matches(const VideoFrame& frame) const
            format == frame.format;
 }
 
-void Stream::onPacket(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
+void Stream::setAudioPacketCallback(AudioPacketCallback callback)
+{
+    std::lock_guard<std::mutex> lock(m_audioCallbackMutex);
+    m_audioPacketCallback = std::move(callback);
+}
+
+void Stream::onVideoPacket(VideoCodec codec, const uint8_t* data, size_t size, uint64_t timestampUs)
 {
     if (m_decodeWorker != nullptr) {
         m_decodeWorker->enqueue(codec, data, size, timestampUs);
+    }
+}
+
+void Stream::onAudioPacket(const AudioEncodedPacket& packet)
+{
+    AudioPacketCallback callback;
+    {
+        // 不持锁调用外部代码：观察者可以安全地撤销/重设自己的音频订阅。
+        std::lock_guard<std::mutex> lock(m_audioCallbackMutex);
+        callback = m_audioPacketCallback;
+    }
+    if (callback) {
+        callback(packet);
     }
 }
 

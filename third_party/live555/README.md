@@ -16,3 +16,13 @@ lib/aarch64-rv1126b/  # RV1126B SDK toolchain
 ```
 
 构建脚本会显式传入 `MCR_LIVE555_TARGET`，因此不会再发生“新头文件配旧静态库”的混搭。
+
+## 端口快速重启
+
+构建静态库时必须定义 `ALLOW_RTSP_SERVER_PORT_REUSE=1`。live555 默认会在
+`GenericMediaServer` 创建监听 socket 前关闭 `SO_REUSEADDR`，这样 RTSP 服务刚停止后，
+旧 IPv4 连接仍处于 `TIME_WAIT` 时可能无法重新绑定 8554；IPv6 socket 又能单独绑定成功，
+最终表现为程序启动成功、却只监听 `:::8554`，IPv4 客户端连接被拒绝。
+
+该宏保留 `SO_REUSEADDR`，用于正常的“停止后立即重启”。它不允许两个存活的 RTSP Server
+共同占用同一端口；已有监听者时新服务仍会启动失败。

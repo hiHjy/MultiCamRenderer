@@ -121,6 +121,11 @@ int rk_mpp_encoder_init(RkMppEncoder *enc,
 void rk_mpp_encoder_set_packet_callback(RkMppEncoder *enc,
                                         RkMppPacketCallback callback,
                                         void *userdata);
+/*
+ * 查询独立的 H264 SPS/PPS 或 H265 VPS/SPS/PPS。MPP 为这包配置数据给出的 PTS 为 0；
+ * 它不应直接作为实时 RTP 流的首包发送。正常实时路径依赖每个 IDR 自带的参数集。
+ * 该接口仅保留给文件封装或底层诊断工具使用。
+ */
 int rk_mpp_encoder_write_header(RkMppEncoder *enc);
 int rk_mpp_encoder_request_idr(RkMppEncoder *enc);
 int rk_mpp_encoder_send_frame(RkMppEncoder *enc,

@@ -41,11 +41,14 @@ bool RtspStream::start()
     if (!m_client->start(
             m_url,
             [this](VideoCodec codec, uint8_t* data, size_t size, uint64_t timestampUs) {
-                onPacket(codec, data, size, timestampUs);
+                onVideoPacket(codec, data, size, timestampUs);
             },
             false,
             [this](Live555RtspClient::State state, const std::string& message) {
                 onRtspClientState(state, message);
+            },
+            [this](const AudioEncodedPacket& packet) {
+                onAudioPacket(packet);
             })) {
         setError("启动 live555 RTSP 客户端失败: " + m_client->lastError());
         m_started.store(false);
