@@ -27,6 +27,8 @@ if(NOT MCR_SYSROOT)
 endif()
 
 set(MCR_LIVE555_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/live555")
+set(MCR_GSOAP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gsoap")
+set(MCR_ONVIF_WSDD_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/ws-discovery")
 set(MCR_LIVE555_TARGET "rk3568" CACHE STRING "live555 静态库目标平台（rk3568 或 rv1126b）")
 set_property(CACHE MCR_LIVE555_TARGET PROPERTY STRINGS rk3568 rv1126b)
 set(MCR_LIVE555_LIBRARY_DIR "${MCR_LIVE555_ROOT}/lib/aarch64-${MCR_LIVE555_TARGET}")
@@ -42,6 +44,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/audio"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -185,6 +188,93 @@ function(mcr_link_live555 target)
         Threads::Threads
     )
 endfunction()
+
+# 自动生成检查：当本地缺少 gSOAP / ONVIF 自动绑定代码时，自动调用脚本生成。
+# 这样 Git 仓库无需提交 20MB 的 generated/ 目录，克隆后初次 CMake 会自动补齐。
+set(MCR_ONVIF_DEVICE_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/device")
+set(MCR_ONVIF_WSDD_GENERATED_C "${MCR_ONVIF_WSDD_GENERATED_DIR}/wsddC.c")
+set(MCR_ONVIF_DEVICE_GENERATED_C "${MCR_ONVIF_DEVICE_GENERATED_DIR}/onvifC.c")
+
+if(NOT EXISTS "${MCR_ONVIF_WSDD_GENERATED_C}")
+    message(STATUS "未检测到 ONVIF WS-Discovery 生成代码，正在自动生成...")
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate-onvif-wsdd.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _wsdd_res
+    )
+    if(NOT _wsdd_res EQUAL 0)
+        message(FATAL_ERROR "自动生成 ONVIF WS-Discovery 绑定失败，返回值: ${_wsdd_res}")
+    endif()
+endif()
+
+if(NOT EXISTS "${MCR_ONVIF_DEVICE_GENERATED_C}")
+    message(STATUS "未检测到 ONVIF Device/Media 生成代码，正在自动生成...")
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate-onvif-device-bindings.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _device_res
+    )
+    if(NOT _device_res EQUAL 0)
+        message(FATAL_ERROR "自动生成 ONVIF Device/Media 绑定失败，返回值: ${_device_res}")
+    endif()
+endif()
+
+# ONVIF 的 WS-Discovery 是低频 UDP 控制面。gSOAP 的生成代码与 runtime 单独收为
+# 一个静态库，避免污染现有 live555/媒体链路，也避免未来 Device/Media SOAP binding
+# 与 WSDD 使用不同 soapH 文件时相互干扰。
+add_library(mcr_gsoap_wsdd STATIC
+    third_party/gsoap/src/stdsoap2.c
+    third_party/gsoap/plugin/threads.c
+    third_party/gsoap/plugin/wsaapi.c
+    third_party/gsoap/plugin/wsddapi.c
+    generated/onvif/ws-discovery/wsddC.c
+    generated/onvif/ws-discovery/wsddClient.c
+    generated/onvif/ws-discovery/wsddNsmap.c
+)
+target_include_directories(mcr_gsoap_wsdd
+    PUBLIC
+        "${MCR_GSOAP_ROOT}/include"
+        "${MCR_GSOAP_ROOT}/plugin"
+        "${MCR_ONVIF_WSDD_GENERATED_DIR}"
+)
+# wsaapi.h 内部会对 SOAP_H_FILE 做字符串化，因此这里必须传 token，不能传字符串。
+target_compile_definitions(mcr_gsoap_wsdd PRIVATE SOAP_H_FILE=wsddH.h)
+target_compile_options(mcr_gsoap_wsdd PRIVATE -Wall -Wextra)
+target_link_libraries(mcr_gsoap_wsdd PUBLIC Threads::Threads)
+
+# This is intentionally separate from mcr_gsoap_wsdd while the discovery demo
+# remains standalone.  The future OnvifServer will link only this combined
+# Device-Service + WS-Discovery binding, which owns one gSOAP runtime and one
+# global XML namespace table.
+add_library(mcr_onvif_gsoap_bindings STATIC
+    third_party/gsoap/src/stdsoap2.c
+    third_party/gsoap/plugin/threads.c
+    third_party/gsoap/plugin/wsaapi.c
+    third_party/gsoap/plugin/wsddapi.c
+    generated/onvif/device/onvifC.c
+    generated/onvif/device/onvifClient.c
+    generated/onvif/device/onvifServer.c
+    generated/onvif/device/onvifNsmap.c
+    generated/onvif/device/onvifUnimplementedOps.c
+    src/core/onvif/OnvifSoapService.c
+)
+target_include_directories(mcr_onvif_gsoap_bindings PUBLIC
+    "${MCR_GSOAP_ROOT}/include"
+    "${MCR_GSOAP_ROOT}/plugin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/device"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
+)
+target_compile_definitions(mcr_onvif_gsoap_bindings PRIVATE SOAP_H_FILE=onvifH.h)
+target_compile_options(mcr_onvif_gsoap_bindings PRIVATE -Wall -Wextra)
+target_link_libraries(mcr_onvif_gsoap_bindings PUBLIC Threads::Threads)
+
+# 应用层只依赖这个 C++ 对象；gSOAP 的全局 C handler 与完整 WSDL 生成代码都留在
+# mcr_onvif_gsoap_bindings 内部，避免把协议生成细节扩散到 IpcApp。
+add_library(mcr_onvif_server STATIC
+    src/core/onvif/OnvifServer.cpp
+)
+target_include_directories(mcr_onvif_server PUBLIC ${MCR_PROJECT_INCLUDE_DIRS})
+target_link_libraries(mcr_onvif_server PUBLIC mcr_onvif_gsoap_bindings Threads::Threads)
 
 # FreeType 的头文件固定随项目放在 third_party；动态库随 RV1126B SDK 的 media_out 发布。
 # 以后 core/osd 接入时仍复用这个函数，不把 SDK 路径散落到业务 CMake 中。
@@ -336,7 +426,7 @@ if(MCR_BUILD_IPC_APP)
     )
     # mcr_rtsp_server 公开依赖 mcr_audio_core（AAC SDP 与 source 所需）；IPC 本身也通过
     # 这条传递依赖使用 AudioPipeline，避免在每个 app 重复列同一个音频库。
-    target_link_libraries(ipc_app PRIVATE mcr_rtsp_server)
+    target_link_libraries(ipc_app PRIVATE mcr_rtsp_server mcr_onvif_server)
     target_include_directories(ipc_app PRIVATE "${MCR_RKAIQ_INCLUDE_DIR}")
     target_link_libraries(ipc_app PRIVATE "${MCR_RKAIQ_LIBRARY}")
     mcr_link_freetype(ipc_app)
@@ -361,6 +451,29 @@ if(MCR_BUILD_IPC_APP)
 endif()
 
 if(MCR_BUILD_DEMOS)
+
+    # 第一阶段 ONVIF 验证：仅作为 WS-Discovery Target Service 回复 Probe。它不依赖
+    # 摄像头、MPP 或 live555，先单独验证组播收包与单播 ProbeMatches 的协议链路。
+    mcr_add_executable(onvif_ws_discovery_demo demo/OnvifWsDiscoveryDemo.c)
+    target_include_directories(onvif_ws_discovery_demo PRIVATE
+        "${MCR_GSOAP_ROOT}/include"
+        "${MCR_GSOAP_ROOT}/plugin"
+        "${MCR_ONVIF_WSDD_GENERATED_DIR}"
+    )
+    target_compile_definitions(onvif_ws_discovery_demo PRIVATE SOAP_H_FILE=wsddH.h)
+    target_link_libraries(onvif_ws_discovery_demo PRIVATE mcr_gsoap_wsdd)
+
+    mcr_add_executable(onvif_ws_discovery_probe_demo demo/OnvifWsDiscoveryProbeDemo.c)
+    target_include_directories(onvif_ws_discovery_probe_demo PRIVATE
+        "${MCR_GSOAP_ROOT}/include"
+        "${MCR_GSOAP_ROOT}/plugin"
+        "${MCR_ONVIF_WSDD_GENERATED_DIR}"
+    )
+    target_compile_definitions(onvif_ws_discovery_probe_demo PRIVATE SOAP_H_FILE=wsddH.h)
+    target_link_libraries(onvif_ws_discovery_probe_demo PRIVATE mcr_gsoap_wsdd)
+
+    mcr_add_executable(onvif_device_service_demo demo/OnvifDeviceServiceDemo.cpp)
+    target_link_libraries(onvif_device_service_demo PRIVATE mcr_onvif_server)
 
     # C++ AudioPipeline 图验证：raw PCM 分发、raw->Opus 与 APM->Opus 并发；运行中取消
     # APM 支路，确认不会干扰 raw 编码支路。
