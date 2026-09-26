@@ -4367,3 +4367,109 @@ write 异常实际发生并被 `prepare/recover` 后，才将 `recoveredFromDisc
 RTSP`，以及 `RTSP -> Decoder -> AudioPlaybackPipeline` 两条主数据流；再阅读三个边界状态：PCM timestamp
 断裂、ALSA capture XRUN、ALSA playback XRUN。FDK/Opus/WebRTC 内部实现按输入、输出、线程与失败语义使用即可，
 不需要逐行背诵。
+
+## 2026-09-26：ONVIF Target 与纯 C 客户端发现 / 查询链路
+
+### 目标
+
+在现有 RTSP IPC Target 基础上补齐 ONVIF 的最小可互操作闭环，并验证本项目未来作为
+NVR/客户端时能够发现 ONVIF 设备、取得其标准 RTSP URI。协议实现与项目 C++ 业务层分开：
+gSOAP 和 ONVIF 控制/发现层统一采用 C，避免 gSOAP 的生成代码、回调符号和 C++ ABI 混用。
+
+### 服务端能力
+
+`ipc_app` 内部持有 `OnvifServer`，与进程同寿命：启动时提供 Device Service、Media v1、Media2
+与 WS-Discovery；退出时按服务线程、socket、gSOAP context 的顺序停止。Device `GetServices`
+声明三个 endpoint；Media2 用于正确描述 H265 main stream，Media v1 保留给旧 ONVIF 客户端回退。
+
+当前设备服务地址为：
+
+```text
+http://<board-ip>:8899/onvif/device_service
+```
+
+服务端返回两个固定 Profile：
+
+| token | Media2 名称 | RTSP URI |
+|---|---|---|
+| `main` | `Main Stream (H265)` | `rtsp://<board-ip>:8554/main` |
+| `sub` | `Sub Stream (H264)` | `rtsp://<board-ip>:8554/sub` |
+
+### gSOAP 与生成方式
+
+完整 gSOAP 源码置于 `third_party/gsoap/`，ONVIF WSDL/XSD 置于 `third_party/onvif-specs/`。
+生成文件位于被忽略的 `generated/`，不作为手写源提交；需要重新生成时执行：
+
+```bash
+tools/generate-onvif-device-bindings.sh
+tools/generate-onvif-wsdd.sh
+```
+
+`tools/gsoap-typemap.dat` 固定 ONVIF 的 namespace prefix（包括 `tr2`），避免 generator 在
+Media2 上产生不稳定的匿名 prefix。WS-Discovery 生成脚本还显式写入 `dn` namespace，确保发出的
+`dn:NetworkVideoTransmitter` Probe 类型有正确 XML namespace 绑定。
+
+### 客户端 C API
+
+ONVIF 客户端层不暴露 `struct soap*`、生成的 WSDL 类型或 C++ 容器，所有结果都深拷贝到固定容量 C 值对象：
+
+```text
+onvif_discover_devices()
+    -> OnvifDiscoveredDevices
+
+onvif_device_get_media_service_urls()
+    -> OnvifMediaServiceUrls
+
+onvif_media2_get_stream_profiles()
+    -> OnvifDeviceStreamProfiles
+    -> Media v1 作为调用方回退
+```
+
+每次 SOAP 请求独占一个 gSOAP context，严格执行：
+
+```text
+soap_init1 -> SOAP 调用/拷贝结果 -> soap_destroy -> soap_end -> soap_done
+```
+
+`GetProfiles` 的 token/name 会先复制为临时 C 值数组，再以新 context 为每个 profile 调用
+`GetStreamUri`；因此不会在 `soap_end()` 后引用反序列化响应内存。
+
+### 独立审查后的可靠性修复
+
+Gemini 对未提交 ONVIF client 代码进行只读审查后，确认生命周期、C ABI 和 client/server binding
+物理隔离正确；以下问题已修复：
+
+1. WS-Discovery 的 UDP ProbeMatch 允许设备重传。原先仅在上层去重，底层固定 32 个槽可能先被重复
+   回复占满，导致后到设备被静默丢弃。现在 `OnvifWsddClient.c` 在写入槽位前按 EPR **或** Device XAddr
+   去重，上层同样使用对称的 EPR/XAddr 比较作防御。
+2. Media2 或 Media v1 `GetStreamUri` 虽返回 SOAP_OK、但 URI 为空时，不再计为有效 profile；若 Media2
+   所有 URI 都无效，调用方可以正确回退到 Media v1。
+3. 空 Service URL、零个可用 Profile、gSOAP 返回 size 大于零却没有数组指针等异常路径现在都会写入
+   明确错误文本，不再让现场日志出现空白失败原因。
+4. Profile 临时描述只保存 token/name，避免在栈上为每条临时记录保留完整 URI 输出字段。
+
+注意：`mcr_onvif_discovery` 对 `mcr_onvif_client_gsoap_bindings` 保持 `PUBLIC` 链接是有意的。
+前者是静态库，最终消费者仍需要解析其引用的 gSOAP 符号；改成 `PRIVATE` 会在静态库被最终链接时丢失
+传递依赖。
+
+### 验证
+
+RK3568（`192.168.1.3`）运行 `/tmp/onvif_discovery_client_demo 3000` 发现 RV1126B
+（`192.168.1.4`）并完成：
+
+```text
+WS-Discovery
+  -> Device.GetServices
+  -> Media2.GetProfiles
+  -> Media2.GetStreamUri(main/sub)
+```
+
+实测返回：
+
+```text
+Main Stream (H265), token=main, rtsp://192.168.1.4:8554/main
+Sub Stream (H264),  token=sub,  rtsp://192.168.1.4:8554/sub
+```
+
+`onvif_discovery_client_demo` 的 RK3568 交叉编译通过；RV1126B `ipc_app` 交叉编译通过；
+`git diff --check` 通过。本次只部署客户端 demo 到 `/tmp` 做验证，未替换板端自启动 IPC 二进制。

@@ -15,3 +15,9 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 "${GENERATOR}" -c -a -L -pwsdd -I"${IMPORT_DIR}" -d "${OUTPUT_DIR}" "${IMPORT_DIR}/wsdd5.h"
+
+# wsdd5.h itself has no ONVIF Network namespace, but ONVIF Discovery uses the
+# QName dn:NetworkVideoTransmitter in Probe Types.  Declare it in the generated
+# namespace table so outgoing Probes are valid XML instead of an unbound prefix.
+sed -i '/{ "wsdd", "http:\/\/schemas.xmlsoap.org\/ws\/2005\/04\/discovery"/a\        { "dn", "http://www.onvif.org/ver10/network/wsdl", NULL, NULL },' \
+    "${OUTPUT_DIR}/wsdd.nsmap"

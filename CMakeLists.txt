@@ -242,6 +242,38 @@ target_compile_definitions(mcr_gsoap_wsdd PRIVATE SOAP_H_FILE=wsddH.h)
 target_compile_options(mcr_gsoap_wsdd PRIVATE -Wall -Wextra)
 target_link_libraries(mcr_gsoap_wsdd PUBLIC Threads::Threads)
 
+# 纯 ONVIF 客户端 binding：含 Discovery、Device/Media/Media2 的客户端桩，刻意不含
+# OnvifSoapService.c 与生成的 onvifServer.c。后两者拥有 Target Service 的全局
+# wsdd_event_* 回调，不能与客户端 ProbeMatch 回调出现在同一进程。
+add_library(mcr_onvif_client_gsoap_bindings STATIC
+    third_party/gsoap/src/stdsoap2.c
+    third_party/gsoap/plugin/threads.c
+    third_party/gsoap/plugin/wsaapi.c
+    third_party/gsoap/plugin/wsddapi.c
+    generated/onvif/device/onvifC.c
+    generated/onvif/device/onvifClient.c
+    generated/onvif/device/onvifNsmap.c
+    src/core/onvif/OnvifWsddClient.c
+    src/core/onvif/OnvifDeviceClient.c
+)
+target_include_directories(mcr_onvif_client_gsoap_bindings PUBLIC
+    "${MCR_GSOAP_ROOT}/include"
+    "${MCR_GSOAP_ROOT}/plugin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/device"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
+)
+target_compile_definitions(mcr_onvif_client_gsoap_bindings PRIVATE SOAP_H_FILE=onvifH.h)
+target_compile_options(mcr_onvif_client_gsoap_bindings PRIVATE -Wall -Wextra)
+target_link_libraries(mcr_onvif_client_gsoap_bindings PUBLIC Threads::Threads)
+
+# ONVIF 客户端协议层是纯 C：不泄漏 gSOAP 类型；它与 OnvifServer 是两个可独立链接的
+# 角色库，NVR/客户端进程链接前者，IPC Target Service 链接后者。
+add_library(mcr_onvif_discovery STATIC
+    src/core/onvif/OnvifDiscoveryClient.c
+)
+target_include_directories(mcr_onvif_discovery PUBLIC ${MCR_PROJECT_INCLUDE_DIRS})
+target_link_libraries(mcr_onvif_discovery PUBLIC mcr_onvif_client_gsoap_bindings Threads::Threads)
+
 # This is intentionally separate from mcr_gsoap_wsdd while the discovery demo
 # remains standalone.  The future OnvifServer will link only this combined
 # Device-Service + WS-Discovery binding, which owns one gSOAP runtime and one
@@ -474,6 +506,11 @@ if(MCR_BUILD_DEMOS)
 
     mcr_add_executable(onvif_device_service_demo demo/OnvifDeviceServiceDemo.cpp)
     target_link_libraries(onvif_device_service_demo PRIVATE mcr_onvif_server)
+
+    # 客户端第一阶段：只验证 WS-Discovery Probe/ProbeMatch，输出 Device Service XAddr。
+    # 上层再以此 XAddr 调用 C 协议层请求 GetServices / Media Profiles。
+    mcr_add_executable(onvif_discovery_client_demo demo/OnvifDiscoveryClientDemo.cpp)
+    target_link_libraries(onvif_discovery_client_demo PRIVATE mcr_onvif_discovery)
 
     # C++ AudioPipeline 图验证：raw PCM 分发、raw->Opus 与 APM->Opus 并发；运行中取消
     # APM 支路，确认不会干扰 raw 编码支路。

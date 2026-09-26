@@ -11,6 +11,7 @@ media_wsdl="${base_dir}/third_party/onvif-specs/wsdl/ver10/media/wsdl/media.wsdl
 media2_wsdl="${base_dir}/third_party/onvif-specs/wsdl/ver20/media/wsdl/media.wsdl"
 output_dir="${base_dir}/generated/onvif/device"
 interface_header="${output_dir}/onvif_device.h"
+typemap="${base_dir}/tools/gsoap-typemap.dat"
 
 if [[ ! -x "${tools_dir}/wsdl2h" || ! -x "${tools_dir}/soapcpp2" ]]; then
     echo "gSOAP host generators are missing under ${tools_dir}" >&2
@@ -21,7 +22,7 @@ mkdir -p "${output_dir}"
 
 # Keep the official Device, Media v1 and Media2 WSDL surfaces intact. wsdl2h resolves the
 # OASIS schema imports referenced by the upstream ONVIF schema on refresh.
-"${tools_dir}/wsdl2h" -c -s -L -o "${interface_header}" \
+"${tools_dir}/wsdl2h" -c -s -L -t "${typemap}" -o "${interface_header}" \
     "${device_wsdl}" "${media_wsdl}" "${media2_wsdl}"
 
 # One process must use one generated namespace table. Importing WS-Discovery
@@ -55,9 +56,9 @@ awk '
         implemented["__trt__GetProfile"] = 1
         implemented["__trt__GetProfiles"] = 1
         implemented["__trt__GetStreamUri"] = 1
-        implemented["__ns1__GetServiceCapabilities"] = 1
-        implemented["__ns1__GetProfiles"] = 1
-        implemented["__ns1__GetStreamUri"] = 1
+        implemented["__tr2__GetServiceCapabilities"] = 1
+        implemented["__tr2__GetProfiles"] = 1
+        implemented["__tr2__GetStreamUri"] = 1
         print "/* Generated fallback handlers for currently unsupported ONVIF Device/Media operations. */"
         print "#include \"stdsoap2.h\""
     }

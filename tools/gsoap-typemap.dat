@@ -1,0 +1,17 @@
+# Minimal project typemap for the ONVIF Device/Media binding generator.
+#
+# wsdl2h otherwise invents an `ns1` import for WS-Addressing, while this
+# project vendors the corresponding standard gSOAP declaration as wsa5.h.
+[
+#import "wsa5.h"
+]
+
+wsa5 = <http://www.w3.org/2005/08/addressing>
+
+# Keep stable, readable C prefixes for the ONVIF namespaces implemented by
+# OnvifSoapService.c. Without these entries wsdl2h assigns volatile nsN names
+# based on WSDL import order, which breaks the generated handler contract.
+tt  = "http://www.onvif.org/ver10/schema"
+tds = "http://www.onvif.org/ver10/device/wsdl"
+trt = "http://www.onvif.org/ver10/media/wsdl"
+tr2 = "http://www.onvif.org/ver20/media/wsdl"

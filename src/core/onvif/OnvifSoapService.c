@@ -528,17 +528,17 @@ static struct tt__AudioEncoder2Configuration *fill_media2_audio_encoder(
     return audio;
 }
 
-static int fill_media2_profile(struct soap *soap, struct ns1__MediaProfile *profile,
+static int fill_media2_profile(struct soap *soap, struct tr2__MediaProfile *profile,
                                const char *token, const char *name, int is_sub)
 {
-    struct ns1__ConfigurationSet *configs;
+    struct tr2__ConfigurationSet *configs;
     profile->Name = soap_copy_text(soap, name);
     profile->token = soap_copy_text(soap, token);
     profile->fixed = soap_boolean(soap, xsd__boolean__true_);
     if (profile->Name == NULL || profile->token == NULL || profile->fixed == NULL)
         return SOAP_EOM;
 
-    configs = (struct ns1__ConfigurationSet *)soap_calloc(soap, sizeof(*configs));
+    configs = (struct tr2__ConfigurationSet *)soap_calloc(soap, sizeof(*configs));
     if (configs == NULL)
         return SOAP_EOM;
 
@@ -560,17 +560,17 @@ static int fill_media2_profile(struct soap *soap, struct ns1__MediaProfile *prof
     return SOAP_OK;
 }
 
-int __ns1__GetServiceCapabilities(struct soap *soap,
-                                  struct _ns1__GetServiceCapabilities *request,
-                                  struct _ns1__GetServiceCapabilitiesResponse *response)
+int __tr2__GetServiceCapabilities(struct soap *soap,
+                                  struct _tr2__GetServiceCapabilities *request,
+                                  struct _tr2__GetServiceCapabilitiesResponse *response)
 {
-    struct ns1__Capabilities2 *capabilities;
-    struct ns1__ProfileCapabilities *profiles;
-    struct ns1__StreamingCapabilities *streaming;
+    struct tr2__Capabilities2 *capabilities;
+    struct tr2__ProfileCapabilities *profiles;
+    struct tr2__StreamingCapabilities *streaming;
     (void)request;
-    capabilities = (struct ns1__Capabilities2 *)soap_calloc(soap, sizeof(*capabilities));
-    profiles = (struct ns1__ProfileCapabilities *)soap_calloc(soap, sizeof(*profiles));
-    streaming = (struct ns1__StreamingCapabilities *)soap_calloc(soap, sizeof(*streaming));
+    capabilities = (struct tr2__Capabilities2 *)soap_calloc(soap, sizeof(*capabilities));
+    profiles = (struct tr2__ProfileCapabilities *)soap_calloc(soap, sizeof(*profiles));
+    streaming = (struct tr2__StreamingCapabilities *)soap_calloc(soap, sizeof(*streaming));
     if (capabilities == NULL || profiles == NULL || streaming == NULL)
         return SOAP_EOM;
     profiles->MaximumNumberOfProfiles = (int *)soap_calloc(soap, sizeof(*profiles->MaximumNumberOfProfiles));
@@ -587,15 +587,15 @@ int __ns1__GetServiceCapabilities(struct soap *soap,
     return SOAP_OK;
 }
 
-int __ns1__GetProfiles(struct soap *soap, struct _ns1__GetProfiles *request,
-                       struct _ns1__GetProfilesResponse *response)
+int __tr2__GetProfiles(struct soap *soap, struct _tr2__GetProfiles *request,
+                       struct _tr2__GetProfilesResponse *response)
 {
-    struct ns1__MediaProfile *profiles;
+    struct tr2__MediaProfile *profiles;
     if (request != NULL && request->Token != NULL && *request->Token != '\0') {
         const int is_sub = strcmp(request->Token, "sub") == 0;
         if (strcmp(request->Token, "main") != 0 && !is_sub)
             return SOAP_FAULT;
-        profiles = (struct ns1__MediaProfile *)soap_calloc(soap, sizeof(*profiles));
+        profiles = (struct tr2__MediaProfile *)soap_calloc(soap, sizeof(*profiles));
         if (profiles == NULL)
             return SOAP_EOM;
         if (fill_media2_profile(soap, profiles, is_sub ? "sub" : "main",
@@ -606,7 +606,7 @@ int __ns1__GetProfiles(struct soap *soap, struct _ns1__GetProfiles *request,
         return SOAP_OK;
     }
 
-    profiles = (struct ns1__MediaProfile *)soap_calloc(soap, 2 * sizeof(*profiles));
+    profiles = (struct tr2__MediaProfile *)soap_calloc(soap, 2 * sizeof(*profiles));
     if (profiles == NULL)
         return SOAP_EOM;
     if (fill_media2_profile(soap, &profiles[0], "main", "Main Stream (H265)", 0) != SOAP_OK ||
@@ -618,8 +618,8 @@ int __ns1__GetProfiles(struct soap *soap, struct _ns1__GetProfiles *request,
     return SOAP_OK;
 }
 
-int __ns1__GetStreamUri(struct soap *soap, struct _ns1__GetStreamUri *request,
-                        struct _ns1__GetStreamUriResponse *response)
+int __tr2__GetStreamUri(struct soap *soap, struct _tr2__GetStreamUri *request,
+                        struct _tr2__GetStreamUriResponse *response)
 {
     const OnvifSoapServiceConfig *config = service_config(soap);
     const char *rtsp_url;
