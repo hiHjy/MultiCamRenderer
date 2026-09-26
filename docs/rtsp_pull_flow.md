@@ -31,7 +31,7 @@ DecodeWorker 线程
 
 ## 1. 程序入口
 
-示例入口是 `demo/RtspStreamDemo.cpp`：
+示例入口是 `demo/rtsp/RtspStreamDemo.cpp`：
 
 ```cpp
 RtspStream stream("rtsp://192.168.1.5:8554/live", 2);

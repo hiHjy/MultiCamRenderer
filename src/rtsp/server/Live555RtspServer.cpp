@@ -118,6 +118,12 @@ bool Live555RtspServer::start(unsigned short rtspPort,
         setErrorLocked("RTSP Server 未注册任何 stream");
         return false;
     }
+    // 与 OnvifServer 的认证配置语义保持一致：账号和密码要么一起提供，要么一起关闭。
+    // 否则 ONVIF 会拒绝启动、RTSP 却建立不完整认证库，两个入口的行为会分叉。
+    if (username.empty() != password.empty()) {
+        setErrorLocked("RTSP 认证必须同时提供用户名和密码，或两者均留空关闭认证");
+        return false;
+    }
 
     m_rtspPort = rtspPort == 0 ? 8554 : rtspPort;
     m_username = username;

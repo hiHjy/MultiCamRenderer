@@ -4367,3 +4367,192 @@ write 异常实际发生并被 `prepare/recover` 后，才将 `recoveredFromDisc
 RTSP`，以及 `RTSP -> Decoder -> AudioPlaybackPipeline` 两条主数据流；再阅读三个边界状态：PCM timestamp
 断裂、ALSA capture XRUN、ALSA playback XRUN。FDK/Opus/WebRTC 内部实现按输入、输出、线程与失败语义使用即可，
 不需要逐行背诵。
+
+## 2026-09-26：ONVIF Target 与纯 C 客户端发现 / 查询链路
+
+### 目标
+
+在现有 RTSP IPC Target 基础上补齐 ONVIF 的最小可互操作闭环，并验证本项目未来作为
+NVR/客户端时能够发现 ONVIF 设备、取得其标准 RTSP URI。协议实现与项目 C++ 业务层分开：
+gSOAP 和 ONVIF 控制/发现层统一采用 C，避免 gSOAP 的生成代码、回调符号和 C++ ABI 混用。
+
+### 服务端能力
+
+`ipc_app` 内部持有 `OnvifServer`，与进程同寿命：启动时提供 Device Service、Media v1、Media2
+与 WS-Discovery；退出时按服务线程、socket、gSOAP context 的顺序停止。Device `GetServices`
+声明三个 endpoint；Media2 用于正确描述 H265 main stream，Media v1 保留给旧 ONVIF 客户端回退。
+
+当前设备服务地址为：
+
+```text
+http://<board-ip>:8899/onvif/device_service
+```
+
+服务端返回两个固定 Profile：
+
+| token | Media2 名称 | RTSP URI |
+|---|---|---|
+| `main` | `Main Stream (H265)` | `rtsp://<board-ip>:8554/main` |
+| `sub` | `Sub Stream (H264)` | `rtsp://<board-ip>:8554/sub` |
+
+### gSOAP 与生成方式
+
+完整 gSOAP 源码置于 `third_party/gsoap/`，ONVIF WSDL/XSD 置于 `third_party/onvif-specs/`。
+生成文件位于被忽略的 `generated/`，不作为手写源提交；需要重新生成时执行：
+
+```bash
+tools/generate-onvif-device-bindings.sh
+tools/generate-onvif-wsdd.sh
+```
+
+`tools/gsoap-typemap.dat` 固定 ONVIF 的 namespace prefix（包括 `tr2`），避免 generator 在
+Media2 上产生不稳定的匿名 prefix。WS-Discovery 生成脚本还显式写入 `dn` namespace，确保发出的
+`dn:NetworkVideoTransmitter` Probe 类型有正确 XML namespace 绑定。
+
+### 客户端 C API
+
+ONVIF 客户端层不暴露 `struct soap*`、生成的 WSDL 类型或 C++ 容器，所有结果都深拷贝到固定容量 C 值对象：
+
+```text
+onvif_discover_devices()
+    -> OnvifDiscoveredDevices
+
+onvif_device_get_media_service_urls()
+    -> OnvifMediaServiceUrls
+
+onvif_media2_get_stream_profiles()
+    -> OnvifDeviceStreamProfiles
+    -> Media v1 作为调用方回退
+```
+
+每次 SOAP 请求独占一个 gSOAP context，严格执行：
+
+```text
+soap_init1 -> SOAP 调用/拷贝结果 -> soap_destroy -> soap_end -> soap_done
+```
+
+`GetProfiles` 的 token/name 会先复制为临时 C 值数组，再以新 context 为每个 profile 调用
+`GetStreamUri`；因此不会在 `soap_end()` 后引用反序列化响应内存。
+
+### 独立审查后的可靠性修复
+
+Gemini 对未提交 ONVIF client 代码进行只读审查后，确认生命周期、C ABI 和 client/server binding
+物理隔离正确；以下问题已修复：
+
+1. WS-Discovery 的 UDP ProbeMatch 允许设备重传。原先仅在上层去重，底层固定 32 个槽可能先被重复
+   回复占满，导致后到设备被静默丢弃。现在 `OnvifWsddClient.c` 在写入槽位前按 EPR **或** Device XAddr
+   去重，上层同样使用对称的 EPR/XAddr 比较作防御。
+2. Media2 或 Media v1 `GetStreamUri` 虽返回 SOAP_OK、但 URI 为空时，不再计为有效 profile；若 Media2
+   所有 URI 都无效，调用方可以正确回退到 Media v1。
+3. 空 Service URL、零个可用 Profile、gSOAP 返回 size 大于零却没有数组指针等异常路径现在都会写入
+   明确错误文本，不再让现场日志出现空白失败原因。
+4. Profile 临时描述只保存 token/name，避免在栈上为每条临时记录保留完整 URI 输出字段。
+
+注意：`mcr_onvif_discovery` 对 `mcr_onvif_client_gsoap_bindings` 保持 `PUBLIC` 链接是有意的。
+前者是静态库，最终消费者仍需要解析其引用的 gSOAP 符号；改成 `PRIVATE` 会在静态库被最终链接时丢失
+传递依赖。
+
+### 验证
+
+RK3568（`192.168.1.3`）运行 `/tmp/onvif_discovery_client_demo 3000` 发现 RV1126B
+（`192.168.1.4`）并完成：
+
+```text
+WS-Discovery
+  -> Device.GetServices
+  -> Media2.GetProfiles
+  -> Media2.GetStreamUri(main/sub)
+```
+
+实测返回：
+
+```text
+Main Stream (H265), token=main, rtsp://192.168.1.4:8554/main
+Sub Stream (H264),  token=sub,  rtsp://192.168.1.4:8554/sub
+```
+
+`onvif_discovery_client_demo` 的 RK3568 交叉编译通过；RV1126B `ipc_app` 交叉编译通过；
+`git diff --check` 通过。本次只部署客户端 demo 到 `/tmp` 做验证，未替换板端自启动 IPC 二进制。
+
+## 2026-09-26：ONVIF Digest 认证、动态网络地址与目录整理
+
+### 本轮收口目标
+
+在已有 ONVIF 最小发现、Device、Media v1/Media2 能力上补齐实际设备接入所需的认证与网络恢复语义：
+
+- ONVIF HTTP Digest 与 RTSP Digest 使用同一份应用配置的账号密码；
+- ONVIF 在 DHCP 尚未完成、网络稍后恢复、或 IP 变化时能够重新上线，并返回当前 IP 的 RTSP URI；
+- 客户端能够区分“需要认证”“密码错误”和普通请求失败；
+- 将 ONVIF 从 `core/` 移到协议边界，并把 demo 按领域分类，降低后续查找成本。
+
+当前 IPC 示例账号为 `admin/admin`。这是开发阶段的统一默认值；未来接入持久化配置、修改密码和用户管理时，
+只需替换 `IpcApp` 的配置来源，RTSP 与 ONVIF 仍会自然使用同一组凭据。
+
+### 服务端认证与网络行为
+
+1. 引入 gSOAP 官方 `httpda` 插件，并在 ONVIF Device、Media v1、Media2 的已实现操作入口统一验证
+   HTTP Digest。未携带或验证失败的请求返回 HTTP 401 挑战；WS-Discovery 仍保持匿名，因为发现阶段本身
+   不承载账户信息。
+2. RTSP `Live555RtspServer` 对齐 ONVIF 的凭据校验规则：用户名和密码必须同时提供，或同时为空关闭认证，
+   避免出现 RTSP 已启认证而 ONVIF 启动失败的边缘配置。
+3. `OnvifServerConfig` 不再保存启动时拼出的完整 RTSP URL，只保存 `rtspPort`。每次网络服务准备启动时，
+   都根据刚探测到的本机 IPv4 动态构造：
+
+   ```text
+   rtsp://<当前IPv4>:8554/main
+   rtsp://<当前IPv4>:8554/sub
+   ```
+
+   因此冷启动时网络未就绪不会导致 ONVIF 永久退出；网络监视线程会继续等待可用 IPv4。DHCP 地址变化时，
+   ONVIF HTTP/WS-Discovery 服务会以新地址重新建立，随后返回的新 URI 不会残留旧 IP。
+4. WS-Discovery UDP socket 设置 `SO_REUSEADDR`，方便服务快速重启以及与同主机的其他 discovery socket
+   协作。它不是绕过端口独占的手段；若别的程序以独占方式占用端口，绑定仍会失败并记录明确错误。
+5. 预期的 HTTP 401 是 Digest 握手的第一步，不再被服务端当作异常 SOAP fault 刷屏。
+
+### 客户端认证语义
+
+`OnvifDeviceClient` 保持纯 C API，同时新增可供上层 UI/配置层直接判断的结果：
+
+```text
+ONVIF_CLIENT_OK
+ONVIF_CLIENT_AUTHENTICATION_REQUIRED
+ONVIF_CLIENT_AUTHENTICATION_FAILED
+ONVIF_CLIENT_REQUEST_FAILED
+```
+
+每个 SOAP 调用的行为为“无认证请求 -> 收到 401/realm/nonce -> 若调用方提供凭据则用 Digest 自动重试”。
+调用结束立即释放 Digest 临时状态，不记录密码到日志或 URI。空密码本身是合法 Digest 凭据，因此只要求
+用户名非空、password 指针有效，不再错误地把 `admin + 空密码` 一律视为没有凭据。
+
+Media2 到 Media v1 的兼容回退只在普通请求失败时发生；认证所需或认证失败会原样返回，不能被后续
+Media v1 失败覆盖。`demo/onvif/OnvifDiscoveryClientDemo.cpp` 支持：
+
+```bash
+onvif_discovery_client_demo [timeout-ms] [username password]
+```
+
+### 目录整理
+
+- ONVIF 属于网络协议层，不再放在 `include/core/onvif`、`src/core/onvif`，统一移动到
+  `include/onvif`、`src/onvif`。
+- `demo/` 按 `audio`、`camera`、`codec`、`memory`、`onvif`、`osd`、`rtsp` 等领域归档；
+  CMake target 名保持不变，并新增 `demo/README.md` 作为导航。
+- gSOAP 的 Digest/WS-Security 辅助源码随第三方依赖保存，交叉编译时通过 SDK OpenSSL 链接，避免依赖
+  板端临时文件。
+
+### 构建、板端与协议验证
+
+- `./wsl-build-ipc.sh` 通过；ONVIF Device 服务 demo、发现客户端 demo 及目录变更后的相关 demo target
+  均通过交叉构建。
+- RV1126B (`192.168.1.4`) 已替换 `/oem/usr/bin/multicam_ipc_app` 为本轮版本，进程日志确认 ONVIF
+  Device Service、WS-Discovery 和 RTSP 均正常启动。
+- RK3568 (`192.168.1.3`) 运行发现客户端实测：
+
+  | 调用凭据 | 结果 |
+  | --- | --- |
+  | 未提供 | 正确返回 `AUTHENTICATION_REQUIRED` |
+  | `admin` + 错误密码 | 正确返回 `AUTHENTICATION_FAILED` |
+  | `admin/admin` | 取得 `main` H265 与 `sub` H264 的 Media2 Profile 和 RTSP URI |
+
+这一阶段 ONVIF 已完成“被发现 -> Digest 认证 -> 查询 profile -> 获得受同一账号保护的 RTSP URI”的最小
+设备互操作闭环。PTZ、事件、网络配置、用户管理等服务留待确有产品需求时按 WSDL 操作逐项实现。

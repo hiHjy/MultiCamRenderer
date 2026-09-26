@@ -75,8 +75,8 @@ cat > "$BASE/compile_commands.base.json" <<EOF
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/camera_capture_demo.cpp -o $BASE/build/camera_capture_demo.o",
-    "file": "$BASE/demo/camera_capture_demo.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/camera/camera_capture_demo.cpp -o $BASE/build/camera_capture_demo.o",
+    "file": "$BASE/demo/camera/camera_capture_demo.cpp"
   },
   {
     "directory": "$BASE",
@@ -85,8 +85,8 @@ cat > "$BASE/compile_commands.base.json" <<EOF
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/dma_allocator_demo.cpp -o $BASE/build/dma_allocator_demo.o",
-    "file": "$BASE/demo/dma_allocator_demo.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/memory/dma_allocator_demo.cpp -o $BASE/build/dma_allocator_demo.o",
+    "file": "$BASE/demo/memory/dma_allocator_demo.cpp"
   },
   {
     "directory": "$BASE",
@@ -100,8 +100,8 @@ cat > "$BASE/compile_commands.base.json" <<EOF
   },
   {
     "directory": "$BASE",
-    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/v4l2_probe_demo.cpp -o $BASE/build/v4l2_probe_demo.o",
-    "file": "$BASE/demo/v4l2_probe_demo.cpp"
+    "command": "$CXX_ABS --sysroot=$STAGING_DIR -std=c++17 $CXXFLAGS -Wall -Wextra $PROJECT_INCLUDE_FLAGS -c $BASE/demo/camera/v4l2_probe_demo.cpp -o $BASE/build/v4l2_probe_demo.o",
+    "file": "$BASE/demo/camera/v4l2_probe_demo.cpp"
   },
   {
     "directory": "$BASE",
@@ -116,7 +116,7 @@ set -x
     $PROJECT_INCLUDE_FLAGS \
     "$BASE/src/core/memory/DmaAllocator.cpp" \
     "$BASE/src/core/cam/V4L2CameraSource.cpp" \
-    "$BASE/demo/camera_capture_demo.cpp" \
+    "$BASE/demo/camera/camera_capture_demo.cpp" \
     -o "$BASE/build/camera_capture_demo"
 "$STRIP" "$BASE/build/camera_capture_demo" || true
 
@@ -133,7 +133,7 @@ set -x
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
     $PROJECT_INCLUDE_FLAGS \
     "$BASE/src/core/memory/DmaAllocator.cpp" \
-    "$BASE/demo/dma_allocator_demo.cpp" \
+    "$BASE/demo/memory/dma_allocator_demo.cpp" \
     -o "$BASE/build/dma_allocator_demo"
 "$STRIP" "$BASE/build/dma_allocator_demo" || true
 
@@ -167,7 +167,7 @@ set -x
 "$CXX" -std=c++17 -Wall -Wextra -O2 -g0 \
     $PROJECT_INCLUDE_FLAGS \
     "$BASE/src/core/cam/V4L2DeviceProbe.cpp" \
-    "$BASE/demo/v4l2_probe_demo.cpp" \
+    "$BASE/demo/camera/v4l2_probe_demo.cpp" \
     -o "$BASE/build/v4l2_probe_demo"
 "$STRIP" "$BASE/build/v4l2_probe_demo" || true
 set +x

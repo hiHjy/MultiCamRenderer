@@ -4,6 +4,7 @@
 #include "IspController.hpp"
 #include "Live555RtspServer.hh"
 #include "Log.hpp"
+#include "OnvifServer.hpp"
 #include "RtspAudioPublishSink.hpp"
 #include "RtspPublishSink.hpp"
 
@@ -19,6 +20,11 @@ namespace {
 constexpr char kMainDevicePath[] = "/dev/video33"; // rkvpss_scale0
 constexpr char kSubDevicePath[] = "/dev/video34";  // rkvpss_scale1
 constexpr unsigned short kRtspPort = 8554;
+constexpr unsigned short kOnvifDeviceServicePort = 8899;
+// 第一版固定管理员账号。后续接入 ONVIF CreateUsers/SetUser 或本机配置文件时，
+// 只替换这组凭据的来源；RTSP 与 ONVIF 必须始终使用同一套账号。
+constexpr char kAdministratorUsername[] = "admin";
+constexpr char kAdministratorPassword[] = "admin";
 constexpr int kCameraFps = 30;
 constexpr int kCameraBufferCount = 6;
 // 字体是系统运行资源，不嵌进程序或项目源码。量产 rootfs 需在此路径部署一份
@@ -53,6 +59,7 @@ int main()
 
     CamManager cameraManager;
     Live555RtspServer rtspServer;
+    OnvifServer onvifServer;
     AudioPipeline audioPipeline;
     AudioDiagnosticCapture audioDiagnosticCapture;
 
@@ -157,14 +164,28 @@ int main()
         return 1;
     }
 
-    // 空用户名/密码表示不启用认证。
-    if (!rtspServer.start(kRtspPort, "", "")) {
+    if (!rtspServer.start(kRtspPort, kAdministratorUsername, kAdministratorPassword)) {
         LOG_ERROR("IpcApp", "启动 RTSP Server 失败: " << rtspServer.lastError());
         audioPublishSink.reset();
         audioPipeline.stopCapture();
         cameraManager.stopAllCameras();
         cameraManager.shutdownPolling();
         return 1;
+    }
+
+    // IpcApp 只提供自身的媒体资源；IP/MAC 选择、DHCP 换址重启和 Discovery 生命周期
+    // 都是 OnvifServer 的内部职责，避免把协议细节散落在应用主循环。
+    OnvifServerConfig onvifConfig;
+    onvifConfig.deviceServicePort = kOnvifDeviceServicePort;
+    onvifConfig.rtspPort = kRtspPort;
+    onvifConfig.username = kAdministratorUsername;
+    onvifConfig.password = kAdministratorPassword;
+    if (!onvifServer.start(onvifConfig)) {
+        LOG_WARN("IpcApp", "ONVIF 配置非法，未启动: " << onvifServer.lastError());
+    } else if (onvifServer.isRunning()) {
+        LOG_INFO("IpcApp", "ONVIF Device/Media Service 已就绪 url=" << onvifServer.deviceServiceUrl());
+    } else {
+        LOG_WARN("IpcApp", "ONVIF 正等待可用网络: " << onvifServer.lastError());
     }
 
     LOG_INFO("IpcApp", "IPC RTSP 服务已就绪（两路 VPSS 保持采集；无视频客户端时不编码；"
@@ -205,11 +226,13 @@ int main()
                                     << " lastAlsaError=" << audioStatistics.lastError);
         }
         lastAudioCaptureStatistics = audioStatistics;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     LOG_INFO("IpcApp", "收到退出信号，正在停止 IPC RTSP 服务");
     audioDiagnosticCapture.cancel();
+    onvifServer.stop();
     rtspServer.stop();
     audioPublishSink.reset();
     audioPipeline.stopCapture();
