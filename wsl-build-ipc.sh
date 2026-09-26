@@ -6,6 +6,9 @@ set -euo pipefail
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SDK_ROOT="/home/hjy/2026-07-18/rv1126b_linux_ipc_xiaoyu"
 MEDIA_ROOT="${SDK_ROOT}/output/out/media_out"
+# gSOAP 的 ONVIF HTTP Digest 插件需要 OpenSSL；它属于完整 RV1126B rootfs，
+# 不在 media_out 中。该目录同时提供交叉编译头文件与板端一致的 ABI 库。
+OPENSSL_ROOT="${SDK_ROOT}/sysdrv/out/rootfs_glibc_rv1126b"
 BUILD_DIR="${BASE}/build/rv1126b-aarch64"
 TOOLCHAIN_FILE="${BASE}/cmake/rv1126b-aarch64-toolchain.cmake"
 MODE="${1:-build}"
@@ -21,7 +24,8 @@ cmake -S "${BASE}" -B "${BUILD_DIR}" -G Ninja \
     -DMCR_BUILD_DEMOS=OFF \
     -DMCR_BUILD_QT=OFF \
     -DMCR_BUILD_IPC_APP=ON \
-    -DMCR_MEDIA_ROOT="${MEDIA_ROOT}"
+    -DMCR_MEDIA_ROOT="${MEDIA_ROOT}" \
+    -DMCR_ONVIF_OPENSSL_ROOT="${OPENSSL_ROOT}"
 
 cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
 

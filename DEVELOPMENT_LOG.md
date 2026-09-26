@@ -4473,3 +4473,86 @@ Sub Stream (H264),  token=sub,  rtsp://192.168.1.4:8554/sub
 
 `onvif_discovery_client_demo` 的 RK3568 交叉编译通过；RV1126B `ipc_app` 交叉编译通过；
 `git diff --check` 通过。本次只部署客户端 demo 到 `/tmp` 做验证，未替换板端自启动 IPC 二进制。
+
+## 2026-09-26：ONVIF Digest 认证、动态网络地址与目录整理
+
+### 本轮收口目标
+
+在已有 ONVIF 最小发现、Device、Media v1/Media2 能力上补齐实际设备接入所需的认证与网络恢复语义：
+
+- ONVIF HTTP Digest 与 RTSP Digest 使用同一份应用配置的账号密码；
+- ONVIF 在 DHCP 尚未完成、网络稍后恢复、或 IP 变化时能够重新上线，并返回当前 IP 的 RTSP URI；
+- 客户端能够区分“需要认证”“密码错误”和普通请求失败；
+- 将 ONVIF 从 `core/` 移到协议边界，并把 demo 按领域分类，降低后续查找成本。
+
+当前 IPC 示例账号为 `admin/admin`。这是开发阶段的统一默认值；未来接入持久化配置、修改密码和用户管理时，
+只需替换 `IpcApp` 的配置来源，RTSP 与 ONVIF 仍会自然使用同一组凭据。
+
+### 服务端认证与网络行为
+
+1. 引入 gSOAP 官方 `httpda` 插件，并在 ONVIF Device、Media v1、Media2 的已实现操作入口统一验证
+   HTTP Digest。未携带或验证失败的请求返回 HTTP 401 挑战；WS-Discovery 仍保持匿名，因为发现阶段本身
+   不承载账户信息。
+2. RTSP `Live555RtspServer` 对齐 ONVIF 的凭据校验规则：用户名和密码必须同时提供，或同时为空关闭认证，
+   避免出现 RTSP 已启认证而 ONVIF 启动失败的边缘配置。
+3. `OnvifServerConfig` 不再保存启动时拼出的完整 RTSP URL，只保存 `rtspPort`。每次网络服务准备启动时，
+   都根据刚探测到的本机 IPv4 动态构造：
+
+   ```text
+   rtsp://<当前IPv4>:8554/main
+   rtsp://<当前IPv4>:8554/sub
+   ```
+
+   因此冷启动时网络未就绪不会导致 ONVIF 永久退出；网络监视线程会继续等待可用 IPv4。DHCP 地址变化时，
+   ONVIF HTTP/WS-Discovery 服务会以新地址重新建立，随后返回的新 URI 不会残留旧 IP。
+4. WS-Discovery UDP socket 设置 `SO_REUSEADDR`，方便服务快速重启以及与同主机的其他 discovery socket
+   协作。它不是绕过端口独占的手段；若别的程序以独占方式占用端口，绑定仍会失败并记录明确错误。
+5. 预期的 HTTP 401 是 Digest 握手的第一步，不再被服务端当作异常 SOAP fault 刷屏。
+
+### 客户端认证语义
+
+`OnvifDeviceClient` 保持纯 C API，同时新增可供上层 UI/配置层直接判断的结果：
+
+```text
+ONVIF_CLIENT_OK
+ONVIF_CLIENT_AUTHENTICATION_REQUIRED
+ONVIF_CLIENT_AUTHENTICATION_FAILED
+ONVIF_CLIENT_REQUEST_FAILED
+```
+
+每个 SOAP 调用的行为为“无认证请求 -> 收到 401/realm/nonce -> 若调用方提供凭据则用 Digest 自动重试”。
+调用结束立即释放 Digest 临时状态，不记录密码到日志或 URI。空密码本身是合法 Digest 凭据，因此只要求
+用户名非空、password 指针有效，不再错误地把 `admin + 空密码` 一律视为没有凭据。
+
+Media2 到 Media v1 的兼容回退只在普通请求失败时发生；认证所需或认证失败会原样返回，不能被后续
+Media v1 失败覆盖。`demo/onvif/OnvifDiscoveryClientDemo.cpp` 支持：
+
+```bash
+onvif_discovery_client_demo [timeout-ms] [username password]
+```
+
+### 目录整理
+
+- ONVIF 属于网络协议层，不再放在 `include/core/onvif`、`src/core/onvif`，统一移动到
+  `include/onvif`、`src/onvif`。
+- `demo/` 按 `audio`、`camera`、`codec`、`memory`、`onvif`、`osd`、`rtsp` 等领域归档；
+  CMake target 名保持不变，并新增 `demo/README.md` 作为导航。
+- gSOAP 的 Digest/WS-Security 辅助源码随第三方依赖保存，交叉编译时通过 SDK OpenSSL 链接，避免依赖
+  板端临时文件。
+
+### 构建、板端与协议验证
+
+- `./wsl-build-ipc.sh` 通过；ONVIF Device 服务 demo、发现客户端 demo 及目录变更后的相关 demo target
+  均通过交叉构建。
+- RV1126B (`192.168.1.4`) 已替换 `/oem/usr/bin/multicam_ipc_app` 为本轮版本，进程日志确认 ONVIF
+  Device Service、WS-Discovery 和 RTSP 均正常启动。
+- RK3568 (`192.168.1.3`) 运行发现客户端实测：
+
+  | 调用凭据 | 结果 |
+  | --- | --- |
+  | 未提供 | 正确返回 `AUTHENTICATION_REQUIRED` |
+  | `admin` + 错误密码 | 正确返回 `AUTHENTICATION_FAILED` |
+  | `admin/admin` | 取得 `main` H265 与 `sub` H264 的 Media2 Profile 和 RTSP URI |
+
+这一阶段 ONVIF 已完成“被发现 -> Digest 认证 -> 查询 profile -> 获得受同一账号保护的 RTSP URI”的最小
+设备互操作闭环。PTZ、事件、网络配置、用户管理等服务留待确有产品需求时按 WSDL 操作逐项实现。

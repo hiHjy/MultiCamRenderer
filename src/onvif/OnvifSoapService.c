@@ -1,5 +1,14 @@
+/**
+ * @file OnvifSoapService.c
+ * @brief ONVIF SOAP 服务端实现文件
+ *
+ * 实现了 gSOAP 生成代码所需的回调函数，使设备能被 ONVIF 客户端发现和查询。
+ * 提供 Device, Media, Media2 服务以及 WS-Discovery 支持。
+ */
+
 #include "OnvifSoapService.h"
 
+#include "httpda.h"
 #include "stdsoap2.h"
 #include "wsddapi.h"
 
@@ -10,17 +19,31 @@
 #include <string.h>
 #include <time.h>
 
+/** ONVIF Device 服务的 XML 命名空间 */
 #define ONVIF_DEVICE_NAMESPACE "http://www.onvif.org/ver10/device/wsdl"
+/** ONVIF Media v1 服务的 XML 命名空间 */
 #define ONVIF_MEDIA_NAMESPACE "http://www.onvif.org/ver10/media/wsdl"
+/** ONVIF Media v2 服务的 XML 命名空间 */
 #define ONVIF_MEDIA2_NAMESPACE "http://www.onvif.org/ver20/media/wsdl"
+/** WS-Discovery 默认的 UDP 多播端口 */
 #define ONVIF_WSDD_PORT 3702
+/** WS-Discovery IPv4 多播地址 */
 #define ONVIF_WSDD_MULTICAST_ADDRESS "239.255.255.250"
+/** ONVIF 网络视频发送者设备类型 (NVT) */
 #define ONVIF_NETWORK_VIDEO_TRANSMITTER "dn:NetworkVideoTransmitter"
+
 // ONVIF Discovery Feature 规范要求 ProbeMatch 同时声明通用 Device 与 NVT 类型。
 // 只声明 NVT 虽然很多客户端能识别，但 ODM 会用两种类型交叉过滤。
+/** 设备发现时响应的设备类型列表 */
 #define ONVIF_DISCOVERY_TYPES "dn:NetworkVideoTransmitter tds:Device"
 
 /* gSOAP owns all response memory through the current struct soap. */
+/**
+ * @brief 分配并清零 SOAP 管理的内存
+ * @param soap SOAP 上下文实例，用于内存生命周期管理
+ * @param size 需要分配的字节数
+ * @return 分配的内存指针，分配失败则返回 NULL
+ */
 static void *soap_calloc(struct soap *soap, size_t size)
 {
     void *memory = soap_malloc(soap, size);
@@ -29,6 +52,12 @@ static void *soap_calloc(struct soap *soap, size_t size)
     return memory;
 }
 
+/**
+ * @brief 在 SOAP 管理的内存中复制字符串
+ * @param soap SOAP 上下文实例
+ * @param text 需要复制的源字符串（以 null 结尾）
+ * @return 复制后的字符串指针，分配失败则返回 NULL
+ */
 static char *soap_copy_text(struct soap *soap, const char *text)
 {
     const size_t length = strlen(text) + 1;
@@ -38,6 +67,13 @@ static char *soap_copy_text(struct soap *soap, const char *text)
     return copy;
 }
 
+/**
+ * @brief 在 SOAP 管理的内存中复制指定长度的字符串，并自动添加 null 终止符
+ * @param soap SOAP 上下文实例
+ * @param begin 字符串起始位置
+ * @param length 需要复制的长度
+ * @return 复制后的字符串指针，分配失败则返回 NULL
+ */
 static char *soap_copy_text_range(struct soap *soap, const char *begin, size_t length)
 {
     char *copy = (char *)soap_malloc(soap, length + 1);
@@ -48,6 +84,12 @@ static char *soap_copy_text_range(struct soap *soap, const char *begin, size_t l
     return copy;
 }
 
+/**
+ * @brief 在 SOAP 内存中分配一个布尔值并初始化
+ * @param soap SOAP 上下文实例
+ * @param value 要设置的布尔值枚举
+ * @return 布尔值的指针，分配失败则返回 NULL
+ */
 static enum xsd__boolean *soap_boolean(struct soap *soap, enum xsd__boolean value)
 {
     enum xsd__boolean *result = (enum xsd__boolean *)soap_calloc(soap, sizeof(*result));
@@ -56,16 +98,68 @@ static enum xsd__boolean *soap_boolean(struct soap *soap, enum xsd__boolean valu
     return result;
 }
 
+/**
+ * @brief 获取与当前 SOAP 实例绑定的服务配置
+ * @param soap SOAP 上下文实例
+ * @return 配置指针，保存在 soap->user 中
+ */
 static const OnvifSoapServiceConfig *service_config(const struct soap *soap)
 {
     return (const OnvifSoapServiceConfig *)soap->user;
 }
 
+/*
+ * ONVIF 的 Device、Media、Media2 操作都是 HTTP POST。认证在每个 gSOAP handler
+ * 进入时经过同一个门，而不是让业务函数自己比较用户名/密码。
+ *
+ * 未配置账号时保持匿名模式，便于 demo 和尚未配置设备的开发流程；一旦 username
+ * 与 password 同时存在，只接受 HTTP Digest，不接受会明文传密码的 HTTP Basic。
+ */
+static int require_http_digest_authentication(struct soap *soap)
+{
+    const OnvifSoapServiceConfig *config = service_config(soap);
+    if (config == NULL)
+        return SOAP_FAULT;
+    if (config->username[0] == '\0')
+        return SOAP_OK;
+
+    if (soap->authrealm != NULL && soap->userid != NULL &&
+        strcmp(soap->authrealm, config->authenticationRealm) == 0 &&
+        strcmp(soap->userid, config->username) == 0 &&
+        http_da_verify_post(soap, config->password) == SOAP_OK) {
+        return SOAP_OK;
+    }
+
+    /* http_da 插件会依据 realm 生成 nonce/opaque 和 WWW-Authenticate: Digest。 */
+    soap->authrealm = config->authenticationRealm;
+    return 401;
+}
+
+#define ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap_context) \
+    do { \
+        const int authentication_result = require_http_digest_authentication((soap_context)); \
+        if (authentication_result != SOAP_OK) \
+            return authentication_result; \
+    } while (0)
+
+/**
+ * @brief 检查是否收到了停止服务的请求
+ * @param callback 用户提供的停止检查回调函数
+ * @param context 回调函数所需的上下文指针
+ * @return 如果已请求停止返回 1，否则返回 0
+ */
 static int stop_requested(OnvifSoapStopRequestedFn callback, void *context)
 {
     return callback != NULL && callback(context) != 0;
 }
 
+/**
+ * @brief 汇报服务启动结果
+ * @param callback 用户提供的启动通知回调函数
+ * @param context 回调函数所需的上下文指针
+ * @param success 启动成功为 1，失败为 0
+ * @param error_text 如果启动失败，此参数包含错误描述
+ */
 static void report_started(OnvifSoapStartedFn callback, void *context,
                            int success, const char *error_text)
 {
@@ -73,6 +167,12 @@ static void report_started(OnvifSoapStartedFn callback, void *context,
         callback(context, success, error_text);
 }
 
+/**
+ * @brief 生成当前系统的 UTC 时间并填充到 SOAP 响应结构中
+ * @param soap SOAP 上下文实例
+ * @param output 用于保存输出时间结构的指针地址
+ * @return 成功返回 SOAP_OK，分配内存失败或时间获取失败返回 SOAP_EOM
+ */
 static int populate_utc_time(struct soap *soap, struct tt__SystemDateTime **output)
 {
     time_t now;
@@ -110,6 +210,23 @@ static int populate_utc_time(struct soap *soap, struct tt__SystemDateTime **outp
 
 /* Required by gSOAP's generic dispatcher. ONVIF Device Service does not
  * consume incoming Fault messages, so accepting one is sufficient here. */
+/**
+ * @brief 处理 SOAP 错误消息 (gSOAP 要求实现的回调)
+ *
+ * ONVIF Device 服务通常不接收 Fault 消息，此处提供空实现以满足编译要求。
+ *
+ * @param soap SOAP 上下文实例
+ * @param faultcode 错误代码
+ * @param faultstring 错误描述
+ * @param faultactor 触发错误的参与者
+ * @param detail 错误详情结构
+ * @param code 错误代码结构
+ * @param reason 错误原因结构
+ * @param node 发生错误的节点
+ * @param role 角色信息
+ * @param detail12 SOAP 1.2 错误详情
+ * @return 始终返回 SOAP_OK
+ */
 int SOAP_ENV__Fault(struct soap *soap, char *faultcode, char *faultstring,
                     char *faultactor, struct SOAP_ENV__Detail *detail,
                     struct SOAP_ENV__Code *code, struct SOAP_ENV__Reason *reason,
@@ -126,11 +243,22 @@ int SOAP_ENV__Fault(struct soap *soap, char *faultcode, char *faultstring,
  * serializes `response` after SOAP_OK is returned. All other generated Device
  * operations return SOAP_NO_METHOD from onvifUnimplementedOps.c.
  */
+/**
+ * @brief 获取设备基础信息
+ *
+ * ONVIF Device 核心 API 之一。向客户端返回设备的制造商、型号、固件版本号等信息。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体 (空)
+ * @param response SOAP 响应结构体，将由该函数负责填充
+ * @return 成功返回 SOAP_OK，否则返回 SOAP_FAULT 或 SOAP_EOM
+ */
 int __tds__GetDeviceInformation(struct soap *soap,
                                 struct _tds__GetDeviceInformation *request,
                                 struct _tds__GetDeviceInformationResponse *response)
 {
     const OnvifSoapServiceConfig *config = service_config(soap);
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     if (config == NULL)
         return SOAP_FAULT;
@@ -146,14 +274,35 @@ int __tds__GetDeviceInformation(struct soap *soap,
                : SOAP_EOM;
 }
 
+/**
+ * @brief 获取系统日期和时间
+ *
+ * 返回设备当前的 UTC 时间。许多 ONVIF 客户端在发送带签名的 SOAP 报文前会调用此接口同步时间。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，将填充系统时间
+ * @return 成功返回 SOAP_OK，分配失败返回 SOAP_EOM
+ */
 int __tds__GetSystemDateAndTime(struct soap *soap,
                                 struct _tds__GetSystemDateAndTime *request,
                                 struct _tds__GetSystemDateAndTimeResponse *response)
 {
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     return populate_utc_time(soap, &response->SystemDateAndTime);
 }
 
+/**
+ * @brief 获取设备的 ONVIF 作用域 (Scopes)
+ *
+ * 作用域是客户端识别设备属性（如物理位置、设备名称等）的重要依据，空格分隔。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，返回所有固定 Scope 项
+ * @return 成功返回 SOAP_OK
+ */
 int __tds__GetScopes(struct soap *soap, struct _tds__GetScopes *request,
                      struct _tds__GetScopesResponse *response)
 {
@@ -161,6 +310,7 @@ int __tds__GetScopes(struct soap *soap, struct _tds__GetScopes *request,
     const char *cursor;
     int count = 0;
     int index = 0;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     if (config == NULL)
         return SOAP_FAULT;
@@ -197,11 +347,22 @@ int __tds__GetScopes(struct soap *soap, struct _tds__GetScopes *request,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取设备服务的能力集 (Capabilities)
+ *
+ * 返回与设备本身相关的能力（如网络、安全、系统）。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，将填充能力集数据
+ * @return 成功返回 SOAP_OK
+ */
 int __tds__GetServiceCapabilities(struct soap *soap,
                                   struct _tds__GetServiceCapabilities *request,
                                   struct _tds__GetServiceCapabilitiesResponse *response)
 {
     struct tds__DeviceServiceCapabilities *capabilities;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     capabilities = (struct tds__DeviceServiceCapabilities *)soap_calloc(soap, sizeof(*capabilities));
     if (capabilities == NULL)
@@ -219,12 +380,23 @@ int __tds__GetServiceCapabilities(struct soap *soap,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取设备支持的服务列表 (GetServices)
+ *
+ * 向客户端返回当前设备启用的所有 ONVIF 服务的端点 URL 和支持的版本号（包含 Device, Media, Media2）。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，将填充服务列表和对应版本
+ * @return 成功返回 SOAP_OK
+ */
 int __tds__GetServices(struct soap *soap, struct _tds__GetServices *request,
                        struct _tds__GetServicesResponse *response)
 {
     const OnvifSoapServiceConfig *config = service_config(soap);
     struct tds__Service *services;
     struct tt__OnvifVersion *versions;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     if (config == NULL)
         return SOAP_FAULT;
@@ -234,21 +406,25 @@ int __tds__GetServices(struct soap *soap, struct _tds__GetServices *request,
         return SOAP_EOM;
     response->__sizeService = 3;
     response->Service = services;
+
     services[0].Namespace = soap_copy_text(soap, ONVIF_DEVICE_NAMESPACE);
     services[0].XAddr = soap_copy_text(soap, config->deviceServiceUrl);
     services[0].Version = &versions[0];
     versions[0].Major = 25;
     versions[0].Minor = 6;
+
     services[1].Namespace = soap_copy_text(soap, ONVIF_MEDIA_NAMESPACE);
     services[1].XAddr = soap_copy_text(soap, config->mediaServiceUrl);
     services[1].Version = &versions[1];
     versions[1].Major = 1;
     versions[1].Minor = 0;
+
     services[2].Namespace = soap_copy_text(soap, ONVIF_MEDIA2_NAMESPACE);
     services[2].XAddr = soap_copy_text(soap, config->media2ServiceUrl);
     services[2].Version = &versions[2];
     versions[2].Major = 20;
     versions[2].Minor = 12;
+
     return services[0].Namespace != NULL && services[0].XAddr != NULL &&
            services[1].Namespace != NULL && services[1].XAddr != NULL &&
            services[2].Namespace != NULL && services[2].XAddr != NULL
@@ -256,6 +432,16 @@ int __tds__GetServices(struct soap *soap, struct _tds__GetServices *request,
                : SOAP_EOM;
 }
 
+/**
+ * @brief 获取设备的兼容性能力集 (GetCapabilities)
+ *
+ * 返回各具体服务（例如 Media）的端点 URL 及其能力描述（如支持 RTP/RTSP/TCP 流媒体等）。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，填充旧版 Capabilities 接口需要的设备与媒体能力
+ * @return 成功返回 SOAP_OK
+ */
 int __tds__GetCapabilities(struct soap *soap, struct _tds__GetCapabilities *request,
                            struct _tds__GetCapabilitiesResponse *response)
 {
@@ -264,6 +450,7 @@ int __tds__GetCapabilities(struct soap *soap, struct _tds__GetCapabilities *requ
     struct tt__DeviceCapabilities *device;
     struct tt__MediaCapabilities *media;
     struct tt__RealTimeStreamingCapabilities *streaming;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     if (config == NULL)
         return SOAP_FAULT;
@@ -285,6 +472,13 @@ int __tds__GetCapabilities(struct soap *soap, struct _tds__GetCapabilities *requ
     return SOAP_OK;
 }
 
+/**
+ * @brief 填充 AAC 音频编码配置 (Media v1)
+ * @param soap SOAP 上下文实例
+ * @param profile 要填充的 Profile 结构体
+ * @param token 音频配置的唯一标识
+ * @return 成功返回 SOAP_OK
+ */
 static int fill_aac_configuration(struct soap *soap, struct tt__Profile *profile, const char *token)
 {
     struct tt__AudioEncoderConfiguration *audio =
@@ -304,6 +498,12 @@ static int fill_aac_configuration(struct soap *soap, struct tt__Profile *profile
     return SOAP_OK;
 }
 
+/**
+ * @brief 填充子码流 (H264 720p) 视频编码配置 (Media v1)
+ * @param soap SOAP 上下文实例
+ * @param profile 要填充的 Profile 结构体
+ * @return 成功返回 SOAP_OK
+ */
 static int fill_h264_sub_configuration(struct soap *soap, struct tt__Profile *profile)
 {
     struct tt__VideoEncoderConfiguration *video =
@@ -338,6 +538,12 @@ static int fill_h264_sub_configuration(struct soap *soap, struct tt__Profile *pr
     return SOAP_OK;
 }
 
+/**
+ * @brief 填充主码流 (H265 1080p, 兼容标记为 H264) 视频编码配置 (Media v1)
+ * @param soap SOAP 上下文实例
+ * @param profile 要填充的 Profile 结构体
+ * @return 成功返回 SOAP_OK
+ */
 static int fill_h264_main_configuration(struct soap *soap, struct tt__Profile *profile)
 {
     struct tt__VideoEncoderConfiguration *video =
@@ -375,6 +581,15 @@ static int fill_h264_main_configuration(struct soap *soap, struct tt__Profile *p
     return SOAP_OK;
 }
 
+/**
+ * @brief 填充完整的 Media Profile (Media v1)
+ * @param soap SOAP 上下文实例
+ * @param profile 要填充的 Profile 结构体
+ * @param token Profile 唯一标识 (如 "main" 或 "sub")
+ * @param name Profile 人类可读名称
+ * @param is_sub 是否为子码流标志
+ * @return 成功返回 SOAP_OK
+ */
 static int fill_media_profile(struct soap *soap, struct tt__Profile *profile,
                               const char *token, const char *name, int is_sub)
 {
@@ -388,6 +603,16 @@ static int fill_media_profile(struct soap *soap, struct tt__Profile *profile,
     return is_sub ? fill_h264_sub_configuration(soap, profile) : fill_h264_main_configuration(soap, profile);
 }
 
+/**
+ * @brief 获取媒体服务能力 (Media v1 GetServiceCapabilities)
+ *
+ * 返回 Media v1 服务的各项能力，如最大 Profile 数量，以及支持通过 TCP 进行 RTSP 流传输。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，包含媒体能力信息
+ * @return 成功返回 SOAP_OK
+ */
 int __trt__GetServiceCapabilities(struct soap *soap,
                                   struct _trt__GetServiceCapabilities *request,
                                   struct _trt__GetServiceCapabilitiesResponse *response)
@@ -395,6 +620,7 @@ int __trt__GetServiceCapabilities(struct soap *soap,
     struct trt__Capabilities *capabilities;
     struct trt__ProfileCapabilities *profiles;
     struct trt__StreamingCapabilities *streaming;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     capabilities = (struct trt__Capabilities *)soap_calloc(soap, sizeof(*capabilities));
     profiles = (struct trt__ProfileCapabilities *)soap_calloc(soap, sizeof(*profiles));
@@ -412,10 +638,21 @@ int __trt__GetServiceCapabilities(struct soap *soap,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取所有媒体配置档案 (Media v1 GetProfiles)
+ *
+ * 向客户端返回设备上可用的所有 Profile（包含主码流与子码流）。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，包含 Profile 列表
+ * @return 成功返回 SOAP_OK
+ */
 int __trt__GetProfiles(struct soap *soap, struct _trt__GetProfiles *request,
                        struct _trt__GetProfilesResponse *response)
 {
     struct tt__Profile *profiles;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     profiles = (struct tt__Profile *)soap_calloc(soap, 2 * sizeof(*profiles));
     if (profiles == NULL)
@@ -429,10 +666,19 @@ int __trt__GetProfiles(struct soap *soap, struct _trt__GetProfiles *request,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取指定的媒体配置档案 (Media v1 GetProfile)
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体，必须包含请求的 ProfileToken
+ * @param response SOAP 响应结构体，包含匹配的 Profile 数据
+ * @return 成功返回 SOAP_OK，找不到则返回 SOAP_FAULT
+ */
 int __trt__GetProfile(struct soap *soap, struct _trt__GetProfile *request,
                       struct _trt__GetProfileResponse *response)
 {
     struct tt__Profile *profile;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     const int is_sub = request != NULL && request->ProfileToken != NULL &&
                        strcmp(request->ProfileToken, "sub") == 0;
     if (request == NULL || request->ProfileToken == NULL ||
@@ -450,12 +696,23 @@ int __trt__GetProfile(struct soap *soap, struct _trt__GetProfile *request,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取指定 Profile 的流媒体地址 (Media v1 GetStreamUri)
+ *
+ * 返回供客户端进行 RTSP 拉流的 URL 地址。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体，指定需要的 ProfileToken 等信息
+ * @param response SOAP 响应结构体，包含流媒体 URI
+ * @return 成功返回 SOAP_OK，匹配失败返回 SOAP_FAULT
+ */
 int __trt__GetStreamUri(struct soap *soap, struct _trt__GetStreamUri *request,
                         struct _trt__GetStreamUriResponse *response)
 {
     const OnvifSoapServiceConfig *config = service_config(soap);
     const char *rtsp_url;
     struct tt__MediaUri *media_uri;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     if (config == NULL || request == NULL || request->ProfileToken == NULL)
         return SOAP_FAULT;
     if (strcmp(request->ProfileToken, "main") == 0)
@@ -481,6 +738,18 @@ int __trt__GetStreamUri(struct soap *soap, struct _trt__GetStreamUri *request,
  * ONVIF Media2 (ver20 Media) Service Implementation
  */
 
+/**
+ * @brief 填充 Media2 视频编码器配置
+ * @param soap SOAP 上下文实例
+ * @param token 视频配置的唯一标识
+ * @param name 视频配置的人类可读名称
+ * @param encoding 编码格式 (如 "H264", "H265")
+ * @param width 视频宽度
+ * @param height 视频高度
+ * @param fps 帧率限制
+ * @param bitrate_kbps 码率限制 (kbps)
+ * @return 视频编码配置指针，失败返回 NULL
+ */
 static struct tt__VideoEncoder2Configuration *fill_media2_video_encoder(
     struct soap *soap, const char *token, const char *name,
     const char *encoding, int width, int height, float fps, int bitrate_kbps)
@@ -509,6 +778,16 @@ static struct tt__VideoEncoder2Configuration *fill_media2_video_encoder(
     return video;
 }
 
+/**
+ * @brief 填充 Media2 音频编码器配置
+ * @param soap SOAP 上下文实例
+ * @param token 音频配置的唯一标识
+ * @param name 音频配置的人类可读名称
+ * @param encoding 编码格式 (如 "MP4A-LATM")
+ * @param bitrate_kbps 码率限制 (kbps)
+ * @param sample_rate_khz 采样率 (kHz)
+ * @return 音频编码配置指针，失败返回 NULL
+ */
 static struct tt__AudioEncoder2Configuration *fill_media2_audio_encoder(
     struct soap *soap, const char *token, const char *name,
     const char *encoding, int bitrate_kbps, int sample_rate_khz)
@@ -528,6 +807,15 @@ static struct tt__AudioEncoder2Configuration *fill_media2_audio_encoder(
     return audio;
 }
 
+/**
+ * @brief 填充完整的 Media2 媒体配置档案
+ * @param soap SOAP 上下文实例
+ * @param profile 要填充的 Media2 Profile 结构体
+ * @param token Profile 唯一标识
+ * @param name Profile 人类可读名称
+ * @param is_sub 是否为子码流
+ * @return 成功返回 SOAP_OK
+ */
 static int fill_media2_profile(struct soap *soap, struct tr2__MediaProfile *profile,
                                const char *token, const char *name, int is_sub)
 {
@@ -560,6 +848,16 @@ static int fill_media2_profile(struct soap *soap, struct tr2__MediaProfile *prof
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取媒体服务能力 (Media v2 GetServiceCapabilities)
+ *
+ * 返回 Media2 的流媒体能力及 Profile 数量限制。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，将填充能力信息
+ * @return 成功返回 SOAP_OK
+ */
 int __tr2__GetServiceCapabilities(struct soap *soap,
                                   struct _tr2__GetServiceCapabilities *request,
                                   struct _tr2__GetServiceCapabilitiesResponse *response)
@@ -567,6 +865,7 @@ int __tr2__GetServiceCapabilities(struct soap *soap,
     struct tr2__Capabilities2 *capabilities;
     struct tr2__ProfileCapabilities *profiles;
     struct tr2__StreamingCapabilities *streaming;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     (void)request;
     capabilities = (struct tr2__Capabilities2 *)soap_calloc(soap, sizeof(*capabilities));
     profiles = (struct tr2__ProfileCapabilities *)soap_calloc(soap, sizeof(*profiles));
@@ -587,10 +886,21 @@ int __tr2__GetServiceCapabilities(struct soap *soap,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取媒体配置档案 (Media v2 GetProfiles)
+ *
+ * 支持按 Token 获取指定的 Profile，或在不指定时返回全部。
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体，可选包含目标 Token
+ * @param response SOAP 响应结构体，将填充相应的 Profile 列表
+ * @return 成功返回 SOAP_OK
+ */
 int __tr2__GetProfiles(struct soap *soap, struct _tr2__GetProfiles *request,
                        struct _tr2__GetProfilesResponse *response)
 {
     struct tr2__MediaProfile *profiles;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     if (request != NULL && request->Token != NULL && *request->Token != '\0') {
         const int is_sub = strcmp(request->Token, "sub") == 0;
         if (strcmp(request->Token, "main") != 0 && !is_sub)
@@ -618,11 +928,20 @@ int __tr2__GetProfiles(struct soap *soap, struct _tr2__GetProfiles *request,
     return SOAP_OK;
 }
 
+/**
+ * @brief 获取指定 Profile 的流媒体地址 (Media v2 GetStreamUri)
+ *
+ * @param soap SOAP 上下文实例
+ * @param request SOAP 请求结构体
+ * @param response SOAP 响应结构体，将填充 RTSP 拉流 URI
+ * @return 成功返回 SOAP_OK
+ */
 int __tr2__GetStreamUri(struct soap *soap, struct _tr2__GetStreamUri *request,
                         struct _tr2__GetStreamUriResponse *response)
 {
     const OnvifSoapServiceConfig *config = service_config(soap);
     const char *rtsp_url;
+    ONVIF_REQUIRE_AUTHENTICATED_REQUEST(soap);
     if (config == NULL || request == NULL || request->ProfileToken == NULL)
         return SOAP_FAULT;
     if (strcmp(request->ProfileToken, "main") == 0)
@@ -635,6 +954,11 @@ int __tr2__GetStreamUri(struct soap *soap, struct _tr2__GetStreamUri *request,
     return response->Uri != NULL ? SOAP_OK : SOAP_EOM;
 }
 
+/**
+ * @brief 判断 WS-Discovery Probe 请求是否匹配本设备类型
+ * @param types Probe 请求中指定的类型列表字符串
+ * @return 匹配返回 1，不匹配返回 0
+ */
 static int probe_requests_this_device_type(const char *types)
 {
     /* ODM 会同时探测 ONVIF 具体设备类型 dn:NetworkVideoTransmitter 与通用的
@@ -643,6 +967,13 @@ static int probe_requests_this_device_type(const char *types)
            strstr(types, "NetworkVideoTransmitter") != NULL || strstr(types, ":Device") != NULL;
 }
 
+/**
+ * @brief 获取当前 UDP 通信对端的地址，格式化为 soap.udp://host:port
+ * @param soap SOAP 上下文实例
+ * @param endpoint 用于保存结果的缓冲区
+ * @param endpoint_size 缓冲区大小
+ * @return 成功返回 0，失败返回 -1
+ */
 static int get_peer_udp_endpoint(const struct soap *soap, char *endpoint, size_t endpoint_size)
 {
     char host[NI_MAXHOST] = {0};
@@ -665,6 +996,20 @@ void wsdd_event_Bye(struct soap *soap, unsigned int a, const char *b, unsigned i
                     const char *h, const char *i, const char *j, unsigned int *k)
 { (void)soap; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; (void)k; }
 
+/**
+ * @brief WS-Discovery Probe 报文处理钩子
+ *
+ * 当收到 UDP 广播发现请求时被 gSOAP 调用。若匹配本设备类型，则向发送方单播回复 ProbeMatch。
+ *
+ * @param soap SOAP 上下文实例
+ * @param message_id 请求的消息 ID
+ * @param reply_to 回复地址
+ * @param types 请求查找的设备类型
+ * @param scopes 请求查找的作用域
+ * @param match_by 匹配规则
+ * @param matches 回复结构体
+ * @return SOAP_WSDD_ADHOC
+ */
 soap_wsdd_mode wsdd_event_Probe(struct soap *soap, const char *message_id,
                                 const char *reply_to, const char *types,
                                 const char *scopes, const char *match_by,
@@ -698,6 +1043,20 @@ void wsdd_event_ResolveMatches(struct soap *soap, unsigned int a, const char *b,
                                const char *d, const char *e, struct wsdd__ResolveMatchType *f)
 { (void)soap; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; }
 
+/**
+ * @brief 运行 ONVIF HTTP SOAP 设备服务的主循环
+ *
+ * 监听指定的 HTTP 端口，接收并响应 ONVIF 客户端的 SOAP 请求。
+ * 该函数会阻塞当前线程直到被请求停止。
+ *
+ * @param config 服务配置参数
+ * @param port 监听的 HTTP 端口
+ * @param should_stop 检查是否需要停止的回调
+ * @param stop_context 停止回调上下文
+ * @param on_started 服务启动结果的回调
+ * @param started_context 启动结果回调上下文
+ * @return 成功返回 0，失败返回 -1
+ */
 int onvif_soap_run_device_service(const OnvifSoapServiceConfig *config, unsigned short port,
                                   OnvifSoapStopRequestedFn should_stop, void *stop_context,
                                   OnvifSoapStartedFn on_started, void *started_context)
@@ -710,6 +1069,13 @@ int onvif_soap_run_device_service(const OnvifSoapServiceConfig *config, unsigned
     }
     soap_init1(&soap, SOAP_XML_TREE);
     soap.user = (void *)config;
+    /* ONVIF Core 的经典 Digest 兼容路径使用 RFC 2617 MD5。RTSP 的 live555
+       Digest 也使用同一账号；以后整体升级 RFC 7616 SHA-256 时在此统一切换。 */
+    if (soap_register_plugin_arg(&soap, http_da, http_da_md5()) != SOAP_OK) {
+        report_started(on_started, started_context, 0, "register HTTP Digest plugin failed");
+        soap_done(&soap);
+        return -1;
+    }
     /* Rebinding after an app restart must not wait for old TCP TIME_WAIT sockets. */
     soap.bind_flags = SO_REUSEADDR;
     if (!soap_valid_socket(soap_bind(&soap, NULL, port, 16))) {
@@ -728,7 +1094,12 @@ int onvif_soap_run_device_service(const OnvifSoapServiceConfig *config, unsigned
                 fprintf(stderr, "OnvifSoapService: HTTP accept error soap=%d errno=%d\n", soap.error, soap.errnum);
             continue;
         }
-        if (soap_serve(&soap) != SOAP_OK)
+        const int serve_result = soap_serve(&soap);
+        /*
+         * HTTP Digest 的第一包本来就应返回 401 challenge。它不是服务端故障，不能
+         * 每次客户端认证都刷一条 SOAP fault；解析/业务等其他 SOAP 错误仍完整保留。
+         */
+        if (serve_result != SOAP_OK && soap.error != 401)
             soap_print_fault(&soap, stderr);
         soap_destroy(&soap);
         soap_end(&soap);
@@ -738,6 +1109,19 @@ int onvif_soap_run_device_service(const OnvifSoapServiceConfig *config, unsigned
     return 0;
 }
 
+/**
+ * @brief 运行 ONVIF WS-Discovery 服务的主循环
+ *
+ * 监听 UDP 多播组，响应其他客户端发起的设备发现探测，并在启动时主动广播 Hello 报文。
+ * 该函数会阻塞当前线程直到被请求停止。
+ *
+ * @param config 服务配置参数
+ * @param should_stop 检查是否需要停止的回调
+ * @param stop_context 停止回调上下文
+ * @param on_started 服务启动结果的回调
+ * @param started_context 启动结果回调上下文
+ * @return 成功返回 0，失败返回 -1
+ */
 int onvif_soap_run_discovery_service(const OnvifSoapServiceConfig *config,
                                      OnvifSoapStopRequestedFn should_stop, void *stop_context,
                                      OnvifSoapStartedFn on_started, void *started_context)
@@ -751,6 +1135,12 @@ int onvif_soap_run_discovery_service(const OnvifSoapServiceConfig *config,
     }
     soap_init1(&soap, SOAP_IO_UDP | SOAP_XML_TREE);
     soap.user = (void *)config;
+    /*
+     * WS-Discovery 固定使用公共组播端口 3702。快速网络换址重启时允许 socket 及时
+     * 重绑；Linux 上也提升与其他同样正确设置 REUSEADDR 的组播监听者共存的兼容性。
+     * 这不绕过真正独占该端口的进程，soap_bind 失败仍会如实上报。
+     */
+    soap.bind_flags = SO_REUSEADDR;
     if (soap_register_plugin(&soap, soap_wsa) != SOAP_OK ||
         !soap_valid_socket(soap_bind(&soap, NULL, ONVIF_WSDD_PORT, 16))) {
         snprintf(error, sizeof(error), "bind WS-Discovery UDP %d failed (soap=%d errno=%d)",

@@ -10,7 +10,7 @@
 ```text
 src/core/audio/AudioApm.cpp          APM 的 C 边界（AGC2 + 降噪 + 高通）
 include/core/audio/AudioApm.h        配置项
-demo/AudioCaptureApmPcmDemo.c        「采集 -> APM -> 写 WAV」，可同时落原始 PCM 做 A/B
+demo/audio/AudioCaptureApmPcmDemo.c        「采集 -> APM -> 写 WAV」，可同时落原始 PCM 做 A/B
 tools/build-third-party.sh           重建 webrtc-audio-processing 2.1
 ```
 

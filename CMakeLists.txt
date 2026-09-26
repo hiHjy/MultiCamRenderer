@@ -44,7 +44,7 @@ set(MCR_PROJECT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/hw/rga"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/osd"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/core/audio"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/onvif"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/client"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rtsp/server"
 )
@@ -86,6 +86,26 @@ else()
     find_library(MCR_DRM_LIBRARY NAMES drm REQUIRED)
     set(MCR_ALSA_INCLUDE_DIR "${MCR_SYSROOT}/usr/include")
     find_library(MCR_ALSA_LIBRARY NAMES asound REQUIRED)
+endif()
+
+# ONVIF 的 HTTP Digest 使用 gSOAP 官方 httpda 插件。即使设备当前允许匿名访问，
+# 客户端也需要它才能连接开启 Digest 的第三方设备，因此 ONVIF binding 始终链接 OpenSSL。
+# RV1126B 的媒体 SDK 不把 OpenSSL 放在 media_out，而是由完整 rootfs 提供，故 IPC
+# 构建脚本传入一个显式根目录。
+set(MCR_ONVIF_OPENSSL_ROOT "" CACHE PATH "ONVIF HTTP Digest 所用目标端 OpenSSL 根目录")
+if(MCR_ONVIF_OPENSSL_ROOT)
+    set(MCR_ONVIF_OPENSSL_INCLUDE_DIR "${MCR_ONVIF_OPENSSL_ROOT}/include")
+    set(MCR_ONVIF_SSL_LIBRARY "${MCR_ONVIF_OPENSSL_ROOT}/lib/libssl.so")
+    set(MCR_ONVIF_CRYPTO_LIBRARY "${MCR_ONVIF_OPENSSL_ROOT}/lib/libcrypto.so")
+    if(NOT EXISTS "${MCR_ONVIF_OPENSSL_INCLUDE_DIR}/openssl/evp.h" OR
+       NOT EXISTS "${MCR_ONVIF_SSL_LIBRARY}" OR
+       NOT EXISTS "${MCR_ONVIF_CRYPTO_LIBRARY}")
+        message(FATAL_ERROR "MCR_ONVIF_OPENSSL_ROOT 不完整：需要 include/openssl、lib/libssl.so、lib/libcrypto.so")
+    endif()
+else()
+    find_path(MCR_ONVIF_OPENSSL_INCLUDE_DIR openssl/evp.h REQUIRED)
+    find_library(MCR_ONVIF_SSL_LIBRARY NAMES ssl REQUIRED)
+    find_library(MCR_ONVIF_CRYPTO_LIBRARY NAMES crypto REQUIRED)
 endif()
 
 # Opus 与 WebRTC APM 都以"头文件 + 预编译静态库"的形式入库（同 third_party/live555）。
@@ -250,26 +270,32 @@ add_library(mcr_onvif_client_gsoap_bindings STATIC
     third_party/gsoap/plugin/threads.c
     third_party/gsoap/plugin/wsaapi.c
     third_party/gsoap/plugin/wsddapi.c
+    third_party/gsoap/plugin/httpda.c
+    third_party/gsoap/plugin/smdevp.c
     generated/onvif/device/onvifC.c
     generated/onvif/device/onvifClient.c
     generated/onvif/device/onvifNsmap.c
-    src/core/onvif/OnvifWsddClient.c
-    src/core/onvif/OnvifDeviceClient.c
+    src/onvif/OnvifWsddClient.c
+    src/onvif/OnvifDeviceClient.c
 )
 target_include_directories(mcr_onvif_client_gsoap_bindings PUBLIC
     "${MCR_GSOAP_ROOT}/include"
     "${MCR_GSOAP_ROOT}/plugin"
     "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/device"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/onvif"
 )
 target_compile_definitions(mcr_onvif_client_gsoap_bindings PRIVATE SOAP_H_FILE=onvifH.h)
+target_compile_definitions(mcr_onvif_client_gsoap_bindings PRIVATE WITH_OPENSSL)
+target_include_directories(mcr_onvif_client_gsoap_bindings PRIVATE "${MCR_ONVIF_OPENSSL_INCLUDE_DIR}")
+target_link_libraries(mcr_onvif_client_gsoap_bindings PUBLIC
+    "${MCR_ONVIF_SSL_LIBRARY}" "${MCR_ONVIF_CRYPTO_LIBRARY}")
 target_compile_options(mcr_onvif_client_gsoap_bindings PRIVATE -Wall -Wextra)
 target_link_libraries(mcr_onvif_client_gsoap_bindings PUBLIC Threads::Threads)
 
 # ONVIF 客户端协议层是纯 C：不泄漏 gSOAP 类型；它与 OnvifServer 是两个可独立链接的
 # 角色库，NVR/客户端进程链接前者，IPC Target Service 链接后者。
 add_library(mcr_onvif_discovery STATIC
-    src/core/onvif/OnvifDiscoveryClient.c
+    src/onvif/OnvifDiscoveryClient.c
 )
 target_include_directories(mcr_onvif_discovery PUBLIC ${MCR_PROJECT_INCLUDE_DIRS})
 target_link_libraries(mcr_onvif_discovery PUBLIC mcr_onvif_client_gsoap_bindings Threads::Threads)
@@ -283,27 +309,33 @@ add_library(mcr_onvif_gsoap_bindings STATIC
     third_party/gsoap/plugin/threads.c
     third_party/gsoap/plugin/wsaapi.c
     third_party/gsoap/plugin/wsddapi.c
+    third_party/gsoap/plugin/httpda.c
+    third_party/gsoap/plugin/smdevp.c
     generated/onvif/device/onvifC.c
     generated/onvif/device/onvifClient.c
     generated/onvif/device/onvifServer.c
     generated/onvif/device/onvifNsmap.c
     generated/onvif/device/onvifUnimplementedOps.c
-    src/core/onvif/OnvifSoapService.c
+    src/onvif/OnvifSoapService.c
 )
 target_include_directories(mcr_onvif_gsoap_bindings PUBLIC
     "${MCR_GSOAP_ROOT}/include"
     "${MCR_GSOAP_ROOT}/plugin"
     "${CMAKE_CURRENT_SOURCE_DIR}/generated/onvif/device"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/core/onvif"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/onvif"
 )
 target_compile_definitions(mcr_onvif_gsoap_bindings PRIVATE SOAP_H_FILE=onvifH.h)
+target_compile_definitions(mcr_onvif_gsoap_bindings PRIVATE WITH_OPENSSL)
+target_include_directories(mcr_onvif_gsoap_bindings PRIVATE "${MCR_ONVIF_OPENSSL_INCLUDE_DIR}")
+target_link_libraries(mcr_onvif_gsoap_bindings PUBLIC
+    "${MCR_ONVIF_SSL_LIBRARY}" "${MCR_ONVIF_CRYPTO_LIBRARY}")
 target_compile_options(mcr_onvif_gsoap_bindings PRIVATE -Wall -Wextra)
 target_link_libraries(mcr_onvif_gsoap_bindings PUBLIC Threads::Threads)
 
 # 应用层只依赖这个 C++ 对象；gSOAP 的全局 C handler 与完整 WSDL 生成代码都留在
 # mcr_onvif_gsoap_bindings 内部，避免把协议生成细节扩散到 IpcApp。
 add_library(mcr_onvif_server STATIC
-    src/core/onvif/OnvifServer.cpp
+    src/onvif/OnvifServer.cpp
 )
 target_include_directories(mcr_onvif_server PUBLIC ${MCR_PROJECT_INCLUDE_DIRS})
 target_link_libraries(mcr_onvif_server PUBLIC mcr_onvif_gsoap_bindings Threads::Threads)
@@ -486,7 +518,7 @@ if(MCR_BUILD_DEMOS)
 
     # 第一阶段 ONVIF 验证：仅作为 WS-Discovery Target Service 回复 Probe。它不依赖
     # 摄像头、MPP 或 live555，先单独验证组播收包与单播 ProbeMatches 的协议链路。
-    mcr_add_executable(onvif_ws_discovery_demo demo/OnvifWsDiscoveryDemo.c)
+    mcr_add_executable(onvif_ws_discovery_demo demo/onvif/OnvifWsDiscoveryDemo.c)
     target_include_directories(onvif_ws_discovery_demo PRIVATE
         "${MCR_GSOAP_ROOT}/include"
         "${MCR_GSOAP_ROOT}/plugin"
@@ -495,7 +527,7 @@ if(MCR_BUILD_DEMOS)
     target_compile_definitions(onvif_ws_discovery_demo PRIVATE SOAP_H_FILE=wsddH.h)
     target_link_libraries(onvif_ws_discovery_demo PRIVATE mcr_gsoap_wsdd)
 
-    mcr_add_executable(onvif_ws_discovery_probe_demo demo/OnvifWsDiscoveryProbeDemo.c)
+    mcr_add_executable(onvif_ws_discovery_probe_demo demo/onvif/OnvifWsDiscoveryProbeDemo.c)
     target_include_directories(onvif_ws_discovery_probe_demo PRIVATE
         "${MCR_GSOAP_ROOT}/include"
         "${MCR_GSOAP_ROOT}/plugin"
@@ -504,76 +536,76 @@ if(MCR_BUILD_DEMOS)
     target_compile_definitions(onvif_ws_discovery_probe_demo PRIVATE SOAP_H_FILE=wsddH.h)
     target_link_libraries(onvif_ws_discovery_probe_demo PRIVATE mcr_gsoap_wsdd)
 
-    mcr_add_executable(onvif_device_service_demo demo/OnvifDeviceServiceDemo.cpp)
+    mcr_add_executable(onvif_device_service_demo demo/onvif/OnvifDeviceServiceDemo.cpp)
     target_link_libraries(onvif_device_service_demo PRIVATE mcr_onvif_server)
 
     # 客户端第一阶段：只验证 WS-Discovery Probe/ProbeMatch，输出 Device Service XAddr。
     # 上层再以此 XAddr 调用 C 协议层请求 GetServices / Media Profiles。
-    mcr_add_executable(onvif_discovery_client_demo demo/OnvifDiscoveryClientDemo.cpp)
+    mcr_add_executable(onvif_discovery_client_demo demo/onvif/OnvifDiscoveryClientDemo.cpp)
     target_link_libraries(onvif_discovery_client_demo PRIVATE mcr_onvif_discovery)
 
     # C++ AudioPipeline 图验证：raw PCM 分发、raw->Opus 与 APM->Opus 并发；运行中取消
     # APM 支路，确认不会干扰 raw 编码支路。
-    mcr_add_executable(audio_pipeline_demo demo/AudioPipelineDemo.cpp)
+    mcr_add_executable(audio_pipeline_demo demo/audio/AudioPipelineDemo.cpp)
     target_link_libraries(audio_pipeline_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_pipeline_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 反复挂载/释放 APM->Opus 支路，同时维持 raw->Opus。验证订阅 RAII 与 Node 生命周期。
-    mcr_add_executable(audio_pipeline_stress_demo demo/AudioPipelineStressDemo.cpp)
+    mcr_add_executable(audio_pipeline_stress_demo demo/audio/AudioPipelineStressDemo.cpp)
     target_link_libraries(audio_pipeline_stress_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_pipeline_stress_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 不依赖声卡：验证 PCM/压缩包池的满池丢弃与 payload buffer 复用语义。
-    mcr_add_executable(audio_frame_pool_demo demo/AudioFramePoolDemo.cpp)
+    mcr_add_executable(audio_frame_pool_demo demo/audio/AudioFramePoolDemo.cpp)
     target_link_libraries(audio_frame_pool_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_frame_pool_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 不依赖 ALSA：验证 AAC/Opus 在 PCM 时间轴断裂时轻量 reset 后，不会跨缺口拼包。
-    mcr_add_executable(audio_encoder_reset_demo demo/AudioEncoderResetDemo.c)
+    mcr_add_executable(audio_encoder_reset_demo demo/audio/AudioEncoderResetDemo.c)
     target_link_libraries(audio_encoder_reset_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_encoder_reset_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # C++ 唯一扬声器消费端：一条验证 PCM 直放，另一条验证 .mcropus -> 解码 -> ALSA。
-    mcr_add_executable(audio_playback_pipeline_pcm_demo demo/AudioPlaybackPipelinePcmDemo.cpp)
+    mcr_add_executable(audio_playback_pipeline_pcm_demo demo/audio/AudioPlaybackPipelinePcmDemo.cpp)
     target_link_libraries(audio_playback_pipeline_pcm_demo PRIVATE mcr_audio_core m)
     set_target_properties(audio_playback_pipeline_pcm_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
-    mcr_add_executable(audio_playback_pipeline_opus_demo demo/AudioPlaybackPipelineOpusDemo.cpp)
+    mcr_add_executable(audio_playback_pipeline_opus_demo demo/audio/AudioPlaybackPipelineOpusDemo.cpp)
     target_link_libraries(audio_playback_pipeline_opus_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_playback_pipeline_opus_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 用实际麦克风驱动 AudioPipeline 的 AAC-LC 支路，并异步写入 demo packet 文件。
-    mcr_add_executable(audio_capture_aac_demo demo/AudioCaptureAacDemo.cpp)
+    mcr_add_executable(audio_capture_aac_demo demo/audio/AudioCaptureAacDemo.cpp)
     target_link_libraries(audio_capture_aac_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_capture_aac_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 不经过 Opus/APM 的 raw PCM 文件闭环，用于隔离板级采集、播放与全双工问题。
-    mcr_add_executable(audio_pcm_capture_demo demo/AudioPcmCaptureDemo.cpp)
+    mcr_add_executable(audio_pcm_capture_demo demo/audio/AudioPcmCaptureDemo.cpp)
     target_link_libraries(audio_pcm_capture_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_pcm_capture_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
-    mcr_add_executable(audio_pcm_playback_demo demo/AudioPcmPlaybackDemo.cpp)
+    mcr_add_executable(audio_pcm_playback_demo demo/audio/AudioPcmPlaybackDemo.cpp)
     target_link_libraries(audio_pcm_playback_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_pcm_playback_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 采集与播放直通闭环：麦克风采集 PCM 并实时送入播放管线推至扬声器。
-    mcr_add_executable(audio_capture_and_playback demo/audio_capture_and_playback.cpp)
+    mcr_add_executable(audio_capture_and_playback demo/audio/audio_capture_and_playback.cpp)
     target_link_libraries(audio_capture_and_playback PRIVATE mcr_audio_core)
     set_target_properties(audio_capture_and_playback PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
@@ -582,21 +614,21 @@ if(MCR_BUILD_DEMOS)
 
     # 采集 -> APM(AGC) -> 写 WAV，不经过 Opus。用于直接听/量 AGC 处理后的效果，
     # 例如判断板端麦克风电平偏低时 AGC 究竟能补回多少 dB。
-    mcr_add_executable(audio_capture_apm_pcm_demo demo/AudioCaptureApmPcmDemo.c)
+    mcr_add_executable(audio_capture_apm_pcm_demo demo/audio/AudioCaptureApmPcmDemo.c)
     target_link_libraries(audio_capture_apm_pcm_demo PRIVATE mcr_audio_core m)
     set_target_properties(audio_capture_apm_pcm_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 读取已有 .mcropus packet 文件，完成 Opus -> PCM -> ALSA 播放闭环。
-    mcr_add_executable(audio_opus_playback_demo demo/AudioOpusPlaybackDemo.c)
+    mcr_add_executable(audio_opus_playback_demo demo/audio/AudioOpusPlaybackDemo.c)
     target_link_libraries(audio_opus_playback_demo PRIVATE mcr_audio_core)
     set_target_properties(audio_opus_playback_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 不依赖 ALSA 设备的 WebRTC AGC 自检：用固定低电平 PCM 验证处理后的实际增益。
-    mcr_add_executable(audio_apm_gain_demo demo/AudioApmGainDemo.c)
+    mcr_add_executable(audio_apm_gain_demo demo/audio/AudioApmGainDemo.c)
     target_link_libraries(audio_apm_gain_demo PRIVATE mcr_audio_core m)
     set_target_properties(audio_apm_gain_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
@@ -604,46 +636,46 @@ if(MCR_BUILD_DEMOS)
 
     # 不依赖声卡的 AEC3 调用自检：验证 10ms reverse reference 与 capture 能被同一 APM
     # 实例正确处理；不用于评价真实声学消回声效果。
-    mcr_add_executable(audio_apm_aec_smoke_demo demo/AudioApmAecSmokeDemo.c)
+    mcr_add_executable(audio_apm_aec_smoke_demo demo/audio/AudioApmAecSmokeDemo.c)
     target_link_libraries(audio_apm_aec_smoke_demo PRIVATE mcr_audio_core m)
     set_target_properties(audio_apm_aec_smoke_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     # 板端诊断工具：不修改 mixer，只列出 codec 实际提供的采集/播放控件与当前值。
-    mcr_add_executable(audio_mixer_inspect_demo demo/AudioMixerInspectDemo.c)
+    mcr_add_executable(audio_mixer_inspect_demo demo/audio/AudioMixerInspectDemo.c)
     mcr_link_alsa(audio_mixer_inspect_demo)
     set_target_properties(audio_mixer_inspect_demo PROPERTIES
         INSTALL_RPATH "/oem/usr/lib"
     )
 
     mcr_add_executable(mpp_decoder_demo
-        demo/mpp_decoder_demo.cpp
+        demo/codec/mpp_decoder_demo.cpp
         src/core/memory/DmaAllocator.cpp
         ${MCR_MPP_DECODER_SOURCES}
     )
     mcr_link_media(mpp_decoder_demo)
 
     mcr_add_executable(mpp_encoder_demo
-        demo/mpp_encoder_demo.cpp
+        demo/codec/mpp_encoder_demo.cpp
         src/core/memory/DmaAllocator.cpp
         ${MCR_MPP_ENCODER_SOURCES}
     )
     mcr_link_media(mpp_encoder_demo)
 
     mcr_add_executable(v4l2_probe_demo
-        demo/v4l2_probe_demo.cpp
+        demo/camera/v4l2_probe_demo.cpp
         src/core/cam/V4L2DeviceProbe.cpp
     )
 
     mcr_add_executable(dma_allocator_demo
-        demo/dma_allocator_demo.cpp
+        demo/memory/dma_allocator_demo.cpp
         src/core/memory/DmaAllocator.cpp
     )
     mcr_link_drm(dma_allocator_demo)
 
     mcr_add_executable(camera_capture_demo
-        demo/camera_capture_demo.cpp
+        demo/camera/camera_capture_demo.cpp
         src/core/memory/DmaAllocator.cpp
         src/core/cam/V4L2CameraSource.cpp
     )
@@ -652,7 +684,7 @@ if(MCR_BUILD_DEMOS)
     # 使用真实 V4L2 设备验证 CamManager 的轻恢复、完整重建、以及 lease 未归还时的
     # stop/start 与自动恢复行为；physical 参数模式可额外验证 USB 摄像头真实拔插。
     mcr_add_executable(cam_recovery_stress_demo
-        demo/CamRecoveryStressDemo.cpp
+        demo/camera/CamRecoveryStressDemo.cpp
         src/core/cam/CamManager.cpp
         src/core/memory/DmaAllocator.cpp
         src/core/memory/DmaBufferPool.cpp
@@ -665,7 +697,7 @@ if(MCR_BUILD_DEMOS)
     mcr_add_executable(frame_lease_demo demo/frame_lease/main.cpp)
 
     mcr_add_executable(rtsp_mpp_decoder_demo
-        demo/RtspMppDecoderDemo.cpp
+        demo/rtsp/RtspMppDecoderDemo.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
         ${MCR_MPP_DECODER_SOURCES}
     )
@@ -675,13 +707,13 @@ if(MCR_BUILD_DEMOS)
     # 临时诊断工具：把 live555 已重组的完整 Annex-B NALU 原样落盘，便于区分
     # RTP/服务端问题和播放器兼容性问题。
     mcr_add_executable(rtsp_annexb_record_demo
-        demo/RtspAnnexBRecordDemo.cpp
+        demo/rtsp/RtspAnnexBRecordDemo.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
     )
     mcr_link_live555(rtsp_annexb_record_demo)
 
     mcr_add_executable(rtsp_stream_demo
-        demo/RtspStreamDemo.cpp
+        demo/rtsp/RtspStreamDemo.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
@@ -695,7 +727,7 @@ if(MCR_BUILD_DEMOS)
 
     # 接收 IPC 发布的 AAC audio track，并经项目正式 AudioPlaybackPipeline 解码写 ALSA。
     mcr_add_executable(rtsp_audio_playback_demo
-        demo/RtspAudioPlaybackDemo.cpp
+        demo/rtsp/RtspAudioPlaybackDemo.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
         src/core/stream/Stream.cpp
@@ -714,7 +746,7 @@ if(MCR_BUILD_DEMOS)
     # 音频故障隔离工具：RTSP AAC -> AudioDecoder -> WAV，不经过 ALSA。可随后用 aplay
     # 回放同一文件，明确区分码流/解码问题与板端播放路由问题。
     mcr_add_executable(rtsp_aac_wav_record_demo
-        demo/RtspAacWavRecordDemo.cpp
+        demo/rtsp/RtspAacWavRecordDemo.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
     )
     target_link_libraries(rtsp_aac_wav_record_demo PRIVATE mcr_audio_core)
@@ -724,7 +756,7 @@ if(MCR_BUILD_DEMOS)
     )
 
     mcr_add_executable(stream_manager_demo
-        demo/StreamManagerDemo.cpp
+        demo/rtsp/StreamManagerDemo.cpp
         src/core/stream/StreamManager.cpp
         ${MCR_RTSP_CLIENT_SOURCES}
         src/rtsp/client/RtspStream.cpp
@@ -741,7 +773,7 @@ if(MCR_BUILD_DEMOS)
     # 不依赖网络或摄像头，直接验证 Stream 的恢复门控、超时上报、合并 Annex-B 恢复边界
     # 与 StreamManager Error -> Streaming 状态回转。
     mcr_add_executable(stream_recovery_demo
-        demo/StreamRecoveryDemo.cpp
+        demo/rtsp/StreamRecoveryDemo.cpp
         src/core/stream/StreamManager.cpp
         src/core/stream/Stream.cpp
         src/core/common/FrameHub.cpp
@@ -789,7 +821,7 @@ if(MCR_BUILD_FREETYPE_BITMAP_DEMO)
     # 独立验证 OSD 的完整路径：FreeType 小 RGBA DMA-BUF -> RGA 合成/画框 -> PNG。
     # 后续 RtspPublishSink 只复用 core/osd，不再散落原生 RGA 调用。
     mcr_add_executable(freetype_bitmap_demo
-        demo/FreeTypeBitmapDemo.cpp
+        demo/osd/FreeTypeBitmapDemo.cpp
         src/core/osd/FreeTypeTextRenderer.cpp
         src/core/osd/OsdRenderer.cpp
         src/core/common/VideoFrame.cpp
